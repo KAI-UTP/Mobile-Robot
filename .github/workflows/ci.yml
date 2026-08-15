@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes the previous run on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor (the code uses `X | None` and datetime.UTC);
+        # 3.12 is what the Docker images run.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Run tests
+        # No hardware, no broker, no Isaac Sim needed — that is deliberate,
+        # and it is why CI can verify the whole movement and mapping stack.
+        run: pytest tests/ -q --tb=short
+
+      - name: Coverage
+        if: matrix.python-version == '3.12'
+        run: |
+          pytest tests/ --cov=shared --cov=services --cov=simulator \
+                 --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 14
+
+  accuracy:
+    name: Mapping accuracy gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Verify the robot still measures rooms correctly
+        # Separated from the main test job so a regression in mapping ACCURACY
+        # is distinguishable at a glance from an ordinary test failure. This is
+        # the project's headline claim, so it gets its own red or green tick.
+        run: |
+          pytest tests/test_integration.py tests/test_comparison.py -q --tb=short
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build mapper image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/mapper/Dockerfile
+          push: false
+          load: true
+          tags: roommapper/mapper:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build telemetry-sink image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/telemetry-sink/Dockerfile
+          push: false
+          load: true
+          tags: roommapper/telemetry-sink:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the mapper image
+        # Proves the image actually runs and maps a room, not merely that it
+        # built. A container that builds and then crashes on startup is the
+        # failure this catches.
+        run: |
+          docker run --rm -d --name mapper-smoke -p 8080:8080 \
+            roommapper/mapper:ci \
+            python services/mapper/main.py --source sim --speed 25 --port 8080
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health > /dev/null; then break; fi
+            sleep 2
+          done
+
+          curl -sf http://localhost:8080/health | tee /dev/stderr | grep -q healthy
+          sleep 20
+          echo "--- room measurement ---"
+          curl -sf http://localhost:8080/api/room | tee /dev/stderr
+          docker logs mapper-smoke | tail -20
+          docker stop mapper-smoke
+
+  compose:
+    name: Compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        run: docker compose config --quiet

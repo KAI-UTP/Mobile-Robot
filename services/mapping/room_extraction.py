@@ -1,0 +1,510 @@
+"""Turn an occupancy grid into a room outline with a measured floor area.
+
+The pipeline
+------------
+1. **Flood fill** the *confidently* free space reachable from the robot, so
+   furniture voids and anything beyond a wall are excluded. This is what
+   makes the result "the room the robot is in" rather than "every free cell
+   ever seen".
+2. **Open** the region morphologically to erase thin tendrils (see below).
+3. **Trace the boundary** with Moore-neighbour tracing, producing an ordered
+   ring of cells.
+4. **Simplify** the ring with Douglas-Peucker, collapsing the cell-sized
+   staircase into the handful of corners that describe the room.
+5. **Optionally square up** the corners, because real rooms are overwhelmingly
+   rectilinear and the eye immediately reads a wobbly outline as wrong.
+6. **Measure** area and perimeter from the final polygon.
+
+Why steps 1 and 2 are strict
+----------------------------
+Ultrasonic pulses that strike a wall at a shallow angle reflect away instead
+of returning, and the sensor reports maximum range. Before a wall has been
+observed enough times to be treated as opaque, such a reading paints a thin
+line of "free" cells straight through it. Those lines are the failure mode
+that matters: a single one lets the flood fill escape the room and the
+reported area balloons.
+
+Two independent defences handle it, because either alone leaves a gap:
+
+* **Evidence threshold.** A cell counts as floor only after several
+  independent free observations. Genuine floor is seen hundreds of times and
+  saturates; a leaked ray is seen once or twice.
+* **Morphological opening.** Whatever still leaks is one or two cells wide,
+  while the room is hundreds. Eroding then dilating deletes the former and
+  restores the latter almost exactly.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections import deque
+
+import numpy as np
+from robotmap_common.geometry import (
+    douglas_peucker,
+    min_area_rect,
+    polygon_area_m2,
+    polygon_perimeter_m,
+)
+from robotmap_common.models import Point2D, PoseEstimate, RoomOutline
+
+from .occupancy_grid import OccupancyGrid
+
+logger = logging.getLogger(__name__)
+
+# Moore neighbourhood, clockwise from east. Order matters: boundary tracing
+# relies on scanning neighbours in consistent rotational order.
+_NEIGHBOURS_CW = [
+    (1, 0),
+    (1, -1),
+    (0, -1),
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+]
+
+
+class RoomExtractor:
+    """Extracts a room polygon from an occupancy grid."""
+
+    def __init__(
+        self,
+        free_threshold: float = -1.5,
+        occupied_threshold: float = 0.4,
+        simplify_epsilon_m: float = 0.08,
+        squareness_tolerance_deg: float = 12.0,
+        opening_radius_m: float = 0.15,
+        boundary_dilation_cells: int = 1,
+    ) -> None:
+        # -1.5 log-odds is roughly two or three independent "free"
+        # observations. It is deliberately not stricter: raising it also
+        # erodes genuine floor in the middle of the room, which a
+        # wall-following robot observes least, and the effect worsens as
+        # resolution gets finer and each cell collects fewer rays. Leak
+        # removal is the opening's job, not this threshold's.
+        self.free_threshold = free_threshold
+        self.occupied_threshold = occupied_threshold
+        self.simplify_epsilon_m = simplify_epsilon_m
+        self.squareness_tolerance_deg = squareness_tolerance_deg
+        # Structuring-element radius for the opening. Necks narrower than
+        # twice this are severed; a real doorway (~0.8 m) survives, which is
+        # correct — a room with an open door is not a closed room.
+        self.opening_radius_m = opening_radius_m
+        # The traced ring follows the centres of the outermost *free* cells,
+        # but the floor actually continues to the wall face one cell beyond.
+        # Without this the reported room is systematically one cell small on
+        # every side — about 6 % of a 3 m room.
+        self.boundary_dilation_cells = boundary_dilation_cells
+
+    # ── Step 1: reachable interior ────────────────────────────────────────
+
+    def flood_fill_interior(
+        self, grid: OccupancyGrid, seed_col: int, seed_row: int
+    ) -> np.ndarray:
+        """Return a mask of free cells connected to the seed.
+
+        Four-connectivity, not eight: diagonal connectivity leaks the fill
+        through the corner gap where two wall cells touch diagonally, which
+        would merge the room with the corridor outside it.
+        """
+        free = grid.grid < self.free_threshold
+        mask = np.zeros_like(free, dtype=bool)
+
+        if not grid.in_bounds(seed_col, seed_row):
+            logger.warning("Flood-fill seed outside grid bounds")
+            return mask
+
+        # The robot's own cell may read unknown if it has not been observed;
+        # accept it as the seed regardless, since the robot is standing there.
+        if not free[seed_row, seed_col]:
+            free = free.copy()
+            free[seed_row, seed_col] = True
+
+        queue = deque([(seed_col, seed_row)])
+        mask[seed_row, seed_col] = True
+
+        while queue:
+            col, row = queue.popleft()
+            for d_col, d_row in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                n_col, n_row = col + d_col, row + d_row
+                if not grid.in_bounds(n_col, n_row):
+                    continue
+                if mask[n_row, n_col] or not free[n_row, n_col]:
+                    continue
+                mask[n_row, n_col] = True
+                queue.append((n_col, n_row))
+
+        return mask
+
+    # ── Step 2: morphological opening ─────────────────────────────────────
+
+    @staticmethod
+    def _erode(mask: np.ndarray, radius: int) -> np.ndarray:
+        """A cell survives only if its whole square neighbourhood is set."""
+        if radius <= 0:
+            return mask
+        height, width = mask.shape
+        padded = np.pad(mask, radius, mode="constant", constant_values=False)
+        out = np.ones_like(mask, dtype=bool)
+        for d_row in range(-radius, radius + 1):
+            for d_col in range(-radius, radius + 1):
+                out &= padded[
+                    radius + d_row : radius + d_row + height,
+                    radius + d_col : radius + d_col + width,
+                ]
+        return out
+
+    @staticmethod
+    def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+        """A cell is set if any cell in its square neighbourhood is set."""
+        if radius <= 0:
+            return mask
+        height, width = mask.shape
+        padded = np.pad(mask, radius, mode="constant", constant_values=False)
+        out = np.zeros_like(mask, dtype=bool)
+        for d_row in range(-radius, radius + 1):
+            for d_col in range(-radius, radius + 1):
+                out |= padded[
+                    radius + d_row : radius + d_row + height,
+                    radius + d_col : radius + d_col + width,
+                ]
+        return out
+
+    def open_mask(self, mask: np.ndarray, resolution_m: float) -> np.ndarray:
+        """Erode then dilate, deleting tendrils while preserving the room.
+
+        Opening is the standard way to remove structures thinner than the
+        structuring element. The erosion severs every leaked ray, and the
+        dilation grows the surviving bulk back to very nearly its original
+        extent — the room loses only the sub-centimetre roughness of its own
+        edge, which the polygon simplification would have discarded anyway.
+        """
+        # At least three cells: a one- or two-cell element is too small to
+        # sever the leaked rays reliably, so a coarse grid would otherwise
+        # silently lose the protection a fine grid gets.
+        radius = max(3, int(round(self.opening_radius_m / resolution_m)))
+        return self._dilate(self._erode(mask, radius), radius)
+
+    @staticmethod
+    def largest_component(mask: np.ndarray, seed: tuple[int, int] | None = None) -> np.ndarray:
+        """Keep one connected region: the seed's, or the biggest one.
+
+        Opening can sever the room from stray blobs, so connectivity has to be
+        re-established afterwards rather than trusted from before it.
+        """
+        if not mask.any():
+            return mask
+
+        visited = np.zeros_like(mask, dtype=bool)
+        best_mask: np.ndarray | None = None
+        best_size = 0
+
+        seed_col, seed_row = seed if seed else (None, None)
+
+        for start_row, start_col in np.argwhere(mask):
+            if visited[start_row, start_col]:
+                continue
+
+            component = np.zeros_like(mask, dtype=bool)
+            queue = deque([(int(start_col), int(start_row))])
+            visited[start_row, start_col] = True
+            component[start_row, start_col] = True
+            size = 1
+
+            while queue:
+                col, row = queue.popleft()
+                for d_col, d_row in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    n_col, n_row = col + d_col, row + d_row
+                    if not (
+                        0 <= n_row < mask.shape[0] and 0 <= n_col < mask.shape[1]
+                    ):
+                        continue
+                    if visited[n_row, n_col] or not mask[n_row, n_col]:
+                        continue
+                    visited[n_row, n_col] = True
+                    component[n_row, n_col] = True
+                    queue.append((n_col, n_row))
+                    size += 1
+
+            # The component holding the robot always wins, if it survived.
+            if seed_row is not None and component[seed_row, seed_col]:
+                return component
+            if size > best_size:
+                best_size, best_mask = size, component
+
+        return best_mask if best_mask is not None else mask
+
+    @staticmethod
+    def fill_holes(mask: np.ndarray) -> np.ndarray:
+        """Fill enclosed gaps in the region.
+
+        A robot following the walls observes the middle of the room least, so
+        the centre is riddled with cells that are genuinely floor but were
+        never confidently seen. Anything fully surrounded by the room *is*
+        part of the room, whether or not a sensor ray happened to cross it.
+
+        Implemented by flooding the background inward from the grid border:
+        background that the flood cannot reach is, by definition, enclosed.
+        A room with a real gap in its boundary — an open doorway — lets the
+        flood in and is correctly left unfilled.
+        """
+        height, width = mask.shape
+        outside = np.zeros_like(mask, dtype=bool)
+        queue: deque[tuple[int, int]] = deque()
+
+        for col in range(width):
+            for row in (0, height - 1):
+                if not mask[row, col] and not outside[row, col]:
+                    outside[row, col] = True
+                    queue.append((col, row))
+        for row in range(height):
+            for col in (0, width - 1):
+                if not mask[row, col] and not outside[row, col]:
+                    outside[row, col] = True
+                    queue.append((col, row))
+
+        while queue:
+            col, row = queue.popleft()
+            for d_col, d_row in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                n_col, n_row = col + d_col, row + d_row
+                if not (0 <= n_row < height and 0 <= n_col < width):
+                    continue
+                if outside[n_row, n_col] or mask[n_row, n_col]:
+                    continue
+                outside[n_row, n_col] = True
+                queue.append((n_col, n_row))
+
+        return mask | ~(mask | outside)
+
+    # ── Step 3: boundary tracing ──────────────────────────────────────────
+
+    def trace_boundary(self, mask: np.ndarray) -> list[tuple[int, int]]:
+        """Return the outer boundary of a filled region as ordered cells.
+
+        Moore-neighbour tracing with Jacob's stopping criterion: the walk ends
+        when the start cell is re-entered *from the same direction*, not merely
+        revisited. Stopping on revisit alone truncates rooms that pinch to a
+        one-cell-wide doorway, which is exactly where the walk passes twice.
+        """
+        filled = np.argwhere(mask)
+        if filled.size == 0:
+            return []
+
+        # Start at the lowest row, then lowest column — guaranteed on the hull.
+        start_row, start_col = filled[0]
+        start = (int(start_col), int(start_row))
+
+        boundary: list[tuple[int, int]] = [start]
+        current = start
+        # Entry direction into the start cell: came from the west.
+        backtrack_index = 4
+
+        max_steps = int(mask.sum() * 8) + 64  # generous, but always terminates
+
+        for _ in range(max_steps):
+            found = False
+            # Scan clockwise starting just past where we came from.
+            for offset in range(1, 9):
+                idx = (backtrack_index + offset) % 8
+                d_col, d_row = _NEIGHBOURS_CW[idx]
+                n_col, n_row = current[0] + d_col, current[1] + d_row
+
+                if not (0 <= n_row < mask.shape[0] and 0 <= n_col < mask.shape[1]):
+                    continue
+                if not mask[n_row, n_col]:
+                    continue
+
+                # The new backtrack direction points back at the current cell.
+                backtrack_index = (idx + 4) % 8
+                current = (n_col, n_row)
+                found = True
+                break
+
+            if not found:
+                break  # isolated single cell
+
+            if current == start and len(boundary) > 2:
+                break
+
+            boundary.append(current)
+
+        return boundary
+
+    # ── Step 3-4: simplify and square up ──────────────────────────────────
+
+    def _to_world(
+        self, grid: OccupancyGrid, cells: list[tuple[int, int]]
+    ) -> list[tuple[float, float]]:
+        return [grid.cell_to_world(col, row) for col, row in cells]
+
+    def _square_up(
+        self, points: list[tuple[float, float]]
+    ) -> list[tuple[float, float]]:
+        """Snap near-axis-aligned edges onto the axes.
+
+        Only edges already within tolerance are moved, so a genuinely angled
+        wall survives intact. Purely cosmetic, but it is the difference
+        between output that reads as a floor plan and output that reads as
+        a scribble.
+        """
+        if len(points) < 3:
+            return points
+
+        result = list(points)
+        tolerance = math.radians(self.squareness_tolerance_deg)
+
+        for i in range(len(result)):
+            j = (i + 1) % len(result)
+            x1, y1 = result[i]
+            x2, y2 = result[j]
+
+            angle = math.atan2(y2 - y1, x2 - x1)
+            # Distance to the nearest multiple of 90 degrees.
+            snapped = round(angle / (math.pi / 2)) * (math.pi / 2)
+
+            if abs(angle - snapped) > tolerance:
+                continue
+
+            if abs(math.cos(snapped)) < 1e-9:
+                # Vertical edge: share one x.
+                mean_x = (x1 + x2) / 2
+                result[i] = (mean_x, y1)
+                result[j] = (mean_x, y2)
+            else:
+                # Horizontal edge: share one y.
+                mean_y = (y1 + y2) / 2
+                result[i] = (x1, mean_y)
+                result[j] = (x2, mean_y)
+
+        return result
+
+    # ── Full pipeline ─────────────────────────────────────────────────────
+
+    def extract(
+        self,
+        grid: OccupancyGrid,
+        pose: PoseEstimate,
+        robot_id: str,
+        timestamp: str,
+        square_up: bool = True,
+    ) -> RoomOutline:
+        """Run the full extraction and return the measured room."""
+        seed_col, seed_row = grid.world_to_cell(pose.x_m, pose.y_m)
+        interior = self.flood_fill_interior(grid, seed_col, seed_row)
+
+        if interior.sum() < 4:
+            return self._empty_outline(robot_id, timestamp)
+
+        # Erase leaked tendrils, then re-establish connectivity: the opening
+        # may have detached the room from blobs it was only hair-connected to.
+        interior = self.open_mask(interior, grid.resolution_m)
+        seed = (seed_col, seed_row) if grid.in_bounds(seed_col, seed_row) else None
+        if seed is not None and not interior[seed_row, seed_col]:
+            # Erosion can consume the robot's own cell when it finishes close
+            # to a wall; fall back to the largest surviving region.
+            seed = None
+        interior = self.largest_component(interior, seed)
+
+        # Observed-free area, before enclosed gaps are filled in. This is the
+        # honest measure of how much floor the robot actually saw, and is what
+        # the coverage figure is reported against.
+        observed_cells = int(interior.sum())
+
+        interior = self.fill_holes(interior)
+
+        # Grow out to the wall face so the outline sits on the wall rather
+        # than one cell inside it.
+        enclosed = self._dilate(interior, self.boundary_dilation_cells)
+
+        interior_cells = int(enclosed.sum())
+        if interior_cells < 4:
+            return self._empty_outline(robot_id, timestamp)
+
+        boundary_cells = self.trace_boundary(enclosed)
+        if len(boundary_cells) < 4:
+            return self._empty_outline(robot_id, timestamp)
+
+        world_points = self._to_world(grid, boundary_cells)
+
+        # Close the ring before simplifying so the final edge is considered.
+        closed = world_points + [world_points[0]]
+        simplified = douglas_peucker(closed, self.simplify_epsilon_m)
+        if len(simplified) > 1 and simplified[0] == simplified[-1]:
+            simplified = simplified[:-1]
+
+        if square_up:
+            simplified = self._square_up(simplified)
+
+        if len(simplified) < 3:
+            return self._empty_outline(robot_id, timestamp)
+
+        area = polygon_area_m2(simplified)
+        perimeter = polygon_perimeter_m(simplified)
+
+        # Measured against the room's own axes, not the map's arbitrary ones.
+        long_side_m, short_side_m, _ = min_area_rect(simplified)
+
+        # Coverage: how much of the enclosed room the robot actually observed,
+        # as opposed to inferred by filling holes. A low value means the area
+        # figure rests more on inference than on measurement.
+        cell_area = grid.resolution_m**2
+        observed_area = observed_cells * cell_area
+        coverage = min(100.0, (observed_area / area * 100.0) if area > 0 else 0.0)
+
+        return RoomOutline(
+            robot_id=robot_id,
+            timestamp=timestamp,
+            polygon=[Point2D(x_m=x, y_m=y) for x, y in simplified],
+            area_m2=area,
+            perimeter_m=perimeter,
+            bounding_width_m=long_side_m,
+            bounding_height_m=short_side_m,
+            coverage_pct=coverage,
+            # Closure is judged on the observed free region, not the dilated
+            # one: dilation deliberately pushes the boundary into the wall
+            # cells, so the dilated region's rim sits in unknown space beyond
+            # the wall and would always look unexplored.
+            is_closed=self._is_enclosed(grid, interior),
+        )
+
+    def _is_enclosed(self, grid: OccupancyGrid, interior: np.ndarray) -> bool:
+        """True when the interior does not touch the edge of the known grid.
+
+        If the free region runs off the edge of what has been mapped, the
+        robot has not yet found the whole boundary and the area figure is a
+        lower bound, not a measurement.
+        """
+        if interior[0, :].any() or interior[-1, :].any():
+            return False
+        if interior[:, 0].any() or interior[:, -1].any():
+            return False
+
+        # Also require the ring around the interior to be mostly wall rather
+        # than unexplored, otherwise an open doorway reads as enclosed.
+        unknown = grid.grid == 0.0
+        dilated = np.zeros_like(interior)
+        for d_col, d_row in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            dilated |= np.roll(np.roll(interior, d_row, axis=0), d_col, axis=1)
+        border = dilated & ~interior
+
+        border_count = int(border.sum())
+        if border_count == 0:
+            return False
+        unknown_border = int((border & unknown).sum())
+        return (unknown_border / border_count) < 0.15
+
+    def _empty_outline(self, robot_id: str, timestamp: str) -> RoomOutline:
+        return RoomOutline(
+            robot_id=robot_id,
+            timestamp=timestamp,
+            polygon=[],
+            area_m2=0.0,
+            perimeter_m=0.0,
+            bounding_width_m=0.0,
+            bounding_height_m=0.0,
+            coverage_pct=0.0,
+            is_closed=False,
+        )

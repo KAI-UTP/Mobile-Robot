@@ -1,0 +1,131 @@
+# Full digital-twin stack: broker, time-series store, dashboards, mapper.
+#
+#   docker compose up --build -d
+#
+# Then:
+#   http://localhost:8080          live map
+#   http://localhost:8080/compare  real room vs the robot's map
+#   http://localhost:3000          Grafana  (admin / admin)
+#   http://localhost:8086          InfluxDB (admin / roommapper123)
+#
+# The simulator runs inside the mapper by default, so this comes up with data
+# flowing and no hardware attached. Set SOURCE=mqtt and run the robot agent on
+# the host when the real robot is connected — the serial ports live there.
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: roommapper-mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    restart: unless-stopped
+    healthcheck:
+      # The image ships no mosquitto_sub, so probe the listener directly.
+      test: ["CMD-SHELL", "timeout 2 sh -c '</dev/tcp/127.0.0.1/1883' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: roommapper-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: roommapper123
+      DOCKER_INFLUXDB_INIT_ORG: roommapper
+      DOCKER_INFLUXDB_INIT_BUCKET: roommapper
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: roommapper-super-secret-token
+      # A student project generates a lot of 10 Hz telemetry; a week is
+      # plenty and keeps the volume from growing without bound.
+      DOCKER_INFLUXDB_INIT_RETENTION: 7d
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: roommapper-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Land on the twin dashboard rather than an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/digital-twin.json
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mapper:
+    build:
+      context: .
+      dockerfile: services/mapper/Dockerfile
+    container_name: roommapper-mapper
+    ports:
+      - "8080:8080"
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      ROBOT_ID: "${ROBOT_ID:-MR3W01}"
+      REFERENCE_ROOM: "${REFERENCE_ROOM:-rectangular}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    # Simulator by default so the stack is demonstrable with no hardware.
+    # Override with: SOURCE=mqtt docker compose up
+    command: >
+      python services/mapper/main.py
+      --source ${SOURCE:-sim}
+      --room ${REFERENCE_ROOM:-rectangular}
+      --speed ${SIM_SPEED:-4}
+      --port 8080
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  telemetry-sink:
+    build:
+      context: .
+      dockerfile: services/telemetry-sink/Dockerfile
+    container_name: roommapper-sink
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: roommapper-super-secret-token
+      INFLUX_ORG: roommapper
+      INFLUX_BUCKET: roommapper
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mosquitto-data:
+  influxdb-data:
+  influxdb-config:
+  grafana-data:

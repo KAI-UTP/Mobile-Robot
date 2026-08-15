@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: RoomMapper
+    orgId: 1
+    folder: Room Mapper
+    type: file
+    disableDeletion: false
+    # Picks up edits without a container restart, which matters when tuning a
+    # dashboard during a demo rehearsal.
+    updateIntervalSeconds: 15
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

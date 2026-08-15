@@ -1,0 +1,33 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["shared", "services", "."]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 95
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E501",
+    # UP042 wants StrEnum instead of (str, Enum). Kept as (str, Enum) to match
+    # the SmartClean Twin models this project's contracts are derived from, so
+    # the two codebases stay readable side by side.
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import fixtures via conftest path injection.
+"tests/*" = ["E402"]
+"services/*/main.py" = ["E402"]
+# These set up sys.path before importing project packages, because they are
+# run as scripts rather than as installed modules.
+"services/servo-bus/*.py" = ["E402"]
+"services/twin-control/*.py" = ["E402"]
+"services/gps-reader/*.py" = ["E402"]
+"services/robot-agent/*.py" = ["E402"]
+# run_isaac.py must call SimulationApp() before any omni.* import — Isaac Sim
+# boots a Kit application underneath, and importing omni first fails in ways
+# that point nowhere near the real cause. The import order is load-bearing.
+"omniverse/*.py" = ["E402"]

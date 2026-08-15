@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    access: proxy
+    # Container-to-container, so the service name rather than localhost.
+    url: http://influxdb:8086
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: roommapper
+      defaultBucket: roommapper
+      tlsSkipVerify: true
+    secureJsonData:
+      token: roommapper-super-secret-token
+    editable: true

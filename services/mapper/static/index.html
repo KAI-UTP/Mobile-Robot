@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Mapper — Live</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --border: #2a3038;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #4aa3ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --free: #1d6fa5;
+    --wall: #e6edf3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid; grid-template-columns: 1fr 320px; height: 100vh;
+  }
+  @media (max-width: 860px) {
+    body { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+  }
+  #stage { position: relative; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  aside {
+    background: var(--panel); border-left: 1px solid var(--border);
+    padding: 16px; overflow-y: auto;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  .card {
+    background: #0d1117; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; margin-bottom: 12px;
+  }
+  .card h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--muted); margin: 0 0 8px; font-weight: 600;
+  }
+  .big { font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .big span { font-size: 14px; color: var(--muted); font-weight: 400; }
+  .row {
+    display: flex; justify-content: space-between; gap: 8px;
+    padding: 3px 0; font-variant-numeric: tabular-nums;
+  }
+  .row span:first-child { color: var(--muted); }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 99px;
+    font-size: 11px; font-weight: 600;
+  }
+  .pill.ok   { background: rgba(63,185,80,.15);  color: var(--good); }
+  .pill.warn { background: rgba(210,153,34,.15); color: var(--warn); }
+  .pill.bad  { background: rgba(248,81,73,.15);  color: var(--bad); }
+  .bar { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .bar i { display: block; height: 100%; background: var(--good); transition: width .3s, background .3s; }
+  button {
+    width: 100%; padding: 8px; margin-top: 6px; cursor: pointer;
+    background: #21262d; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; font-size: 13px;
+  }
+  button:hover { background: #2d333b; }
+  .note { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
+  #status {
+    position: absolute; top: 12px; left: 12px; z-index: 5;
+    background: rgba(13,17,23,.85); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 12px;
+  }
+  #legend {
+    position: absolute; bottom: 12px; left: 12px; z-index: 5;
+    background: rgba(13,17,23,.85); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--muted);
+  }
+  #legend div { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
+  #legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="status">connecting…</div>
+  <canvas id="map"></canvas>
+  <div id="legend">
+    <div><i style="background:#e6edf3"></i> wall</div>
+    <div><i style="background:#1d6fa5"></i> open floor</div>
+    <div><i style="background:#30363d"></i> not yet seen</div>
+    <div><i style="background:#f0c674"></i> path driven</div>
+    <div><i style="background:#3fb950"></i> room outline</div>
+  </div>
+</div>
+
+<aside>
+  <h1>Room Mapper</h1>
+  <div class="sub">3-wheel differential drive · <span id="robotId">—</span></div>
+
+  <div class="card">
+    <h2>Floor area</h2>
+    <div class="big"><span id="area">—</span> <span>m²</span></div>
+    <div class="row"><span>Dimensions</span><b id="dims">—</b></div>
+    <div class="row"><span>Perimeter</span><b id="perim">—</b></div>
+    <div class="row"><span>Boundary</span><b id="closed">—</b></div>
+    <div class="note" id="areaNote">Drive the robot around the walls to close the boundary.</div>
+  </div>
+
+  <div class="card">
+    <h2>Position</h2>
+    <div class="row"><span>X</span><b id="px">—</b></div>
+    <div class="row"><span>Y</span><b id="py">—</b></div>
+    <div class="row"><span>Heading</span><b id="ph">—</b></div>
+    <div class="row"><span>Travelled</span><b id="dist">—</b></div>
+    <div class="row"><span>Source</span><b id="src">—</b></div>
+    <div class="row"><span>Confidence</span><b id="confTxt">—</b></div>
+    <div class="bar"><i id="confBar" style="width:0%"></i></div>
+    <div class="note">Confidence falls as dead-reckoning drift accumulates. Below 20 % new scans stop being written into the map.</div>
+  </div>
+
+  <div class="card">
+    <h2>GNSS</h2>
+    <div class="row"><span>Map anchored</span><b id="anchored">—</b></div>
+    <div class="row"><span>Fixes accepted</span><b id="gpsAcc">—</b></div>
+    <div class="row"><span>Used to steer</span><b id="gpsCorr">—</b></div>
+    <div class="row"><span>Fixes rejected</span><b id="gpsRej">—</b></div>
+    <div class="note" id="gpsNote">—</div>
+  </div>
+
+  <div class="card">
+    <h2>Controls</h2>
+    <button onclick="send('refresh')">Re-extract room</button>
+    <button onclick="send('reset_pose')">Reset pose only</button>
+    <button onclick="send('clear_map')">Clear map and restart</button>
+    <button onclick="downloadMap()">Download floor plan (SVG)</button>
+  </div>
+</aside>
+
+<script>
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+
+let grid = null;        // Int8Array of occupancy percentages
+let meta = null;        // {width,height,resolution_m,origin_x_m,origin_y_m}
+let state = null;
+let ws = null;
+
+// ── Rendering ────────────────────────────────────────────────────────────
+
+function resize() {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.max(1, Math.round(rect.width  * dpr));
+  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  draw();
+}
+window.addEventListener('resize', resize);
+
+// World metres -> canvas pixels. Recomputed each frame so the view keeps the
+// whole map in shot as the grid grows.
+function makeTransform() {
+  if (!meta) return null;
+  const wM = meta.width  * meta.resolution_m;
+  const hM = meta.height * meta.resolution_m;
+  const pad = 24;
+  const scale = Math.min(
+    (canvas.width  - pad * 2) / wM,
+    (canvas.height - pad * 2) / hM
+  );
+  const offX = (canvas.width  - wM * scale) / 2;
+  const offY = (canvas.height - hM * scale) / 2;
+  return {
+    scale,
+    // Canvas y grows downward; the world's does not, hence the flip.
+    x: mx => offX + (mx - meta.origin_x_m) * scale,
+    y: my => canvas.height - offY - (my - meta.origin_y_m) * scale
+  };
+}
+
+function draw() {
+  ctx.fillStyle = '#0e1116';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const T = makeTransform();
+  if (!T || !grid) return;
+
+  drawGrid(T);
+  drawTrail(T);
+  drawRoom(T);
+  drawRobot(T);
+}
+
+function drawGrid(T) {
+  // Build the occupancy image at grid resolution, then let the canvas scale
+  // it up. Drawing one rectangle per cell would be far slower for a grid
+  // this size and would repaint several times a second.
+  const img = ctx.createImageData(meta.width, meta.height);
+  for (let row = 0; row < meta.height; row++) {
+    for (let col = 0; col < meta.width; col++) {
+      const v = grid[row * meta.width + col];
+      // Flip vertically: image row 0 is the top, world row 0 is the bottom.
+      const p = (((meta.height - 1 - row) * meta.width) + col) * 4;
+      let r, g, b, a = 255;
+      if (v < 0)        { r = 48; g = 54; b = 61; a = 130; }   // unknown
+      else if (v > 60)  { r = 230; g = 237; b = 243; }         // wall
+      else if (v < 35)  { r = 29; g = 111; b = 165; }          // free
+      else              { r = 90; g = 100; b = 110; }          // uncertain
+      img.data[p] = r; img.data[p+1] = g; img.data[p+2] = b; img.data[p+3] = a;
+    }
+  }
+  createImageBitmap(img).then(bmp => {
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(bmp, T.x(meta.origin_x_m),
+                       T.y(meta.origin_y_m + meta.height * meta.resolution_m),
+                       meta.width  * meta.resolution_m * T.scale,
+                       meta.height * meta.resolution_m * T.scale);
+    drawTrail(T); drawRoom(T); drawRobot(T);
+  });
+}
+
+function drawTrail(T) {
+  if (!state || !state.trail || state.trail.length < 2) return;
+  ctx.strokeStyle = 'rgba(240,198,116,.85)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  state.trail.forEach(([x, y], i) => {
+    const px = T.x(x), py = T.y(y);
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  ctx.stroke();
+}
+
+function drawRoom(T) {
+  if (!state || !state.room || !state.room.polygon || state.room.polygon.length < 3) return;
+  const poly = state.room.polygon;
+  ctx.strokeStyle = state.room.is_closed ? '#3fb950' : '#d29922';
+  ctx.lineWidth = 3;
+  ctx.setLineDash(state.room.is_closed ? [] : [8, 6]);
+  ctx.beginPath();
+  poly.forEach((p, i) => {
+    const px = T.x(p.x_m), py = T.y(p.y_m);
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  ctx.closePath();
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawRobot(T) {
+  if (!state || !state.pose) return;
+  const p = state.pose;
+  const px = T.x(p.x_m), py = T.y(p.y_m);
+  const rad = -p.heading_deg * Math.PI / 180;   // negated for the flipped y axis
+
+  // One-sigma uncertainty ring: shows the estimate degrading in real time.
+  const sigma = Math.max(p.std_x_m, p.std_y_m);
+  if (sigma > 0.02) {
+    ctx.strokeStyle = 'rgba(74,163,255,.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(px, py, sigma * T.scale, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(rad);
+  ctx.fillStyle = '#4aa3ff';
+  ctx.beginPath();
+  ctx.moveTo(11, 0); ctx.lineTo(-7, 7); ctx.lineTo(-7, -7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// ── Panel ────────────────────────────────────────────────────────────────
+
+function fmt(v, digits = 2, suffix = '') {
+  return (v === null || v === undefined) ? '—' : v.toFixed(digits) + suffix;
+}
+
+function updatePanel() {
+  if (!state) return;
+  document.getElementById('robotId').textContent = state.robot_id;
+
+  const room = state.room;
+  if (room && room.polygon.length >= 3) {
+    document.getElementById('area').textContent  = room.area_m2.toFixed(1);
+    document.getElementById('dims').textContent  =
+      `${room.bounding_width_m.toFixed(2)} × ${room.bounding_height_m.toFixed(2)} m`;
+    document.getElementById('perim').textContent = fmt(room.perimeter_m, 1, ' m');
+    const closed = document.getElementById('closed');
+    closed.innerHTML = room.is_closed
+      ? '<span class="pill ok">closed</span>'
+      : '<span class="pill warn">incomplete</span>';
+    document.getElementById('areaNote').textContent = room.is_closed
+      ? `Boundary complete. ${room.coverage_pct.toFixed(0)}% of the floor was directly observed; the rest is enclosed by it.`
+      : 'Boundary still open — keep following the walls until the loop closes.';
+  }
+
+  const p = state.pose;
+  if (p) {
+    document.getElementById('px').textContent   = fmt(p.x_m, 2, ' m');
+    document.getElementById('py').textContent   = fmt(p.y_m, 2, ' m');
+    document.getElementById('ph').textContent   = fmt(p.heading_deg, 0, '°');
+    document.getElementById('dist').textContent = fmt(p.distance_travelled_m, 1, ' m');
+    document.getElementById('src').textContent  = p.source.replace(/_/g, ' ').toLowerCase();
+
+    const c = Math.round((state.confidence || 0) * 100);
+    document.getElementById('confTxt').textContent = c + '%';
+    const bar = document.getElementById('confBar');
+    bar.style.width = c + '%';
+    bar.style.background = c > 60 ? 'var(--good)' : c > 25 ? 'var(--warn)' : 'var(--bad)';
+  }
+
+  const d = state.diagnostics || {};
+  document.getElementById('anchored').innerHTML = d.anchored
+    ? '<span class="pill ok">yes</span>' : '<span class="pill warn">no</span>';
+  document.getElementById('gpsAcc').textContent  = d.gps_acceptances ?? '—';
+  document.getElementById('gpsCorr').textContent = d.gps_corrections ?? '—';
+  document.getElementById('gpsRej').textContent  = d.gps_rejections ?? '—';
+  document.getElementById('gpsNote').textContent = d.last_gps_reason || '—';
+}
+
+// ── Transport ────────────────────────────────────────────────────────────
+
+let wsFailures = 0;
+let pollTimer = null;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    wsFailures = 0;
+    stopPolling();
+    document.getElementById('status').textContent = 'live';
+  };
+  ws.onclose = () => {
+    // After a few failures assume WebSockets are unavailable — most often
+    // because uvicorn was installed without its 'standard' extra — and fall
+    // back to plain HTTP polling rather than leaving a blank screen.
+    if (++wsFailures >= 3) { startPolling(); return; }
+    document.getElementById('status').textContent = 'disconnected — retrying';
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'state') {
+        state = msg.data; meta = state.grid; updatePanel(); draw();
+      }
+    } else {
+      grid = new Int8Array(ev.data);
+      draw();
+    }
+  };
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  document.getElementById('status').textContent = 'polling (no websocket)';
+  const tick = async () => {
+    try {
+      const s = await fetch('/api/state').then(r => r.json());
+      state = s; meta = s.grid; updatePanel();
+      const buf = await fetch('/api/grid').then(r => r.arrayBuffer());
+      grid = new Int8Array(buf);
+      draw();
+    } catch (e) {
+      document.getElementById('status').textContent = 'server unreachable';
+    }
+  };
+  tick();
+  pollTimer = setInterval(tick, 700);
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+function send(action) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ action }));
+  } else {
+    fetch('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action })
+    });
+  }
+}
+
+// ── Export ───────────────────────────────────────────────────────────────
+
+function downloadMap() {
+  if (!state || !state.room || state.room.polygon.length < 3) {
+    alert('No room outline yet — drive the robot around the walls first.');
+    return;
+  }
+  const poly = state.room.polygon;
+  const xs = poly.map(p => p.x_m), ys = poly.map(p => p.y_m);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 0.5, scale = 100;               // 100 px per metre
+  const w = (maxX - minX + pad * 2) * scale;
+  const h = (maxY - minY + pad * 2) * scale;
+
+  const pts = poly.map(p =>
+    `${((p.x_m - minX + pad) * scale).toFixed(1)},${((maxY - p.y_m + pad) * scale).toFixed(1)}`
+  ).join(' ');
+
+  const svg =
+`<svg xmlns="http://www.w3.org/2000/svg" width="${w.toFixed(0)}" height="${h.toFixed(0)}">
+  <rect width="100%" height="100%" fill="white"/>
+  <polygon points="${pts}" fill="#eef4fa" stroke="#1d3f5e" stroke-width="3"/>
+  <text x="12" y="24" font-family="sans-serif" font-size="16" fill="#1d3f5e">
+    ${state.room.area_m2.toFixed(1)} m² · ${state.room.bounding_width_m.toFixed(2)} × ${state.room.bounding_height_m.toFixed(2)} m
+  </text>
+</svg>`;
+
+  const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `floorplan-${state.robot_id}.svg`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+resize();
+connect();
+</script>
+</body>
+</html>

@@ -1,0 +1,284 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "title": "Room Mapper — Digital Twin",
+  "uid": "roommapper-twin",
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "robot",
+        "label": "Robot",
+        "type": "query",
+        "datasource": { "type": "influxdb", "uid": "influxdb" },
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"roommapper\", tag: \"robot_id\")",
+        "refresh": 1,
+        "current": { "text": "MR3W01", "value": "MR3W01" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Room measurement",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "Measured floor area",
+      "description": "What the robot believes the room measures. Ground truth for the simulated rectangular room is 27.0 m².",
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m2",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "text", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"room_estimate\" and r._field == \"area_m2\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> last()"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Boundary closed",
+      "description": "Whether the robot has completed a full circuit of the walls. Until it has, the area is a lower bound rather than a measurement.",
+      "gridPos": { "h": 5, "w": 4, "x": 5, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": { "text": "CLOSED", "color": "green", "index": 0 },
+                "0": { "text": "INCOMPLETE", "color": "orange", "index": 1 }
+              }
+            }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        }
+      },
+      "options": { "colorMode": "background", "textMode": "auto" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"room_estimate\" and r._field == \"is_closed\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> last()\n  |> map(fn: (r) => ({ r with _value: if r._value then 1.0 else 0.0 }))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Area estimate converging",
+      "description": "The area estimate should settle as the robot completes its circuit. A figure still climbing means the boundary is not closed.",
+      "gridPos": { "h": 5, "w": 15, "x": 9, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m2",
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"room_estimate\" and r._field == \"area_m2\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Position and twin fidelity",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Sim-to-real divergence",
+      "description": "How far the real robot has drifted from where perfect, slip-free execution of the same commands would have put it. This is the headline research number.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "lengthm",
+          "custom": { "lineWidth": 2, "fillOpacity": 15, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.2 },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"twin_gap\" and r._field == \"position_error_m\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pose uncertainty",
+      "description": "One-sigma error the filter reports. Above 0.5 m new scans stop being written into the map.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "lengthm",
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"robot_pose\" and (r._field == \"std_x_m\" or r._field == \"std_y_m\"))\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "GNSS — why it does not draw the map",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "type": "stat",
+      "title": "Satellites",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 15 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 4 },
+              { "color": "green", "value": 5 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"gps_status\" and r._field == \"satellites\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> last()"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "HDOP",
+      "description": "Horizontal dilution of precision. Above 2.0 the fix is refused for position correction — indoors it is typically 6 to 25.",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 15 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 2 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"gps_status\" and r._field == \"hdop\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> last()"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Fixes usable for positioning",
+      "description": "1 when a fix passes the accuracy gate, 0 otherwise. Indoors this stays flat at zero, which is the point: GPS georeferences the map, it does not draw it.",
+      "gridPos": { "h": 5, "w": 16, "x": 8, "y": 15 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 25, "showPoints": "never", "lineInterpolation": "stepAfter" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"gps_status\" and r._field == \"usable\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> map(fn: (r) => ({ r with _value: if r._value then 1.0 else 0.0 }))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Robot health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Range sensors",
+      "description": "Distance to the nearest wall on each sensor. A reading pinned at max range means no echo returned.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 21 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "lengthm",
+          "custom": { "lineWidth": 1, "fillOpacity": 5, "showPoints": "never" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"robot_sensors\" and r._field =~ /^range_/)\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Distance travelled",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 21 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "lengthm",
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"roommapper\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"robot_pose\" and r._field == \"distance_travelled_m\")\n  |> filter(fn: (r) => r.robot_id == \"${robot}\")\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)"
+        }
+      ]
+    }
+  ]
+}

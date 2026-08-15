@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Project outputs
+divergence.csv
+*.usd
+maps/
+floorplan-*.svg
+
+# Editors
+.vscode/
+.idea/
+.vs/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Secrets — never commit real credentials
+.env
