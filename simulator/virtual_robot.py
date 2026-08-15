@@ -173,6 +173,22 @@ class NoiseProfile:
     gps_outdoor_noise_m: float = 2.5
     gps_indoor_noise_m: float = 25.0
 
+    # ── BLE beacons ─────────────────────────────────────────────────────
+    # Log-normal shadowing, one sigma in dB. Four to eight is the range
+    # normally measured in furnished indoor spaces; 6 is a fair middle.
+    # This single number dominates RSSI positioning accuracy.
+    ble_shadowing_sigma_db: float = 6.0
+    # Beacons are not identical. Their true TxPower varies by several dB from
+    # the nominal figure, and unless each is individually calibrated that
+    # error is indistinguishable from distance.
+    ble_tx_power_spread_db: float = 2.5
+    # A body between tag and beacon costs this much. Common enough in a room
+    # with people in it to be worth modelling.
+    ble_body_blocking_db: float = 8.0
+    ble_body_blocking_rate: float = 0.08
+    # Beyond this the beacon is not heard at all.
+    ble_max_range_m: float = 25.0
+
 
 # ── The robot ─────────────────────────────────────────────────────────────────
 
@@ -376,6 +392,63 @@ class VirtualRobot:
             satellites=satellites,
             hdop=round(hdop, 1),
         )
+
+    # ── BLE beacons ───────────────────────────────────────────────────────
+
+    def attach_beacons(self, layout) -> None:
+        """Install a beacon layout for the robot to hear.
+
+        Each beacon gets a fixed per-beacon TxPower offset, drawn once. That
+        offset is *systematic*: it does not average away over samples, which
+        is why per-beacon calibration matters more than sample count.
+        """
+        self.beacon_layout = layout
+        self._beacon_tx_offsets = {
+            beacon.beacon_id: self.rng.gauss(0.0, self.noise.ble_tx_power_spread_db)
+            for beacon in layout.as_list()
+        }
+
+    def read_beacons(self):
+        """RSSI from every beacon in range, with realistic impairments.
+
+        Three error sources, all of which exist in a real room:
+
+        * **Log-normal shadowing** — the dominant term, and zero-mean, so
+          averaging several advertisements does help.
+        * **Per-beacon TxPower error** — systematic, so averaging does NOT
+          help. Only calibration does.
+        * **Body blocking** — occasional deep fades from someone standing in
+          the path. These are one-sided and produce outliers, not noise.
+        """
+        from robotmap_common.rssi import BeaconReading, distance_to_rssi
+
+        layout = getattr(self, "beacon_layout", None)
+        if layout is None:
+            return []
+
+        readings = []
+        for beacon in layout.as_list():
+            distance = beacon.distance_to(self.true_x, self.true_y)
+            if distance > self.noise.ble_max_range_m:
+                continue
+
+            true_rssi = distance_to_rssi(
+                distance,
+                beacon.tx_power_dbm + self._beacon_tx_offsets.get(beacon.beacon_id, 0.0),
+                # The simulator attenuates as a furnished room does; the solver
+                # is not told this and uses its own assumed exponent, exactly
+                # as it would on real hardware.
+                path_loss_exponent=2.7,
+            )
+
+            rssi = true_rssi + self.rng.gauss(0.0, self.noise.ble_shadowing_sigma_db)
+
+            if self.rng.random() < self.noise.ble_body_blocking_rate:
+                rssi -= abs(self.rng.gauss(self.noise.ble_body_blocking_db, 3.0))
+
+            readings.append(BeaconReading(beacon.beacon_id, rssi))
+
+        return readings
 
     # ── Packet assembly ───────────────────────────────────────────────────
 

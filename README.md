@@ -133,6 +133,27 @@ RTK GNSS does clear it, and is used for corrections when present.
 
 Full reasoning and numbers: **[docs/LOCALIZATION.md](docs/LOCALIZATION.md)**
 
+### Bluetooth trilateration — built, and measured
+
+RSSI positioning from four corner beacons is fully implemented. Measured over
+a circuit of a 6.0 × 4.5 m room:
+
+| | Error | vs odometry |
+|---|---|---|
+| Quiet corridor (2 dB) | 1.28 m | 18.7× worse |
+| **Typical room (6 dB)** | **2.71 m** | **39.5× worse** |
+| Cluttered office (10 dB) | 4.79 m | 69.8× worse |
+
+So it is gated out of the map for the same reason as GPS — 2.71 m of error in
+a 4.5 m room puts walls nowhere near where they belong.
+
+**But it earns its place**, because it fails differently: RSSI error was 2.66 m
+in the first third of the circuit and 2.70 m in the last — **flat**. Odometry
+drifts without bound and cannot detect a robot being picked up and moved. RSSI
+recovers instantly.
+
+Details, including beacon-placement rules: **[docs/BLUETOOTH-POSITIONING.md](docs/BLUETOOTH-POSITIONING.md)**
+
 ---
 
 ## Moving the robot
@@ -145,8 +166,23 @@ simulation has to be reimplemented for hardware.
 
 | You have | Run | Physics? |
 |---|---|---|
-| Omniverse Kit / Code / USD Composer | paste [`omniverse/kit_holonomic.py`](omniverse/kit_holonomic.py) into *Window > Script Editor* | no — kinematic, like your DT project |
+| **Any Kit app** | paste [`omniverse/kit_room_3d.py`](omniverse/kit_room_3d.py) — **furnished 3D room with beacons** | no |
+| Omniverse Kit / Code / USD Composer | [`omniverse/kit_holonomic.py`](omniverse/kit_holonomic.py) — movement only | no |
 | Isaac Sim | `isaac-sim/python.bat omniverse/run_isaac.py --mode teleop` | yes |
+
+`kit_room_3d.py` builds the digital twin scene: walls with a doorway and
+window, table, chairs, sofa, cabinet, and the four BLE beacons in the corners.
+
+It draws **three** robots, and the gap between them is the point:
+
+| | |
+|---|---|
+| 🔵 solid blue | where the robot actually is |
+| 🟢 green ghost | wheel odometry — **0.07 m** mean error |
+| 🟠 orange sphere | Bluetooth RSSI — **2.71 m** mean error |
+
+Watching the orange marker drift across the sofa while the green one stays on
+the robot explains the architecture in one glance.
 
 Keys in teleop: `W`/`S` forward/back, **`A`/`D` strafe left/right**, `Q`/`E`
 rotate. The strafe keys are the point — a differential robot cannot do that.

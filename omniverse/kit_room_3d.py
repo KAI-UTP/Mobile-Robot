@@ -1,0 +1,527 @@
+"""A furnished 3D room in Omniverse, with the robot and its BLE beacons.
+
+    Window > Script Editor, paste this whole file, Ctrl+Enter.
+
+Builds a realistic room rather than an empty box: walls with a doorway and a
+window, a table and chairs, a sofa, a cabinet, a rug — and the four Bluetooth
+beacons in the corners, so the positioning setup is visible rather than
+implied.
+
+Three robots are drawn, and the difference between them is the point
+-------------------------------------------------------------------
+* **Solid blue** — where the robot actually is (ground truth).
+* **Green outline** — where wheel odometry thinks it is. It tracks closely.
+* **Orange sphere** — where Bluetooth trilateration thinks it is. It wanders
+  metres away, all the time.
+
+Measured over a full circuit of this room, odometry averages 0.07 m of error
+and RSSI averages 2.71 m — about 60 % of the room's short dimension. Seeing
+the orange marker drift across the sofa while the green one stays on the robot
+explains, in one glance, why the map is built from odometry and Bluetooth is
+used only for room-level presence.
+
+Furniture is not decoration
+---------------------------
+It attenuates radio and blocks ultrasonic pulses, which is exactly why real
+rooms are harder than empty ones. The layout below is deliberately awkward:
+a table in the middle of the floor and a sofa across one corner.
+
+Data source
+-----------
+Reads the same pose file `services/twin-control` writes, so no packages need
+installing inside Kit. Set `USE_MQTT = True` if paho is available.
+"""
+
+import json
+import math
+import os
+import random
+import tempfile
+
+import omni.kit.app
+import omni.usd
+from pxr import Gf, Sdf, UsdGeom, UsdLux, Vt
+
+# ── Configuration ───────────────────────────────────────────────────────────
+
+ROOM_W = 6.0
+ROOM_H = 4.5
+WALL_HEIGHT = 2.4
+WALL_THICK = 0.12
+
+ROBOT_ID = "MR3W01"
+POSE_FILE = os.path.join(tempfile.gettempdir(), f"roommapper_{ROBOT_ID}_pose.json")
+USE_MQTT = False
+MQTT_HOST = "localhost"
+
+SHOW_ODOMETRY_GHOST = True
+SHOW_RSSI_MARKER = True
+SHOW_BEACON_RANGES = False   # rings showing inferred distance; busy but instructive
+
+# Measured mean error of RSSI trilateration in this room, from
+# tests/test_rssi_accuracy.py. Used to animate the marker realistically when
+# running without a live RSSI feed.
+RSSI_TYPICAL_ERROR_M = 2.71
+
+UPDATE_HZ = 60.0
+SMOOTHING = 0.25
+
+# ── Palette ─────────────────────────────────────────────────────────────────
+
+COL_FLOOR      = (0.74, 0.68, 0.58)
+COL_RUG        = (0.35, 0.42, 0.50)
+COL_WALL       = (0.90, 0.89, 0.86)
+COL_SKIRTING   = (0.82, 0.80, 0.76)
+COL_TABLE      = (0.45, 0.31, 0.20)
+COL_CHAIR      = (0.30, 0.28, 0.26)
+COL_SOFA       = (0.32, 0.38, 0.45)
+COL_CABINET    = (0.52, 0.38, 0.26)
+COL_DOOR       = (0.65, 0.50, 0.36)
+COL_WINDOW     = (0.62, 0.78, 0.88)
+COL_ROBOT      = (0.15, 0.55, 0.90)
+COL_ROBOT_NOSE = (0.98, 0.78, 0.15)
+COL_ODOM       = (0.25, 0.80, 0.35)
+COL_RSSI       = (0.95, 0.55, 0.15)
+COL_BEACON     = (0.85, 0.25, 0.75)
+COL_TRAIL      = (0.95, 0.60, 0.20)
+
+ROOT = "/World/RoomScan"
+
+
+# ── Primitive helpers ───────────────────────────────────────────────────────
+
+
+def _colour(prim, rgb, opacity=None):
+    prim.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*rgb)]))
+    if opacity is not None:
+        UsdGeom.Gprim(prim).CreateDisplayOpacityAttr(Vt.FloatArray([opacity]))
+    return prim
+
+
+def box(stage, path, centre, size, rgb, opacity=None):
+    """An axis-aligned box, given its centre and full extents."""
+    prim = UsdGeom.Cube.Define(stage, Sdf.Path(path))
+    prim.CreateSizeAttr(1.0)
+    api = UsdGeom.XformCommonAPI(prim)
+    api.SetTranslate(Gf.Vec3d(*centre))
+    api.SetScale(Gf.Vec3f(*size))
+    return _colour(prim, rgb, opacity)
+
+
+def cylinder(stage, path, centre, radius, height, rgb, rotate=None, opacity=None):
+    prim = UsdGeom.Cylinder.Define(stage, Sdf.Path(path))
+    prim.CreateRadiusAttr(radius)
+    prim.CreateHeightAttr(height)
+    prim.CreateAxisAttr("Z")
+    api = UsdGeom.XformCommonAPI(prim)
+    api.SetTranslate(Gf.Vec3d(*centre))
+    if rotate:
+        api.SetRotate(Gf.Vec3f(*rotate))
+    return _colour(prim, rgb, opacity)
+
+
+def sphere(stage, path, centre, radius, rgb, opacity=None):
+    prim = UsdGeom.Sphere.Define(stage, Sdf.Path(path))
+    prim.CreateRadiusAttr(radius)
+    UsdGeom.XformCommonAPI(prim).SetTranslate(Gf.Vec3d(*centre))
+    return _colour(prim, rgb, opacity)
+
+
+# ── The room ────────────────────────────────────────────────────────────────
+
+
+def build_shell(stage):
+    """Floor, walls, a doorway and a window.
+
+    The doorway is built as two wall segments with a gap rather than a solid
+    wall, because an opening is what makes the room realistic for both the
+    range sensors and the radio model — and it is where a real robot would
+    drive out and get lost.
+    """
+    UsdGeom.Xform.Define(stage, Sdf.Path(f"{ROOT}/Room"))
+
+    box(stage, f"{ROOT}/Room/Floor",
+        (ROOM_W / 2, ROOM_H / 2, -0.02), (ROOM_W, ROOM_H, 0.04), COL_FLOOR)
+
+    h = WALL_HEIGHT / 2
+    t = WALL_THICK
+
+    # South wall, split around a 0.9 m doorway.
+    door_x, door_w = 4.3, 0.9
+    left_w = door_x - door_w / 2
+    box(stage, f"{ROOT}/Room/WallS_left",
+        (left_w / 2, 0, h), (left_w, t, WALL_HEIGHT), COL_WALL)
+    right_start = door_x + door_w / 2
+    right_w = ROOM_W - right_start
+    box(stage, f"{ROOT}/Room/WallS_right",
+        (right_start + right_w / 2, 0, h), (right_w, t, WALL_HEIGHT), COL_WALL)
+    # Lintel above the opening.
+    box(stage, f"{ROOT}/Room/WallS_lintel",
+        (door_x, 0, 2.15), (door_w, t, 0.5), COL_WALL)
+    # The door itself, swung open into the room.
+    box(stage, f"{ROOT}/Room/Door",
+        (door_x + 0.42, 0.42, 1.0), (0.05, 0.85, 2.0), COL_DOOR)
+
+    box(stage, f"{ROOT}/Room/WallN",
+        (ROOM_W / 2, ROOM_H, h), (ROOM_W, t, WALL_HEIGHT), COL_WALL)
+    box(stage, f"{ROOT}/Room/WallW",
+        (0, ROOM_H / 2, h), (t, ROOM_H, WALL_HEIGHT), COL_WALL)
+    box(stage, f"{ROOT}/Room/WallE",
+        (ROOM_W, ROOM_H / 2, h), (t, ROOM_H, WALL_HEIGHT), COL_WALL)
+
+    # A window in the north wall.
+    box(stage, f"{ROOT}/Room/Window",
+        (2.0, ROOM_H, 1.45), (1.6, 0.02, 1.1), COL_WINDOW, opacity=0.35)
+
+    # Skirting, purely so the scene reads as a room rather than a box.
+    for name, centre, size in (
+        ("N", (ROOM_W / 2, ROOM_H - t / 2, 0.05), (ROOM_W, 0.03, 0.10)),
+        ("W", (t / 2, ROOM_H / 2, 0.05), (0.03, ROOM_H, 0.10)),
+        ("E", (ROOM_W - t / 2, ROOM_H / 2, 0.05), (0.03, ROOM_H, 0.10)),
+    ):
+        box(stage, f"{ROOT}/Room/Skirting{name}", centre, size, COL_SKIRTING)
+
+    print(f"[room] shell built: {ROOM_W} x {ROOM_H} x {WALL_HEIGHT} m, one doorway")
+
+
+def build_furniture(stage):
+    """Obstacles that make the room hard, in the places that make it hardest.
+
+    Every item here blocks ultrasonic pulses and attenuates radio. The table
+    sits in open floor so the robot must go round it; the sofa cuts a corner,
+    which is where wall-following most often loses the wall.
+    """
+    UsdGeom.Xform.Define(stage, Sdf.Path(f"{ROOT}/Furniture"))
+    f = f"{ROOT}/Furniture"
+
+    # Rug — visual only, but it is where wheel slip would be worst.
+    box(stage, f"{f}/Rug", (2.6, 2.3, 0.005), (2.4, 1.6, 0.01), COL_RUG)
+
+    # Dining table with four legs and four chairs.
+    table_x, table_y = 2.6, 2.3
+    box(stage, f"{f}/TableTop", (table_x, table_y, 0.74), (1.4, 0.85, 0.06), COL_TABLE)
+    for index, (dx, dy) in enumerate(((-0.62, -0.36), (0.62, -0.36), (-0.62, 0.36), (0.62, 0.36))):
+        cylinder(stage, f"{f}/TableLeg_{index}",
+                 (table_x + dx, table_y + dy, 0.36), 0.035, 0.72, COL_TABLE)
+
+    for index, (cx, cy, rot) in enumerate((
+        (table_x - 1.0, table_y, 0), (table_x + 1.0, table_y, 180),
+        (table_x, table_y - 0.75, 90), (table_x, table_y + 0.75, 270),
+    )):
+        box(stage, f"{f}/Chair_{index}_seat", (cx, cy, 0.45), (0.42, 0.42, 0.05), COL_CHAIR)
+        back_dx = 0.19 * math.cos(math.radians(rot))
+        back_dy = 0.19 * math.sin(math.radians(rot))
+        box(stage, f"{f}/Chair_{index}_back",
+            (cx - back_dx, cy - back_dy, 0.68), (0.42, 0.05, 0.45), COL_CHAIR)
+        for leg, (lx, ly) in enumerate(((-0.17, -0.17), (0.17, -0.17), (-0.17, 0.17), (0.17, 0.17))):
+            cylinder(stage, f"{f}/Chair_{index}_leg{leg}",
+                     (cx + lx, cy + ly, 0.22), 0.02, 0.44, COL_CHAIR)
+
+    # Sofa across the north-west corner.
+    box(stage, f"{f}/SofaBase", (1.1, 3.7, 0.22), (2.0, 0.85, 0.44), COL_SOFA)
+    box(stage, f"{f}/SofaBack", (1.1, 4.05, 0.58), (2.0, 0.18, 0.72), COL_SOFA)
+    box(stage, f"{f}/SofaArmL", (0.15, 3.7, 0.42), (0.18, 0.85, 0.28), COL_SOFA)
+    box(stage, f"{f}/SofaArmR", (2.05, 3.7, 0.42), (0.18, 0.85, 0.28), COL_SOFA)
+
+    # Cabinet against the east wall.
+    box(stage, f"{f}/Cabinet", (5.6, 2.6, 0.55), (0.45, 1.5, 1.10), COL_CABINET)
+
+    # Bin — small, low, and exactly the sort of thing sonar misses.
+    cylinder(stage, f"{f}/Bin", (5.55, 0.6, 0.18), 0.16, 0.36, COL_CHAIR)
+
+    print("[room] furniture placed: table, 4 chairs, sofa, cabinet, bin, rug")
+
+
+def build_beacons(stage):
+    """The four BLE beacons, mounted high in the corners.
+
+    Corners maximise the spread of bearings from anywhere inside, which is
+    what keeps the geometry well conditioned. Four rather than three means one
+    blocked beacon still leaves a solvable fix.
+
+    Putting them all along one wall makes trilateration mathematically
+    impossible, not merely worse — a mistake worth being able to point at in
+    the scene.
+    """
+    UsdGeom.Xform.Define(stage, Sdf.Path(f"{ROOT}/Beacons"))
+    height = 2.1
+
+    for index, (x, y) in enumerate(
+        ((0.15, 0.15), (ROOM_W - 0.15, 0.15), (ROOM_W - 0.15, ROOM_H - 0.15), (0.15, ROOM_H - 0.15))
+    ):
+        path = f"{ROOT}/Beacons/B{index + 1}"
+        box(stage, f"{path}_body", (x, y, height), (0.09, 0.09, 0.03), COL_BEACON)
+        sphere(stage, f"{path}_glow", (x, y, height), 0.14, COL_BEACON, opacity=0.28)
+
+        light = UsdLux.SphereLight.Define(stage, Sdf.Path(f"{path}_light"))
+        light.CreateRadiusAttr(0.05)
+        light.CreateIntensityAttr(2000.0)
+        light.CreateColorAttr(Gf.Vec3f(*COL_BEACON))
+        UsdGeom.XformCommonAPI(light).SetTranslate(Gf.Vec3d(x, y, height))
+
+    print("[room] 4 BLE beacons at the corners, 2.1 m high")
+
+
+def build_lighting(stage):
+    dome = UsdLux.DomeLight.Define(stage, Sdf.Path(f"{ROOT}/Lighting/Sky"))
+    dome.CreateIntensityAttr(400.0)
+
+    ceiling = UsdLux.RectLight.Define(stage, Sdf.Path(f"{ROOT}/Lighting/Ceiling"))
+    ceiling.CreateWidthAttr(2.5)
+    ceiling.CreateHeightAttr(2.0)
+    ceiling.CreateIntensityAttr(3000.0)
+    api = UsdGeom.XformCommonAPI(ceiling)
+    api.SetTranslate(Gf.Vec3d(ROOM_W / 2, ROOM_H / 2, WALL_HEIGHT - 0.1))
+    api.SetRotate(Gf.Vec3f(180.0, 0.0, 0.0))
+
+
+# ── The robots ──────────────────────────────────────────────────────────────
+
+
+def build_robot(stage, path, rgb, opacity=None, with_wheels=True):
+    UsdGeom.Xform.Define(stage, Sdf.Path(path))
+    cylinder(stage, f"{path}/Body", (0, 0, 0.06), 0.14, 0.06, rgb, opacity=opacity)
+    # Nose marker: without it, strafing and driving forward look identical.
+    box(stage, f"{path}/Nose", (0.11, 0, 0.07), (0.07, 0.025, 0.025),
+        COL_ROBOT_NOSE, opacity=opacity)
+
+    if with_wheels:
+        for index, angle_deg in enumerate((0.0, 120.0, 240.0)):
+            a = math.radians(angle_deg)
+            cylinder(stage, f"{path}/Wheel_{index}",
+                     (0.10 * math.cos(a), 0.10 * math.sin(a), 0.029),
+                     0.029, 0.018, (0.12, 0.12, 0.14),
+                     rotate=(90.0, 0.0, angle_deg + 90.0))
+    return stage.GetPrimAtPath(path)
+
+
+def build_all_robots(stage):
+    build_robot(stage, f"{ROOT}/RobotTrue", COL_ROBOT)
+
+    if SHOW_ODOMETRY_GHOST:
+        build_robot(stage, f"{ROOT}/RobotOdometry", COL_ODOM,
+                    opacity=0.45, with_wheels=False)
+
+    if SHOW_RSSI_MARKER:
+        UsdGeom.Xform.Define(stage, Sdf.Path(f"{ROOT}/RssiEstimate"))
+        sphere(stage, f"{ROOT}/RssiEstimate/Marker", (0, 0, 0.35), 0.16, COL_RSSI, opacity=0.75)
+        # A ring at the typical error radius, so the uncertainty is a size on
+        # the floor rather than a number in a log.
+        cylinder(stage, f"{ROOT}/RssiEstimate/ErrorRing",
+                 (0, 0, 0.01), RSSI_TYPICAL_ERROR_M, 0.012, COL_RSSI, opacity=0.10)
+
+    UsdGeom.Xform.Define(stage, Sdf.Path(f"{ROOT}/Trail"))
+
+
+# ── Pose sources ────────────────────────────────────────────────────────────
+
+
+class FilePose:
+    """Reads the pose file twin-control writes."""
+
+    def __init__(self, path=POSE_FILE):
+        self.path = path
+        self.latest = None
+        self._mtime = 0.0
+
+    def read(self):
+        try:
+            mtime = os.path.getmtime(self.path)
+            if mtime != self._mtime:
+                self._mtime = mtime
+                with open(self.path, encoding="utf-8") as handle:
+                    self.latest = json.load(handle)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"[room] pose read failed: {exc}")
+        return self.latest
+
+
+class DemoPose:
+    """Drives a lap on its own when nothing is publishing.
+
+    So the scene is worth looking at with no stack running — and the RSSI
+    marker still behaves correctly, because its wander is drawn from the same
+    error the accuracy tests measured rather than invented.
+    """
+
+    def __init__(self):
+        self.t = 0.0
+        self.rng = random.Random(7)
+        # Wall-following path, inset from the walls by the standoff distance.
+        self.waypoints = [
+            (0.6, 0.6), (5.4, 0.6), (5.4, 3.9), (0.6, 3.9),
+        ]
+        self.index = 0
+        self.x, self.y = self.waypoints[0]
+        self.heading = 0.0
+
+    def read(self):
+        self.t += 1.0 / UPDATE_HZ
+        target = self.waypoints[(self.index + 1) % len(self.waypoints)]
+
+        dx, dy = target[0] - self.x, target[1] - self.y
+        distance = math.hypot(dx, dy)
+        if distance < 0.08:
+            self.index = (self.index + 1) % len(self.waypoints)
+        else:
+            step = 0.35 / UPDATE_HZ
+            self.x += dx / distance * step
+            self.y += dy / distance * step
+            self.heading = math.degrees(math.atan2(dy, dx)) % 360.0
+
+        return {
+            "x_m": self.x,
+            "y_m": self.y,
+            "heading_deg": self.heading,
+            # Odometry tracks closely: 0.07 m measured over a circuit.
+            "ideal_x_m": self.x + self.rng.gauss(0, 0.05),
+            "ideal_y_m": self.y + self.rng.gauss(0, 0.05),
+            "ideal_heading_deg": self.heading,
+            # RSSI wanders by metres. 2.71 m mean error, measured.
+            "rssi_x_m": self.x + self.rng.gauss(0, RSSI_TYPICAL_ERROR_M * 0.8),
+            "rssi_y_m": self.y + self.rng.gauss(0, RSSI_TYPICAL_ERROR_M * 0.8),
+        }
+
+
+# ── Animation ───────────────────────────────────────────────────────────────
+
+
+def _shortest_angle(target, current):
+    diff = (target - current + 180.0) % 360.0 - 180.0
+    return diff + 360.0 if diff <= -180.0 else diff
+
+
+class RoomScene:
+    def __init__(self, stage, source):
+        self.stage = stage
+        self.source = source
+        self.subscription = None
+
+        self.x = self.y = self.heading = 0.0
+        self.ox = self.oy = 0.0
+        self.rx = self.ry = 0.0
+        self.trail_index = 0
+        self._last_trail = (0.0, 0.0)
+        self._frames = 0
+
+    def start(self):
+        app = omni.kit.app.get_app()
+        self.subscription = app.get_update_event_stream().create_subscription_to_pop(
+            self._on_update, name="roomscan_3d"
+        )
+        print("[room] running — call stop_room() to end")
+
+    def _place(self, path, x, y, heading=None, z=None):
+        prim = self.stage.GetPrimAtPath(path)
+        if not prim:
+            return
+        api = UsdGeom.XformCommonAPI(prim)
+        api.SetTranslate(Gf.Vec3d(x, y, z if z is not None else 0.0))
+        if heading is not None:
+            api.SetRotate(Gf.Vec3f(0.0, 0.0, heading))
+
+    def _on_update(self, event):
+        pose = self.source.read()
+        if not pose:
+            return
+
+        tx = float(pose.get("x_m", 0.0))
+        ty = float(pose.get("y_m", 0.0))
+        th = float(pose.get("heading_deg", 0.0))
+
+        # Chase rather than snap: telemetry arrives at ~10 Hz, Kit renders at
+        # 60, and snapping shows as a visible stutter.
+        self.x += (tx - self.x) * SMOOTHING
+        self.y += (ty - self.y) * SMOOTHING
+        self.heading = (self.heading + _shortest_angle(th, self.heading) * SMOOTHING) % 360.0
+        self._place(f"{ROOT}/RobotTrue", self.x, self.y, self.heading)
+
+        if SHOW_ODOMETRY_GHOST:
+            gx = float(pose.get("ideal_x_m", tx))
+            gy = float(pose.get("ideal_y_m", ty))
+            self.ox += (gx - self.ox) * SMOOTHING
+            self.oy += (gy - self.oy) * SMOOTHING
+            self._place(f"{ROOT}/RobotOdometry", self.ox, self.oy,
+                        float(pose.get("ideal_heading_deg", th)))
+
+        if SHOW_RSSI_MARKER and "rssi_x_m" in pose:
+            # Slower smoothing: RSSI genuinely jumps, and showing that is the
+            # point of the marker.
+            self.rx += (float(pose["rssi_x_m"]) - self.rx) * 0.08
+            self.ry += (float(pose["rssi_y_m"]) - self.ry) * 0.08
+            self._place(f"{ROOT}/RssiEstimate", self.rx, self.ry)
+
+        self._drop_trail()
+
+        self._frames += 1
+        if self._frames % 300 == 0:
+            rssi_gap = math.hypot(self.rx - self.x, self.ry - self.y)
+            odom_gap = math.hypot(self.ox - self.x, self.oy - self.y)
+            print(f"[room] robot ({self.x:.2f}, {self.y:.2f})  "
+                  f"odometry off by {odom_gap:.2f} m  RSSI off by {rssi_gap:.2f} m")
+
+    def _drop_trail(self, spacing=0.15):
+        if math.hypot(self.x - self._last_trail[0], self.y - self._last_trail[1]) < spacing:
+            return
+        box(self.stage, f"{ROOT}/Trail/Dot_{self.trail_index}",
+            (self.x, self.y, 0.008), (0.035, 0.035, 0.008), COL_TRAIL)
+        self.trail_index += 1
+        self._last_trail = (self.x, self.y)
+
+    def stop(self):
+        if self.subscription is not None:
+            self.subscription.unsubscribe()
+            self.subscription = None
+
+
+# ── Entry points ────────────────────────────────────────────────────────────
+
+_scene = None
+
+
+def build_room():
+    """Build the scene without animating it."""
+    stage = omni.usd.get_context().get_stage()
+    UsdGeom.Xform.Define(stage, Sdf.Path(ROOT))
+
+    build_shell(stage)
+    build_furniture(stage)
+    build_beacons(stage)
+    build_lighting(stage)
+    build_all_robots(stage)
+
+    print()
+    print("  blue     = where the robot is")
+    print("  green    = wheel odometry     (0.07 m mean error, measured)")
+    print("  orange   = Bluetooth RSSI     (2.71 m mean error, measured)")
+    print("  magenta  = BLE beacons")
+    print()
+    return stage
+
+
+def run_room():
+    global _scene
+    stop_room()
+
+    stage = build_room()
+
+    source = FilePose()
+    if source.read() is None:
+        print("[room] no live pose found — running the built-in demo lap")
+        print("       start services/twin-control/main.py for live data")
+        source = DemoPose()
+
+    _scene = RoomScene(stage, source)
+    _scene.start()
+
+
+def stop_room():
+    global _scene
+    if _scene is not None:
+        _scene.stop()
+        _scene = None
+
+
+run_room()
