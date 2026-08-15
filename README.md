@@ -21,9 +21,26 @@ Universiti Teknologi PETRONAS · Research Project
 
 ---
 
-## See it work in 30 seconds
+## The whole twin, one command
 
-No hardware, no broker, no Docker required:
+```bash
+docker compose up --build -d
+```
+
+| | |
+|---|---|
+| <http://localhost:8080> | live map |
+| <http://localhost:8080/compare> | **the real room beside the room the robot drew** |
+| <http://localhost:3000> | Grafana dashboards (admin / admin) |
+| <http://localhost:8086> | InfluxDB (admin / roommapper123) |
+
+Comes up with the simulator running, so there is data flowing and nothing to
+configure. Grafana's datasource and dashboard are provisioned — no clicking.
+
+Verified end to end in Docker: **26.77 m² measured against 27.00 m² truth,
+IoU 0.993, grade EXCELLENT.**
+
+### Or without Docker
 
 ```bash
 pip install -r requirements.txt
@@ -178,6 +195,32 @@ packets are sent, so no wheel can move. Then:
 python services/servo-bus/calibrate.py --port COM5 --spin-each
 ```
 
+## The two screens
+
+`/compare` puts them side by side:
+
+| Screen 1 | Screen 2 |
+|---|---|
+| The room that actually exists | The room the robot drew from its own sensors |
+
+Both are rendered at the **same scale**, so the shapes are comparable by eye,
+and the robot's outline is overlaid faintly on screen 1 so any discrepancy
+shows up in place rather than only as a number.
+
+It is scored, not just shown:
+
+| Metric | What it catches that the others miss |
+|---|---|
+| Area error | the headline — and the easiest to satisfy with a wrong map |
+| Dimension error | a room the right area but the wrong proportions |
+| **IoU** | size, shape *and* position together — the honest single number |
+| Centroid offset | separates "wrong shape" from "right shape, wrong place" |
+
+Why IoU rather than grading on area: a room measured 9 × 3 m has *exactly* the
+correct 27 m² area while being entirely the wrong shape. Area error calls that
+perfect; IoU calls it POOR. `test_area_can_be_right_while_the_grade_is_not`
+pins it.
+
 ## Architecture
 
 ```
@@ -321,15 +364,19 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 ```
 
-305 tests, about 14 seconds, no hardware, broker or Isaac Sim needed.
+601 tests, about 16 seconds, no hardware, broker or Isaac Sim needed. CI runs
+them on Python 3.11 and 3.12, plus a Docker build that boots the image and
+checks it actually maps a room.
 
 | File | Covers |
 |---|---|
 | `test_holonomic.py` | Kiwi-drive kinematics: IK/FK round trip, arc integration, strafing |
+| `test_comparison.py` | Twin fidelity: IoU, alignment, and the metrics' blind spots |
 | `test_twin_control.py` | Twin fan-out, slip detection, divergence bookkeeping |
 | `test_nmea.py` | GPS sentence parsing, checksums, the indoor-fix case |
 | `test_robot_agent.py` | PC-side packet assembly, stale-fix rejection |
 | `test_drive_controller.py` | Isaac controller against a fake articulation |
+| `test_source_hygiene.py` | Every file compiles, LF endings, no mojibake or BOM |
 | `test_holonomic_fusion.py` | Three-wheel odometry through the pose filter |
 | `test_servo_protocols.py` | Servo wire formats: framing, checksums, byte order |
 | `test_geometry.py` | Differential kinematics, geodesy, polygon maths |
