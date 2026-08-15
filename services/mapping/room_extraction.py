@@ -47,7 +47,12 @@ from robotmap_common.geometry import (
     polygon_area_m2,
     polygon_perimeter_m,
 )
-from robotmap_common.models import Point2D, PoseEstimate, RoomOutline
+from robotmap_common.models import (
+    ObstacleFootprint,
+    Point2D,
+    PoseEstimate,
+    RoomOutline,
+)
 
 from .occupancy_grid import OccupancyGrid
 
@@ -413,6 +418,11 @@ class RoomExtractor:
         # the coverage figure is reported against.
         observed_cells = int(interior.sum())
 
+        # Keep the un-filled mask: obstacle detection needs the difference
+        # between the room's filled footprint and its actual free floor, and
+        # once the holes are filled that difference is gone.
+        observed_free = interior.copy()
+
         interior = self.fill_holes(interior)
 
         # Grow out to the wall face so the outline sits on the wall rather
@@ -454,11 +464,16 @@ class RoomExtractor:
         observed_area = observed_cells * cell_area
         coverage = min(100.0, (observed_area / area * 100.0) if area > 0 else 0.0)
 
+        obstacles = self.find_obstacles(grid, observed_free)
+        blocked = sum(o["area_m2"] for o in obstacles)
+
         return RoomOutline(
             robot_id=robot_id,
             timestamp=timestamp,
             polygon=[Point2D(x_m=x, y_m=y) for x, y in simplified],
             area_m2=area,
+            obstacles=[ObstacleFootprint(**o) for o in obstacles],
+            blocked_area_m2=blocked,
             perimeter_m=perimeter,
             bounding_width_m=long_side_m,
             bounding_height_m=short_side_m,
@@ -495,6 +510,124 @@ class RoomExtractor:
             return False
         unknown_border = int((border & unknown).sum())
         return (unknown_border / border_count) < 0.15
+
+    # ── Obstacles inside the room ─────────────────────────────────────────
+
+    def find_obstacles(
+        self, grid: OccupancyGrid, interior: np.ndarray, min_area_m2: float = 0.02
+    ) -> list[dict]:
+        """Occupied islands sitting inside the room — furniture, not walls.
+
+        A boundary wall and a table leg look identical to a range sensor: both
+        are simply "occupied". What separates them is *where* they are. A wall
+        encloses the room; furniture is surrounded by the room's own floor.
+
+        So an occupied region is furniture when it is fully enclosed by the
+        interior free space, and wall when it touches the outside. That
+        distinction is what lets the usable floor area exclude the space a
+        table stands on, which is the number a flooring installer actually
+        needs.
+
+        `min_area_m2` discards specks: a couple of stray cells from one noisy
+        reading are not a piece of furniture, and reporting them as such would
+        bury the real obstacles in noise.
+        """
+        occupied = grid.occupied_mask(self.occupied_threshold)
+        if not occupied.any():
+            return []
+
+        # The room's filled footprint: its free space plus every gap enclosed
+        # by it. Furniture sits in exactly those gaps, because the flood fill
+        # flowed around it; the walls do not, because they are reachable from
+        # outside the room.
+        #
+        # Dilating the interior instead — the obvious first attempt — reaches
+        # into the wall cells and reports the entire wall ring as one giant
+        # obstacle spanning the room. An empty room then appears to contain a
+        # 0.9 m2 obstacle, and usable area is wrong everywhere.
+        #
+        # This also handles a cabinet pushed flat against a wall: the sliver
+        # behind it is unreachable from outside, so it fills, and the cabinet
+        # is still found.
+        room_footprint = self.fill_holes(interior)
+
+        # Blocked floor is the room's filled footprint minus its free floor.
+        #
+        # NOT simply the occupied cells: a range sensor only ever sees an
+        # object's outer faces, never its middle, so a 1 m table appears as a
+        # hollow 5 cm outline. Measuring that gives 0.19 m2 for a table that
+        # actually stands on about 1 m2 — the perimeter, not the footprint.
+        #
+        # Subtracting free floor from the filled room recovers the solid
+        # region, because the hole-fill already flowed around the object and
+        # filled its unobserved middle.
+        candidates = room_footprint & ~interior
+        if not candidates.any():
+            return []
+
+        cell_area = grid.resolution_m**2
+        obstacles: list[dict] = []
+        visited = np.zeros_like(candidates, dtype=bool)
+
+        for start_row, start_col in np.argwhere(candidates):
+            if visited[start_row, start_col]:
+                continue
+
+            queue = deque([(int(start_col), int(start_row))])
+            visited[start_row, start_col] = True
+            cells: list[tuple[int, int]] = []
+            touches_edge = False
+            # Require evidence that something is actually there. A pocket the
+            # robot merely never looked into is unexplored floor, not a table,
+            # and calling it an obstacle would invent furniture from a gap in
+            # the sweep.
+            has_occupied_evidence = False
+
+            while queue:
+                col, row = queue.popleft()
+                cells.append((col, row))
+                if occupied[row, col]:
+                    has_occupied_evidence = True
+
+                if (
+                    col <= 0 or row <= 0
+                    or col >= candidates.shape[1] - 1
+                    or row >= candidates.shape[0] - 1
+                ):
+                    touches_edge = True
+
+                for d_col, d_row in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                                     (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                    n_col, n_row = col + d_col, row + d_row
+                    if not grid.in_bounds(n_col, n_row):
+                        continue
+                    if visited[n_row, n_col] or not candidates[n_row, n_col]:
+                        continue
+                    visited[n_row, n_col] = True
+                    queue.append((n_col, n_row))
+
+            area = len(cells) * cell_area
+            if area < min_area_m2 or touches_edge or not has_occupied_evidence:
+                continue
+
+            xs = [grid.cell_to_world(c, r)[0] for c, r in cells]
+            ys = [grid.cell_to_world(c, r)[1] for c, r in cells]
+
+            obstacles.append(
+                {
+                    "centre_x_m": sum(xs) / len(xs),
+                    "centre_y_m": sum(ys) / len(ys),
+                    "min_x_m": min(xs),
+                    "min_y_m": min(ys),
+                    "max_x_m": max(xs),
+                    "max_y_m": max(ys),
+                    "area_m2": round(area, 3),
+                    "cells": len(cells),
+                }
+            )
+
+        obstacles.sort(key=lambda o: o["area_m2"], reverse=True)
+        return obstacles
 
     def _empty_outline(self, robot_id: str, timestamp: str) -> RoomOutline:
         return RoomOutline(

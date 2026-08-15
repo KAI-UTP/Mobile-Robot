@@ -483,39 +483,62 @@ def _ingest(payload: bytes) -> None:
 
 
 def connect_publisher() -> None:
-    """Attach an MQTT publisher for the derived pose and room.
+    """Attach an MQTT publisher for the derived pose and room, in the background.
 
-    Optional by design: the offline demo must keep working on a laptop with no
-    broker, so a failure here is logged and the map still serves.
+    Deliberately threaded. `build_client` retries ten times with exponential
+    backoff, which is up to 210 seconds when no broker is listening — and
+    doing that on the startup path meant the map served nothing for three and
+    a half minutes on any machine without MQTT. It also failed CI, where there
+    is no broker and the health check waits 60 seconds.
+
+    The publisher is an optional extra: it feeds Grafana. The map is the
+    product, so it must come up immediately whether or not a broker ever
+    appears, and simply start publishing later if one does.
     """
-    try:
-        from robotmap_common.mqtt_client import build_client
 
-        client = build_client(client_id="mapper-publisher")
-        app.state.mqtt_publisher = lambda topic, payload: client.publish(
-            topic, payload
-        )
-        logger.info("Publishing pose and room to MQTT for the telemetry sink")
-    except Exception as exc:
-        app.state.mqtt_publisher = None
-        logger.warning(
-            "No MQTT publisher (%s). Grafana will have no data; the live map "
-            "still works.", exc,
-        )
+    def connect() -> None:
+        try:
+            from robotmap_common.mqtt_client import build_client
+
+            client = build_client(client_id="mapper-publisher")
+            app.state.mqtt_publisher = lambda topic, payload: client.publish(
+                topic, payload
+            )
+            logger.info("Publishing pose and room to MQTT for the telemetry sink")
+        except Exception as exc:
+            app.state.mqtt_publisher = None
+            logger.warning(
+                "No MQTT publisher (%s). Grafana will have no data; the live "
+                "map is unaffected.", exc,
+            )
+
+    threading.Thread(target=connect, daemon=True, name="mqtt-publisher").start()
 
 
 def start_mqtt_source() -> None:
-    from robotmap_common.mqtt_client import build_client
+    """Subscribe to the robot's telemetry, without blocking startup.
 
-    def on_message(client, userdata, msg) -> None:
-        _ingest(msg.payload)
+    Threaded for the same reason as the publisher: a broker that is slow to
+    appear — or a robot switched on after the dashboard — must not stop the
+    map from being served in the meantime.
+    """
+    def subscribe() -> None:
+        from robotmap_common.mqtt_client import build_client
 
-    build_client(
-        client_id="mapper",
-        on_message=on_message,
-        subscriptions=[Topics.SENSORS_RAW],
-    )
-    logger.info("Subscribed to %s", Topics.SENSORS_RAW)
+        def on_message(client, userdata, msg) -> None:
+            _ingest(msg.payload)
+
+        try:
+            build_client(
+                client_id="mapper",
+                on_message=on_message,
+                subscriptions=[Topics.SENSORS_RAW],
+            )
+            logger.info("Subscribed to %s", Topics.SENSORS_RAW)
+        except Exception as exc:
+            logger.error("Could not subscribe to telemetry: %s", exc)
+
+    threading.Thread(target=subscribe, daemon=True, name="mqtt-source").start()
 
 
 def start_sim_source(room: str, indoor: bool, speed: float) -> None:

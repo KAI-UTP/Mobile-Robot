@@ -187,7 +187,9 @@ const g2 = c2.getContext('2d');
 
 let world = null, state = null, grid = null, meta = null;
 
-const cam = { yaw: -0.62, pitch: 0.72, dist: 13.5, tx: 3.0, ty: 2.25 };
+// tz aims at roughly table height rather than the floor, so the room sits in
+// the frame instead of the camera staring at the carpet.
+const cam = { yaw: -0.9, pitch: 0.55, dist: 13.5, tx: 3.0, ty: 2.25, tz: 0.9 };
 
 function resize() {
   for (const c of [c3, c2]) {
@@ -203,23 +205,67 @@ window.addEventListener('resize', resize);
 // Rotate world coords into camera space, then project. Z is up in the world,
 // which matches the robot's frame — keeping one convention throughout avoids
 // the axis confusion that makes 3D code unmaintainable.
-function project(x, y, z) {
-  const dx = x - cam.tx, dy = y - cam.ty, dz = z;
-  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
-  const rx = dx * cy - dy * sy;
-  const ry = dx * sy + dy * cy;
-  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-  const ry2 = ry * cp - dz * sp;
-  const rz2 = ry * sp + dz * cp;
+// A proper look-at camera basis, rebuilt whenever the camera moves.
+//
+// The first version hand-rolled the rotation and got the pitch sign wrong for
+// a Z-up world: taller points projected LOWER on screen and sorted as FURTHER
+// away, so the room rendered upside down with wall tops behind their own
+// bases. Deriving right/up/forward from the eye position instead makes the
+// orientation follow from the geometry rather than from remembering a sign.
+let basis = null;
 
-  const depth = rz2 + cam.dist;
-  if (depth < 0.15) return null;               // behind the camera
+function updateCamera() {
+  // Eye orbits the target on a sphere. Pitch is the elevation above the
+  // floor plane, so pitch -> 90 degrees looks straight down.
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+
+  const eye = {
+    x: cam.tx + cam.dist * cp * cy,
+    y: cam.ty + cam.dist * cp * sy,
+    z: cam.tz + cam.dist * sp,
+  };
+
+  // forward: eye -> target, normalised.
+  let fx = cam.tx - eye.x, fy = cam.ty - eye.y, fz = cam.tz - eye.z;
+  const fl = Math.hypot(fx, fy, fz) || 1;
+  fx /= fl; fy /= fl; fz /= fl;
+
+  // right = forward x worldUp, with worldUp = (0, 0, 1). Simplifies to
+  // (fy, -fx, 0) — always horizontal, so the horizon never tilts.
+  let rx = fy, ry = -fx, rz = 0;
+  const rl = Math.hypot(rx, ry, rz) || 1;
+  rx /= rl; ry /= rl; rz /= rl;
+
+  // up = right x forward. Recovering it this way keeps the basis orthonormal
+  // even as pitch approaches vertical.
+  const ux = ry * fz - rz * fy;
+  const uy = rz * fx - rx * fz;
+  const uz = rx * fy - ry * fx;
+
+  basis = { eye, f: [fx, fy, fz], r: [rx, ry, rz], u: [ux, uy, uz] };
+}
+
+function project(x, y, z) {
+  if (!basis) updateCamera();
+  const { eye, f, r, u } = basis;
+
+  const vx = x - eye.x, vy = y - eye.y, vz = z - eye.z;
+
+  // Depth along the view direction. Positive means in front of the camera.
+  const depth = vx * f[0] + vy * f[1] + vz * f[2];
+  if (depth < 0.15) return null;
+
+  const sx = vx * r[0] + vy * r[1] + vz * r[2];
+  const sy = vx * u[0] + vy * u[1] + vz * u[2];
 
   const focal = c3.height * 0.9;
   return {
-    x: c3.width / 2 + (rx * focal) / depth,
-    y: c3.height / 2 - (ry2 * focal) / depth,
-    depth
+    x: c3.width / 2 + (sx * focal) / depth,
+    // Screen y grows downward, so a larger "up" component must move the point
+    // UP the screen — this minus is the whole reason the room is now correct.
+    y: c3.height / 2 - (sy * focal) / depth,
+    depth,
   };
 }
 
@@ -404,16 +450,21 @@ c3.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; last
 window.addEventListener('mouseup', () => { dragging = false; });
 window.addEventListener('mousemove', e => {
   if (!dragging) return;
-  cam.yaw += (e.clientX - lastX) * 0.008;
-  // Clamped so the camera cannot pass through the floor or flip overhead,
-  // both of which are disorienting and hard to recover from by dragging.
-  cam.pitch = Math.max(0.12, Math.min(1.45, cam.pitch + (e.clientY - lastY) * 0.006));
+  // Drag right turns the room right, and drag up raises the viewpoint —
+  // matching every 3D viewer people already use.
+  cam.yaw -= (e.clientX - lastX) * 0.008;
+  // Clamped short of straight down and short of floor level: at exactly
+  // vertical the right vector degenerates, and below the floor the room is
+  // seen from underneath, which is disorienting and hard to undo by dragging.
+  cam.pitch = Math.max(0.08, Math.min(1.40, cam.pitch + (e.clientY - lastY) * 0.006));
   lastX = e.clientX; lastY = e.clientY;
+  updateCamera();
   draw3d();
 });
 c3.addEventListener('wheel', e => {
   e.preventDefault();
-  cam.dist = Math.max(4, Math.min(30, cam.dist + e.deltaY * 0.012));
+  cam.dist = Math.max(3.5, Math.min(30, cam.dist + e.deltaY * 0.012));
+  updateCamera();
   draw3d();
 }, { passive: false });
 
@@ -463,7 +514,8 @@ async function loadWorld() {
     : 'Left is the expected layout, not a measurement — the error figure is indicative only.';
   cam.tx = world.width_m / 2;
   cam.ty = world.height_m / 2;
-  cam.dist = Math.max(world.width_m, world.height_m) * 2.4;
+  cam.dist = Math.max(world.width_m, world.height_m) * 2.2;
+  updateCamera();
   draw3d();
 }
 

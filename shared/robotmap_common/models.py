@@ -359,6 +359,25 @@ class Point2D(BaseModel):
     y_m: float
 
 
+class ObstacleFootprint(BaseModel):
+    """Something standing on the floor inside the room.
+
+    Furniture rather than wall: an occupied region fully enclosed by the
+    room's own free space. The distinction matters commercially — the floor
+    under a table still needs flooring, but a cleaning robot cannot reach it,
+    so the two areas are reported separately rather than merged.
+    """
+
+    centre_x_m: float
+    centre_y_m: float
+    min_x_m: float
+    min_y_m: float
+    max_x_m: float
+    max_y_m: float
+    area_m2: float = Field(..., ge=0.0)
+    cells: int = Field(default=0, ge=0)
+
+
 class RoomOutline(BaseModel):
     """The extracted room boundary and its measurements."""
 
@@ -366,6 +385,10 @@ class RoomOutline(BaseModel):
     timestamp: str
     polygon: list[Point2D]
     area_m2: float = Field(..., ge=0.0)
+
+    # Obstacles found standing on the floor, and how much floor they cover.
+    obstacles: list[ObstacleFootprint] = Field(default_factory=list)
+    blocked_area_m2: float = Field(default=0.0, ge=0.0)
     perimeter_m: float = Field(..., ge=0.0)
     bounding_width_m: float = Field(..., ge=0.0)
     bounding_height_m: float = Field(..., ge=0.0)
@@ -375,6 +398,16 @@ class RoomOutline(BaseModel):
     is_closed: bool = Field(
         default=False, description="True once the boundary forms a complete loop"
     )
+
+    @property
+    def usable_area_m2(self) -> float:
+        """Floor the robot could actually drive on.
+
+        Total area minus what furniture stands on. For a cleaning contract
+        this is the number that matters; for flooring, `area_m2` is, since the
+        floor under a table still has to be laid.
+        """
+        return max(0.0, self.area_m2 - self.blocked_area_m2)
 
 
 # ── Control ───────────────────────────────────────────────────────────────────

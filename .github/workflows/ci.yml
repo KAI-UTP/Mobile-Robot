@@ -114,20 +114,63 @@ jobs:
         # Proves the image actually runs and maps a room, not merely that it
         # built. A container that builds and then crashes on startup is the
         # failure this catches.
+        #
+        # There is deliberately no MQTT broker here: the map must serve
+        # without one. An earlier version connected to MQTT on the startup
+        # path, which blocked for up to 210 seconds with no broker listening
+        # and made this step fail — so running it broker-less is the
+        # regression test for that.
         run: |
+          set -euo pipefail
+
           docker run --rm -d --name mapper-smoke -p 8080:8080 \
             roommapper/mapper:ci \
             python services/mapper/main.py --source sim --speed 25 --port 8080
 
+          echo "--- waiting for the service ---"
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:8080/health > /dev/null; then break; fi
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "healthy after ~$((i * 2))s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "service never became healthy"
+              docker logs mapper-smoke
+              docker stop mapper-smoke || true
+              exit 1
+            fi
             sleep 2
           done
 
           curl -sf http://localhost:8080/health | tee /dev/stderr | grep -q healthy
-          sleep 20
-          echo "--- room measurement ---"
-          curl -sf http://localhost:8080/api/room | tee /dev/stderr
+
+          echo "--- waiting for a completed circuit ---"
+          # /api/room returns 404 until the robot has mapped something, and
+          # `curl -f` treats 404 as an error — so poll for the 200 rather
+          # than sleeping a fixed time and hoping.
+          for i in $(seq 1 45); do
+            code=$(curl -s -o /tmp/room.json -w '%{http_code}' http://localhost:8080/api/room)
+            if [ "$code" = "200" ]; then
+              echo "room measured after ~$((i * 2))s"
+              cat /tmp/room.json
+              break
+            fi
+            if [ "$i" -eq 45 ]; then
+              echo "no room was ever measured (last HTTP $code)"
+              docker logs mapper-smoke | tail -40
+              docker stop mapper-smoke || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "--- every page must render ---"
+          for path in / /twin /compare /scans; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080$path")
+            echo "  $path -> $code"
+            [ "$code" = "200" ] || { docker stop mapper-smoke || true; exit 1; }
+          done
+
           docker logs mapper-smoke | tail -20
           docker stop mapper-smoke
 
