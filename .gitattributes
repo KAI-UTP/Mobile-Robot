@@ -1,0 +1,24 @@
+# Line endings.
+#
+# Git on Windows converts LF to CRLF on checkout by default. That would break
+# `tests/test_source_hygiene.py::test_no_carriage_returns` on a fresh clone —
+# the working tree would contain CRs the moment it was created, and the suite
+# would fail before a single line of project code ran.
+#
+# Forcing LF also keeps diffs readable when the project is opened on Windows,
+# Linux and inside the Docker images, which all touch these files.
+
+* text=auto eol=lf
+
+# Windows batch files genuinely need CRLF: cmd.exe can misparse LF-only
+# scripts, especially around multi-line blocks.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary — never translate these.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.usd binary
+*.usda binary
+*.mp4 binary
