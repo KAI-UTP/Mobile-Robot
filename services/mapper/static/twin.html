@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digital Twin — RoomScan</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #2a3038;
+    --text: #e6edf3; --muted: #8b949e; --dim: #6e7681;
+    --accent: #4aa3ff; --good: #3fb950; --warn: #d29922; --bad: #f85149;
+    --rssi: #f0883e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); overflow: hidden;
+    font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column;
+  }
+
+  header {
+    padding: 10px 18px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 14px; flex-shrink: 0;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .tag {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .8px;
+    padding: 2px 8px; border-radius: 99px; background: #21262d; color: var(--muted);
+  }
+  header nav { margin-left: auto; display: flex; gap: 12px; }
+  header nav a { color: var(--accent); text-decoration: none; font-size: 12px; }
+  header nav a:hover { text-decoration: underline; }
+
+  #panes { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
+  @media (max-width: 1000px) { #panes { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+
+  .pane { position: relative; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .pane + .pane { border-left: 1px solid var(--border); }
+  .pane-head {
+    padding: 9px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 10px; flex-shrink: 0;
+  }
+  .pane-head b { font-size: 12px; letter-spacing: .4px; }
+  .pane-head span { font-size: 11px; color: var(--muted); }
+  .pane-head .hint { margin-left: auto; font-size: 10px; color: var(--dim); }
+  .canvas-wrap { flex: 1; position: relative; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #view3d { cursor: grab; }
+  #view3d:active { cursor: grabbing; }
+
+  .legend {
+    position: absolute; bottom: 10px; left: 12px; z-index: 4;
+    background: rgba(13,17,23,.88); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--muted);
+    pointer-events: none; max-width: 240px;
+  }
+  .legend div { display: flex; align-items: center; gap: 7px; padding: 1.5px 0; }
+  .legend i { width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }
+  .legend .note { color: var(--dim); font-size: 10px; margin-top: 5px; line-height: 1.35; }
+
+  footer {
+    border-top: 1px solid var(--border); background: var(--panel);
+    padding: 9px 18px; display: flex; gap: 26px; flex-wrap: wrap;
+    align-items: center; flex-shrink: 0;
+  }
+  .stat .k {
+    font-size: 9px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted);
+  }
+  .stat .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 11px; color: var(--muted); font-weight: 400; }
+  .bar { width: 90px; height: 5px; background: #21262d; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+  .bar i { display: block; height: 100%; background: var(--good); transition: width .3s, background .3s; }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 99px;
+    font-size: 10px; font-weight: 700;
+  }
+  .pill.ok { background: rgba(63,185,80,.16); color: var(--good); }
+  .pill.warn { background: rgba(210,153,34,.16); color: var(--warn); }
+
+  #truthNote {
+    margin-left: auto; font-size: 11px; color: var(--muted); max-width: 340px; text-align: right;
+  }
+  #status {
+    position: absolute; top: 10px; right: 12px; z-index: 5; font-size: 10px;
+    background: rgba(13,17,23,.85); border: 1px solid var(--border);
+    border-radius: 5px; padding: 3px 8px; color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Digital Twin</h1>
+  <span class="tag" id="roomTag">loading…</span>
+  <nav>
+    <a href="/">map</a>
+    <a href="/compare">comparison</a>
+    <a href="/scans">scans</a>
+  </nav>
+</header>
+
+<div id="panes">
+  <section class="pane">
+    <div class="pane-head">
+      <b>PHYSICAL</b><span>the room that exists</span>
+      <span class="hint">drag to orbit &middot; scroll to zoom</span>
+    </div>
+    <div class="canvas-wrap">
+      <canvas id="view3d"></canvas>
+      <div class="legend">
+        <div><i style="background:#4aa3ff"></i> robot (true position)</div>
+        <div><i style="background:#3fb950"></i> where odometry thinks it is</div>
+        <div><i style="background:#f0883e"></i> where Bluetooth thinks it is</div>
+        <div><i style="background:#c74ec7"></i> BLE beacon</div>
+        <div class="note" id="worldNote"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="pane">
+    <div class="pane-head">
+      <b>DIGITAL</b><span>what the robot has worked out</span>
+      <span class="hint" id="gridHint"></span>
+    </div>
+    <div class="canvas-wrap">
+      <div id="status">connecting…</div>
+      <canvas id="view2d"></canvas>
+      <div class="legend">
+        <div><i style="background:#e6edf3"></i> wall it has found</div>
+        <div><i style="background:#1d6fa5"></i> floor it has seen</div>
+        <div><i style="background:#30363d"></i> not yet visited</div>
+        <div><i style="background:#f0c674"></i> path driven</div>
+        <div><i style="background:#3fb950"></i> room outline</div>
+        <div class="note">The robot starts knowing nothing. Everything here
+          was worked out from wheel rotations and range sensors.</div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <div class="stat">
+    <div class="k">Measured area</div>
+    <div class="v"><span id="area">—</span> <small>m²</small></div>
+  </div>
+  <div class="stat">
+    <div class="k">True area</div>
+    <div class="v" style="color:var(--muted)"><span id="trueArea">—</span> <small>m²</small></div>
+  </div>
+  <div class="stat">
+    <div class="k">Error</div>
+    <div class="v" id="err">—</div>
+  </div>
+  <div class="stat">
+    <div class="k">Boundary</div>
+    <div class="v" id="closed">—</div>
+  </div>
+  <div class="stat">
+    <div class="k">Explored</div>
+    <div class="v"><span id="cov">—</span></div>
+    <div class="bar"><i id="covBar" style="width:0%"></i></div>
+  </div>
+  <div class="stat">
+    <div class="k">Driven</div>
+    <div class="v"><span id="dist">—</span> <small>m</small></div>
+  </div>
+  <div id="truthNote"></div>
+</footer>
+
+<script>
+"use strict";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A very small 3D renderer.
+//
+// No library and no CDN: this has to work on a lab machine with no internet,
+// and pulling in three.js for a dozen boxes would be more risk than it saves.
+// Everything in the room is box-shaped, so painter's-algorithm depth sorting
+// with flat-shaded faces is enough and cannot go wrong the way a z-buffer can.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const c3 = document.getElementById('view3d');
+const g3 = c3.getContext('2d');
+const c2 = document.getElementById('view2d');
+const g2 = c2.getContext('2d');
+
+let world = null, state = null, grid = null, meta = null;
+
+const cam = { yaw: -0.62, pitch: 0.72, dist: 13.5, tx: 3.0, ty: 2.25 };
+
+function resize() {
+  for (const c of [c3, c2]) {
+    const r = c.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    c.width = Math.max(1, Math.round(r.width * dpr));
+    c.height = Math.max(1, Math.round(r.height * dpr));
+  }
+  draw();
+}
+window.addEventListener('resize', resize);
+
+// Rotate world coords into camera space, then project. Z is up in the world,
+// which matches the robot's frame — keeping one convention throughout avoids
+// the axis confusion that makes 3D code unmaintainable.
+function project(x, y, z) {
+  const dx = x - cam.tx, dy = y - cam.ty, dz = z;
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const rx = dx * cy - dy * sy;
+  const ry = dx * sy + dy * cy;
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const ry2 = ry * cp - dz * sp;
+  const rz2 = ry * sp + dz * cp;
+
+  const depth = rz2 + cam.dist;
+  if (depth < 0.15) return null;               // behind the camera
+
+  const focal = c3.height * 0.9;
+  return {
+    x: c3.width / 2 + (rx * focal) / depth,
+    y: c3.height / 2 - (ry2 * focal) / depth,
+    depth
+  };
+}
+
+const CUBE_FACES = [
+  { idx: [0,1,2,3], shade: 0.55 },  // bottom
+  { idx: [4,5,6,7], shade: 1.00 },  // top   — brightest, catches the light
+  { idx: [0,1,5,4], shade: 0.72 },
+  { idx: [2,3,7,6], shade: 0.78 },
+  { idx: [1,2,6,5], shade: 0.88 },
+  { idx: [3,0,4,7], shade: 0.66 },
+];
+
+function shadeColour(hex, factor) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, ((n >> 16) & 255) * factor) | 0;
+  const g = Math.min(255, ((n >> 8) & 255) * factor) | 0;
+  const b = Math.min(255, (n & 255) * factor) | 0;
+  return `rgb(${r},${g},${b})`;
+}
+
+function collectBox(out, cx, cy, cz, w, d, h, colour, opacity) {
+  const hw = w / 2, hd = d / 2, hh = h / 2;
+  const corners = [
+    [cx-hw, cy-hd, cz-hh], [cx+hw, cy-hd, cz-hh], [cx+hw, cy+hd, cz-hh], [cx-hw, cy+hd, cz-hh],
+    [cx-hw, cy-hd, cz+hh], [cx+hw, cy-hd, cz+hh], [cx+hw, cy+hd, cz+hh], [cx-hw, cy+hd, cz+hh],
+  ].map(p => project(p[0], p[1], p[2]));
+
+  if (corners.some(p => p === null)) return;
+
+  for (const face of CUBE_FACES) {
+    const pts = face.idx.map(i => corners[i]);
+    // Depth-sort by the face's mean depth: correct for convex, separated
+    // boxes, which is all a room contains.
+    const depth = pts.reduce((s, p) => s + p.depth, 0) / 4;
+    out.push({ pts, depth, fill: shadeColour(colour, face.shade), opacity });
+  }
+}
+
+function draw3d() {
+  g3.fillStyle = '#0a0d12';
+  g3.fillRect(0, 0, c3.width, c3.height);
+  if (!world) return;
+
+  const faces = [];
+
+  // Floor first — a single flat box so the room has a ground to sit on.
+  collectBox(faces, world.width_m / 2, world.height_m / 2, -0.02,
+             world.width_m, world.height_m, 0.04, '#8f8570', 1);
+
+  for (const b of world.boxes) {
+    // Walls translucent so the furniture and robot inside stay visible; an
+    // opaque room from outside is just a box.
+    const opacity = (b.kind === 'wall') ? 0.30
+                  : (b.kind === 'window') ? 0.45
+                  : (b.kind === 'rug') ? 0.85 : 1;
+    collectBox(faces, b.x_m, b.y_m, b.z_m, b.width_m, b.depth_m, b.height_m, b.colour, opacity);
+  }
+
+  for (const bc of world.beacons || []) {
+    collectBox(faces, bc.x_m, bc.y_m, bc.z_m, 0.13, 0.13, 0.13, '#c74ec7', 1);
+  }
+
+  if (state && state.pose) {
+    const p = state.pose;
+    collectBox(faces, p.x_m, p.y_m, 0.07, 0.28, 0.28, 0.10, '#4aa3ff', 1);
+    // A nose block, so facing is visible — otherwise driving and strafing
+    // look identical, which is the whole point of a holonomic base.
+    const a = p.heading_deg * Math.PI / 180;
+    collectBox(faces, p.x_m + 0.16 * Math.cos(a), p.y_m + 0.16 * Math.sin(a), 0.09,
+               0.10, 0.10, 0.06, '#f0c674', 1);
+
+    if (state.odometry) {
+      collectBox(faces, state.odometry.x_m, state.odometry.y_m, 0.07,
+                 0.30, 0.30, 0.11, '#3fb950', 0.35);
+    }
+    if (state.rssi) {
+      collectBox(faces, state.rssi.x_m, state.rssi.y_m, 0.30,
+                 0.26, 0.26, 0.26, '#f0883e', 0.65);
+    }
+  }
+
+  faces.sort((a, b) => b.depth - a.depth);   // far to near
+
+  for (const f of faces) {
+    g3.globalAlpha = f.opacity;
+    g3.beginPath();
+    g3.moveTo(f.pts[0].x, f.pts[0].y);
+    for (let i = 1; i < f.pts.length; i++) g3.lineTo(f.pts[i].x, f.pts[i].y);
+    g3.closePath();
+    g3.fillStyle = f.fill;
+    g3.fill();
+    g3.strokeStyle = 'rgba(0,0,0,.25)';
+    g3.lineWidth = 1;
+    g3.stroke();
+  }
+  g3.globalAlpha = 1;
+}
+
+// ── 2D map, the robot's own view ────────────────────────────────────────────
+
+function draw2d() {
+  g2.fillStyle = '#0a0d12';
+  g2.fillRect(0, 0, c2.width, c2.height);
+  if (!meta || !grid) return;
+
+  const wM = meta.width * meta.resolution_m;
+  const hM = meta.height * meta.resolution_m;
+  // Padding must never exceed the canvas: on a short pane (a phone, or this
+  // page in a split window) `height - 2*pad` goes negative, the scale factor
+  // inverts, and every derived length — including circle radii — turns
+  // negative. Canvas throws on a negative arc radius, so the whole overlay
+  // stops drawing.
+  const pad = Math.min(24, c2.width / 4, c2.height / 4);
+  const scale = Math.max(
+    1e-3,
+    Math.min((c2.width - pad*2) / wM, (c2.height - pad*2) / hM)
+  );
+  const offX = (c2.width - wM * scale) / 2;
+  const offY = (c2.height - hM * scale) / 2;
+  const X = mx => offX + (mx - meta.origin_x_m) * scale;
+  const Y = my => c2.height - offY - (my - meta.origin_y_m) * scale;
+
+  const img = g2.createImageData(meta.width, meta.height);
+  for (let row = 0; row < meta.height; row++) {
+    for (let col = 0; col < meta.width; col++) {
+      const v = grid[row * meta.width + col];
+      const p = (((meta.height - 1 - row) * meta.width) + col) * 4;
+      let r, g, b, a = 255;
+      if (v < 0)       { r=48;  g=54;  b=61;  a=120; }
+      else if (v > 60) { r=230; g=237; b=243; }
+      else if (v < 35) { r=29;  g=111; b=165; }
+      else             { r=90;  g=100; b=110; }
+      img.data[p]=r; img.data[p+1]=g; img.data[p+2]=b; img.data[p+3]=a;
+    }
+  }
+
+  createImageBitmap(img).then(bmp => {
+    g2.imageSmoothingEnabled = false;
+    g2.drawImage(bmp, X(meta.origin_x_m), Y(meta.origin_y_m + hM), wM*scale, hM*scale);
+    overlay2d(X, Y, scale);
+  });
+}
+
+function overlay2d(X, Y, scale) {
+  if (state && state.trail && state.trail.length > 1) {
+    g2.strokeStyle = 'rgba(240,198,116,.85)';
+    g2.lineWidth = 2;
+    g2.beginPath();
+    state.trail.forEach(([x, y], i) => i ? g2.lineTo(X(x), Y(y)) : g2.moveTo(X(x), Y(y)));
+    g2.stroke();
+  }
+
+  if (state && state.room && state.room.polygon && state.room.polygon.length > 2) {
+    g2.strokeStyle = state.room.is_closed ? '#3fb950' : '#d29922';
+    g2.lineWidth = 3;
+    g2.setLineDash(state.room.is_closed ? [] : [8,6]);
+    g2.beginPath();
+    state.room.polygon.forEach((p, i) => i ? g2.lineTo(X(p.x_m), Y(p.y_m)) : g2.moveTo(X(p.x_m), Y(p.y_m)));
+    g2.closePath(); g2.stroke(); g2.setLineDash([]);
+  }
+
+  if (state && state.pose) {
+    const p = state.pose, px = X(p.x_m), py = Y(p.y_m);
+    const sigma = Math.max(p.std_x_m, p.std_y_m);
+    if (sigma > 0.02) {
+      g2.strokeStyle = 'rgba(74,163,255,.35)'; g2.lineWidth = 1;
+      g2.beginPath(); g2.arc(px, py, sigma*scale, 0, Math.PI*2); g2.stroke();
+    }
+    g2.save(); g2.translate(px, py); g2.rotate(-p.heading_deg*Math.PI/180);
+    g2.fillStyle = '#4aa3ff';
+    g2.beginPath(); g2.moveTo(11,0); g2.lineTo(-7,7); g2.lineTo(-7,-7);
+    g2.closePath(); g2.fill(); g2.restore();
+  }
+}
+
+function draw() { draw3d(); draw2d(); }
+
+// ── Orbit controls ──────────────────────────────────────────────────────────
+
+let dragging = false, lastX = 0, lastY = 0;
+c3.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener('mouseup', () => { dragging = false; });
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  cam.yaw += (e.clientX - lastX) * 0.008;
+  // Clamped so the camera cannot pass through the floor or flip overhead,
+  // both of which are disorienting and hard to recover from by dragging.
+  cam.pitch = Math.max(0.12, Math.min(1.45, cam.pitch + (e.clientY - lastY) * 0.006));
+  lastX = e.clientX; lastY = e.clientY;
+  draw3d();
+});
+c3.addEventListener('wheel', e => {
+  e.preventDefault();
+  cam.dist = Math.max(4, Math.min(30, cam.dist + e.deltaY * 0.012));
+  draw3d();
+}, { passive: false });
+
+// ── Data ────────────────────────────────────────────────────────────────────
+
+function fmt(v, d = 2) { return (v === null || v === undefined) ? '—' : v.toFixed(d); }
+
+function updateStats() {
+  if (!state) return;
+
+  const room = state.room;
+  if (room && room.polygon && room.polygon.length > 2) {
+    document.getElementById('area').textContent = room.area_m2.toFixed(2);
+    document.getElementById('cov').textContent = room.coverage_pct.toFixed(0) + '%';
+    const bar = document.getElementById('covBar');
+    bar.style.width = Math.min(100, room.coverage_pct) + '%';
+    bar.style.background = room.coverage_pct > 80 ? 'var(--good)'
+                         : room.coverage_pct > 50 ? 'var(--warn)' : 'var(--bad)';
+    document.getElementById('closed').innerHTML = room.is_closed
+      ? '<span class="pill ok">closed</span>' : '<span class="pill warn">open</span>';
+
+    if (world) {
+      const err = (room.area_m2 - world.floor_area_m2) / world.floor_area_m2 * 100;
+      const el = document.getElementById('err');
+      el.textContent = (err >= 0 ? '+' : '') + err.toFixed(1) + '%';
+      el.style.color = Math.abs(err) < 5 ? 'var(--good)'
+                     : Math.abs(err) < 15 ? 'var(--warn)' : 'var(--bad)';
+    }
+  }
+
+  if (state.pose) {
+    document.getElementById('dist').textContent = fmt(state.pose.distance_travelled_m, 1);
+  }
+  if (meta) {
+    document.getElementById('gridHint').textContent =
+      `${meta.width}×${meta.height} cells @ ${meta.resolution_m} m`;
+  }
+}
+
+async function loadWorld() {
+  world = await fetch('/api/world').then(r => r.json());
+  document.getElementById('roomTag').textContent = world.name;
+  document.getElementById('trueArea').textContent = world.floor_area_m2.toFixed(2);
+  document.getElementById('worldNote').textContent = world.source_note;
+  document.getElementById('truthNote').textContent = world.is_ground_truth
+    ? 'Left is ground truth from the simulator, so the error figure is exact.'
+    : 'Left is the expected layout, not a measurement — the error figure is indicative only.';
+  cam.tx = world.width_m / 2;
+  cam.ty = world.height_m / 2;
+  cam.dist = Math.max(world.width_m, world.height_m) * 2.4;
+  draw3d();
+}
+
+let ws = null, pollTimer = null, failures = 0;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { failures = 0; stopPolling();
+    document.getElementById('status').textContent = 'live'; };
+  ws.onclose = () => {
+    if (++failures >= 3) { startPolling(); return; }
+    document.getElementById('status').textContent = 'reconnecting';
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'state') { state = m.data; meta = state.grid; updateStats(); draw(); }
+    } else { grid = new Int8Array(ev.data); draw(); }
+  };
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  document.getElementById('status').textContent = 'polling';
+  const tick = async () => {
+    try {
+      state = await fetch('/api/state').then(r => r.json());
+      meta = state.grid;
+      grid = new Int8Array(await fetch('/api/grid').then(r => r.arrayBuffer()));
+      updateStats(); draw();
+    } catch (e) { document.getElementById('status').textContent = 'offline'; }
+  };
+  tick(); pollTimer = setInterval(tick, 800);
+}
+function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+resize();
+loadWorld().then(connect);
+</script>
+</body>
+</html>

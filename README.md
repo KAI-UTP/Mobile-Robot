@@ -44,7 +44,8 @@ docker compose up --build -d
 
 | | |
 |---|---|
-| <http://localhost:8080/scans> | **saved scans — the product loop** |
+| <http://localhost:8080/twin> | **the digital twin — 3D room beside the robot's map** |
+| <http://localhost:8080/scans> | saved scans — the product loop |
 | <http://localhost:8080> | live map |
 | <http://localhost:8080/compare> | the real room beside the room the robot drew |
 | <http://localhost:3001> | Grafana dashboards (admin / admin) |
@@ -286,6 +287,31 @@ Exports: dimensioned **SVG** floor plan, **JSON** for other software, and
 ```bash
 curl http://localhost:8080/api/scans.csv
 ```
+
+## The digital twin view
+
+`/twin` puts both halves side by side, which is what a digital twin actually
+is — the thing, and the model of the thing:
+
+| Left: **PHYSICAL** | Right: **DIGITAL** |
+|---|---|
+| the room that exists, in 3D | what the robot has worked out |
+| walls, doorway, furniture, BLE beacons | occupancy grid it built from scratch |
+| drag to orbit, scroll to zoom | its path, its room outline, its uncertainty |
+
+The 3D runs **in the browser with no library and no CDN** — a small
+painter's-algorithm renderer, because a lab machine with no internet still has
+to be able to show it, and pulling in three.js for twenty boxes is more risk
+than it saves.
+
+Three robots are drawn in the 3D pane, and the gap between them is the point:
+blue is where the robot *is*, green is where **odometry** thinks it is (0.07 m
+error), orange is where **Bluetooth** thinks it is (2.71 m error).
+
+The footer compares measured area against true area live. In simulator mode
+the left pane is genuine ground truth so the error figure is exact; against
+real hardware it says so, because the true room is then an assumption rather
+than a measurement.
 
 ## The two screens
 

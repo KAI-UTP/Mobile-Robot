@@ -41,6 +41,7 @@ from robotmap_common.topics import Topics
 from mapper.exports import scan_to_json, scan_to_svg, scans_to_csv
 from mapper.pipeline import MappingPipeline
 from mapper.storage import Scan, ScanStore, assess_quality, safe_name
+from mapper.world import describe_world
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -74,6 +75,10 @@ app.state.reference_room_name = os.environ.get("REFERENCE_ROOM", "rectangular")
 # Saved scans. Defaults to ./scans; set SCAN_DIR to a mounted volume in Docker
 # so a container rebuild does not take the user's measurements with it.
 store = ScanStore(os.environ.get("SCAN_DIR"))
+
+# Whether the world description is genuine ground truth. Only the simulator
+# knows the real room; with hardware it is an expectation.
+app.state.source_mode = os.environ.get("SOURCE", "sim")
 
 # Every connected browser. Guarded because packets arrive on an MQTT thread.
 _clients: set[WebSocket] = set()
@@ -114,6 +119,27 @@ async def get_room() -> JSONResponse:
 @app.get("/api/state")
 async def get_state() -> JSONResponse:
     return JSONResponse(pipeline.state())
+
+
+@app.get("/twin")
+async def twin_page() -> FileResponse:
+    """The digital twin: the physical room in 3D beside the robot's own map."""
+    return FileResponse(STATIC_DIR / "twin.html")
+
+
+@app.get("/api/world")
+async def get_world() -> JSONResponse:
+    """The physical room — the other half of the twin.
+
+    Flagged as ground truth only in simulator mode. With a real robot the true
+    room is unknown, and presenting a reference layout as if it were measured
+    would make the comparison look authoritative when it is an assumption.
+    """
+    world = describe_world(
+        app.state.reference_room_name,
+        is_ground_truth=app.state.source_mode == "sim",
+    )
+    return JSONResponse(world.to_dict())
 
 
 @app.get("/scans")
@@ -587,6 +613,7 @@ def main() -> None:
     args = parser.parse_args()
 
     app.state.mqtt_publisher = None
+    app.state.source_mode = args.source
     if not args.no_mqtt_publish:
         connect_publisher()
 
