@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Scans</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --border: #2a3038;
+    --text: #e6edf3; --muted: #8b949e;
+    --good: #3fb950; --ok: #d29922; --bad: #f85149; --accent: #4aa3ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 16px 24px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 17px; margin: 0; }
+  header nav { margin-left: auto; display: flex; gap: 14px; }
+  header nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  header nav a:hover { text-decoration: underline; }
+
+  main { padding: 20px 24px; max-width: 1100px; }
+
+  .totals {
+    display: flex; gap: 28px; padding: 16px 18px; margin-bottom: 20px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    flex-wrap: wrap; align-items: center;
+  }
+  .totals .n { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .totals .n small { font-size: 13px; color: var(--muted); font-weight: 400; }
+  .totals .lbl {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted);
+  }
+  .totals .actions { margin-left: auto; display: flex; gap: 8px; }
+
+  button, .btn {
+    padding: 7px 13px; cursor: pointer; font-size: 13px;
+    background: #21262d; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    text-decoration: none; display: inline-block;
+  }
+  button:hover, .btn:hover { background: #2d333b; }
+  button.primary { background: #238636; border-color: #2ea043; }
+  button.primary:hover { background: #2ea043; }
+  button.danger:hover { background: #4a1d1d; border-color: var(--bad); color: var(--bad); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-size: 10px; text-transform: uppercase;
+    letter-spacing: .8px; color: var(--muted); font-weight: 600;
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+  }
+  td { padding: 11px 10px; border-bottom: 1px solid #1c2128; vertical-align: middle; }
+  td.num { font-variant-numeric: tabular-nums; }
+  tr:hover td { background: #12171d; }
+
+  .name { font-weight: 600; }
+  .name input {
+    background: transparent; border: 1px solid transparent; color: var(--text);
+    font: inherit; font-weight: 600; padding: 3px 5px; border-radius: 4px; width: 100%;
+  }
+  .name input:hover { border-color: var(--border); }
+  .name input:focus { border-color: var(--accent); outline: none; background: #0d1117; }
+
+  .grade {
+    display: inline-block; padding: 2px 8px; border-radius: 99px;
+    font-size: 10px; font-weight: 700; letter-spacing: .5px;
+  }
+  .grade.GOOD { background: rgba(63,185,80,.16); color: var(--good); }
+  .grade.ACCEPTABLE { background: rgba(210,153,34,.16); color: var(--ok); }
+  .grade.POOR { background: rgba(248,81,73,.16); color: var(--bad); }
+  .grade.UNUSABLE { background: rgba(248,81,73,.16); color: var(--bad); }
+
+  .warn { font-size: 11px; color: var(--ok); margin-top: 3px; }
+  .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
+  .empty h2 { color: var(--text); font-size: 16px; margin: 0 0 8px; }
+  #msg {
+    padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; display: none;
+    font-size: 13px;
+  }
+  #msg.ok { display: block; background: rgba(63,185,80,.12); color: var(--good); }
+  #msg.err { display: block; background: rgba(248,81,73,.12); color: var(--bad); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Room Scans</h1>
+  <nav>
+    <a href="/">live map</a>
+    <a href="/compare">comparison</a>
+  </nav>
+</header>
+
+<main>
+  <div id="msg"></div>
+
+  <div class="totals">
+    <div>
+      <div class="lbl">Total floor area</div>
+      <div class="n" id="totalArea">— <small>m²</small></div>
+    </div>
+    <div>
+      <div class="lbl">Usable scans</div>
+      <div class="n" id="usableCount">—</div>
+    </div>
+    <div class="actions">
+      <button class="primary" onclick="saveCurrent()">Save current scan</button>
+      <a class="btn" href="/api/scans.csv">Export all (CSV)</a>
+    </div>
+  </div>
+
+  <div id="content"></div>
+</main>
+
+<script>
+let scans = [];
+
+function msg(text, kind) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = kind;
+  if (kind === 'ok') setTimeout(() => { el.className = ''; }, 4000);
+}
+
+async function load() {
+  try {
+    const data = await fetch('/api/scans').then(r => r.json());
+    scans = data.scans;
+    document.getElementById('totalArea').innerHTML =
+      data.totals.total_area_m2.toFixed(2) + ' <small>m²</small>';
+    document.getElementById('usableCount').textContent =
+      `${data.totals.usable_count} of ${data.totals.scan_count}`;
+    render();
+  } catch (e) {
+    msg('Could not reach the server.', 'err');
+  }
+}
+
+function render() {
+  const el = document.getElementById('content');
+
+  if (!scans.length) {
+    el.innerHTML = `
+      <div class="empty">
+        <h2>No scans yet</h2>
+        <p>Drive the robot a full lap of a room and it saves automatically,<br>
+           or press <b>Save current scan</b> to keep what is mapped so far.</p>
+      </div>`;
+    return;
+  }
+
+  const rows = scans.map(s => {
+    const when = new Date(s.created_at).toLocaleString();
+    // Flag unusable scans in the row itself. Someone scanning ten rooms will
+    // not open each one to check, and an unreliable area quoted as fact is
+    // the failure that costs money.
+    const warning = s.is_usable ? '' :
+      `<div class="warn">not reliable — re-scan before quoting</div>`;
+    return `
+      <tr>
+        <td class="name">
+          <input value="${escapeHtml(s.name)}"
+                 onchange="rename('${s.scan_id}', this.value)"
+                 title="click to rename">
+          ${warning}
+        </td>
+        <td class="num"><b>${s.area_m2.toFixed(2)}</b> m²</td>
+        <td class="num">${s.long_side_m.toFixed(2)} × ${s.short_side_m.toFixed(2)} m</td>
+        <td class="num">${s.perimeter_m.toFixed(1)} m</td>
+        <td><span class="grade ${s.grade}">${s.grade}</span></td>
+        <td class="num">${s.coverage_pct.toFixed(0)}%</td>
+        <td style="color:var(--muted);font-size:12px">${when}</td>
+        <td style="white-space:nowrap">
+          <a class="btn" href="/api/scans/${s.scan_id}/floorplan.svg" title="Download floor plan">SVG</a>
+          <a class="btn" href="/api/scans/${s.scan_id}/scan.json" title="Download data">JSON</a>
+          <button class="danger" onclick="remove('${s.scan_id}', '${escapeHtml(s.name)}')">Delete</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  el.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Room</th><th>Area</th><th>Dimensions</th><th>Perimeter</th>
+        <th>Quality</th><th>Observed</th><th>Scanned</th><th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function saveCurrent() {
+  const name = prompt('Name this room:', '');
+  if (name === null) return;
+  try {
+    const res = await fetch('/api/scans', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      msg(err.error === 'nothing mapped yet'
+        ? 'Nothing mapped yet — drive the robot around a room first.'
+        : (err.error || 'Could not save.'), 'err');
+      return;
+    }
+    const saved = await res.json();
+    msg(`Saved "${saved.name}" — ${saved.area_m2.toFixed(2)} m² (${saved.grade}).`, 'ok');
+    load();
+  } catch (e) {
+    msg('Could not save.', 'err');
+  }
+}
+
+async function rename(id, name) {
+  await fetch(`/api/scans/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  });
+  load();
+}
+
+async function remove(id, name) {
+  if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+  await fetch(`/api/scans/${id}`, { method: 'DELETE' });
+  msg(`Deleted "${name}".`, 'ok');
+  load();
+}
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

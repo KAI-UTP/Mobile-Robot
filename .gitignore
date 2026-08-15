@@ -27,3 +27,6 @@ Thumbs.db
 
 # Secrets — never commit real credentials
 .env
+
+# Saved scans are the user's data, not source.
+scans/

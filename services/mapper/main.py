@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import threading
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,7 +38,9 @@ from pydantic import ValidationError
 from robotmap_common.models import SensorPacket, ServiceHealth
 from robotmap_common.topics import Topics
 
+from mapper.exports import scan_to_json, scan_to_svg, scans_to_csv
 from mapper.pipeline import MappingPipeline
+from mapper.storage import Scan, ScanStore, assess_quality, safe_name
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -67,6 +70,10 @@ _start_time = datetime.now(UTC)
 # Set from --room in simulator mode, or REFERENCE_ROOM when running against
 # hardware in a room whose real dimensions are known.
 app.state.reference_room_name = os.environ.get("REFERENCE_ROOM", "rectangular")
+
+# Saved scans. Defaults to ./scans; set SCAN_DIR to a mounted volume in Docker
+# so a container rebuild does not take the user's measurements with it.
+store = ScanStore(os.environ.get("SCAN_DIR"))
 
 # Every connected browser. Guarded because packets arrive on an MQTT thread.
 _clients: set[WebSocket] = set()
@@ -109,10 +116,157 @@ async def get_state() -> JSONResponse:
     return JSONResponse(pipeline.state())
 
 
+@app.get("/scans")
+async def scans_page() -> FileResponse:
+    """The saved-scan library."""
+    return FileResponse(STATIC_DIR / "scans.html")
+
+
 @app.get("/compare")
 async def compare_page() -> FileResponse:
     """Two screens: the real room, and the room the robot drew."""
     return FileResponse(STATIC_DIR / "compare.html")
+
+
+# ── Saved scans ───────────────────────────────────────────────────────────────
+
+
+def save_current_scan(name: str | None = None) -> dict:
+    """Persist whatever the robot has mapped so far.
+
+    Called automatically when a circuit closes, and manually from the UI. The
+    grade is computed here rather than trusted from the caller so a scan
+    cannot be saved claiming to be better than it was.
+    """
+    room = pipeline.refresh_room()
+    if room is None or not room.polygon:
+        raise ValueError("nothing mapped yet")
+
+    pose = pipeline.pose
+    quality = assess_quality(
+        is_closed=room.is_closed,
+        coverage_pct=room.coverage_pct,
+        pose_confidence=pose.position_confidence if pose else 0.0,
+    )
+
+    scan = Scan(
+        scan_id=store.new_id(),
+        name=safe_name(name or "", fallback=f"Room {len(store.list_scans()) + 1}"),
+        created_at=datetime.now(UTC).isoformat(),
+        robot_id=pipeline.robot_id,
+        area_m2=room.area_m2,
+        perimeter_m=room.perimeter_m,
+        long_side_m=room.bounding_width_m,
+        short_side_m=room.bounding_height_m,
+        polygon=[{"x_m": p.x_m, "y_m": p.y_m} for p in room.polygon],
+        quality=quality,
+        distance_travelled_m=pose.distance_travelled_m if pose else 0.0,
+        grid_b64=ScanStore.encode_grid(pipeline.grid_bytes()),
+        grid_meta=pipeline.state()["grid"],
+    )
+    store.save(scan)
+    return scan.summary()
+
+
+@app.get("/api/scans")
+async def list_scans() -> JSONResponse:
+    return JSONResponse({"scans": store.list_scans(), "totals": store.totals()})
+
+
+@app.post("/api/scans")
+async def create_scan(body: dict | None = None) -> JSONResponse:
+    try:
+        summary = save_current_scan((body or {}).get("name"))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(summary, status_code=201)
+
+
+@app.get("/api/scans/{scan_id}")
+async def get_scan(scan_id: str) -> JSONResponse:
+    try:
+        scan = store.load(scan_id)
+    except ValueError:
+        return JSONResponse({"error": "invalid scan id"}, status_code=400)
+    if scan is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    payload = scan.summary()
+    payload["polygon"] = scan.polygon
+    payload["quality"] = asdict(scan.quality)
+    payload["notes"] = scan.notes
+    payload["distance_travelled_m"] = scan.distance_travelled_m
+    return JSONResponse(payload)
+
+
+@app.patch("/api/scans/{scan_id}")
+async def update_scan(scan_id: str, body: dict) -> JSONResponse:
+    try:
+        if "name" in body and not store.rename(scan_id, body["name"]):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if "notes" in body and not store.set_notes(scan_id, body["notes"]):
+            return JSONResponse({"error": "not found"}, status_code=404)
+    except ValueError:
+        return JSONResponse({"error": "invalid scan id"}, status_code=400)
+    return JSONResponse({"status": "ok"})
+
+
+@app.delete("/api/scans/{scan_id}")
+async def delete_scan(scan_id: str) -> JSONResponse:
+    try:
+        deleted = store.delete(scan_id)
+    except ValueError:
+        return JSONResponse({"error": "invalid scan id"}, status_code=400)
+    if not deleted:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"status": "deleted"})
+
+
+# ── Exports ───────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/scans/{scan_id}/floorplan.svg")
+async def export_svg(scan_id: str) -> Response:
+    try:
+        scan = store.load(scan_id)
+    except ValueError:
+        return JSONResponse({"error": "invalid scan id"}, status_code=400)
+    if scan is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    filename = f"{safe_name(scan.name, 'floorplan').replace(' ', '-')}.svg"
+    return Response(
+        content=scan_to_svg(scan),
+        media_type="image/svg+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/scans/{scan_id}/scan.json")
+async def export_json(scan_id: str) -> Response:
+    try:
+        scan = store.load(scan_id)
+    except ValueError:
+        return JSONResponse({"error": "invalid scan id"}, status_code=400)
+    if scan is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    filename = f"{safe_name(scan.name, 'scan').replace(' ', '-')}.json"
+    return Response(
+        content=scan_to_json(scan),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/scans.csv")
+async def export_csv() -> Response:
+    """Every scan as a spreadsheet — where a quote actually gets written."""
+    return Response(
+        content=scans_to_csv(store.list_scans()),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="room-scans.csv"'},
+    )
 
 
 @app.get("/api/compare")
@@ -381,6 +535,17 @@ def start_sim_source(room: str, indoor: bool, speed: float) -> None:
                         room_result.bounding_height_m,
                         room_result.is_closed,
                     )
+                # Save automatically. Finishing a scan and then losing it
+                # because nobody pressed a button is the worst possible
+                # outcome for someone who just drove a robot round a room.
+                try:
+                    saved = save_current_scan()
+                    logger.info(
+                        "Saved as '%s' (%s) — see http://localhost:8080/scans",
+                        saved["name"], saved["grade"],
+                    )
+                except Exception:
+                    logger.exception("Could not save the completed scan")
                 break
 
             robot.drive(command.linear_mps, command.angular_dps, dt_s)

@@ -103,7 +103,15 @@ services:
       MQTT_PORT: "1883"
       ROBOT_ID: "${ROBOT_ID:-MR3W01}"
       REFERENCE_ROOM: "${REFERENCE_ROOM:-rectangular}"
+      SCAN_DIR: /data/scans
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      # Saved scans live on the HOST, not in the container. Without this a
+      # `docker compose up --build` silently destroys every measurement the
+      # user has taken — which would defeat the point of saving them at all.
+      # A bind mount rather than a named volume so the files are visible,
+      # copyable and backed up like any other document.
+      - ./scans:/data/scans
     # Simulator by default so the stack is demonstrable with no hardware.
     # Override with: SOURCE=mqtt docker compose up
     command: >

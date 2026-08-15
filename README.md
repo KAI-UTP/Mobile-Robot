@@ -1,8 +1,23 @@
-# Room Mapper — 3-Wheel Holonomic Mobile Robot
+# RoomScan — a robot that measures rooms
 
-A **three-wheel holonomic (kiwi drive)** robot that drives around a room and
-measures it: floor area in m², dimensions, and a floor plan you can export.
-Three omni wheels at 120°, driven by daisy-chained bus servos over USB.
+**"How many square metres is this room?"** — answered by driving a robot around
+it instead of crawling about with a tape measure.
+
+Drive one lap. Get a floor plan, a measured floor area, and a spreadsheet to
+quote from. Saved, graded for reliability, and exportable.
+
+```
+Room 1     26.77 m²    5.95 × 4.50 m    GOOD    99% observed
+```
+
+Built for the people whose money depends on that number — flooring installers
+quoting per m², cleaning contractors pricing per visit, facilities managers
+reporting space. See **[docs/PRODUCT.md](docs/PRODUCT.md)** for who it is for,
+what the MVP covers, and what it honestly does not do yet.
+
+Underneath: a **three-wheel holonomic (kiwi drive)** robot — three omni wheels
+at 120°, driven by daisy-chained Feetech STS3215 bus servos over USB, with no
+microcontroller.
 
 > **Platform note.** An earlier iteration of this repository assumed
 > differential drive (two driven wheels + caster). The actual robot is
@@ -29,10 +44,16 @@ docker compose up --build -d
 
 | | |
 |---|---|
+| <http://localhost:8080/scans> | **saved scans — the product loop** |
 | <http://localhost:8080> | live map |
-| <http://localhost:8080/compare> | **the real room beside the room the robot drew** |
+| <http://localhost:8080/compare> | the real room beside the room the robot drew |
 | <http://localhost:3001> | Grafana dashboards (admin / admin) |
 | <http://localhost:8086> | InfluxDB (admin / roommapper123) |
+
+A scan **saves itself** the moment the robot completes a lap, so finishing a
+room and then losing it because nobody pressed a button cannot happen. Scans
+live in `./scans/` on the host — a `docker compose up --build` does not touch
+them.
 
 > Grafana is on **3001**, not 3000 — the SmartClean Twin project usually holds
 > 3000. Change it with `GRAFANA_PORT` in `.env`.
@@ -199,6 +220,35 @@ packets are sent, so no wheel can move. Then:
 
 ```bash
 python services/servo-bus/calibrate.py --port COM5 --spin-each
+```
+
+## The product loop
+
+**Scan → judge → save → export.** A demo stops after the first step.
+
+Every scan is graded before it is saved, because a measuring tool that is
+sometimes wrong and never says so is worse than no tool:
+
+| Grade | Meaning |
+|---|---|
+| **GOOD** | boundary closed, ≥85 % of floor observed, pose confident |
+| **ACCEPTABLE** | closed, ≥60 % observed — usable with a wider margin |
+| **POOR** | closed but thin evidence; re-scan |
+| **UNUSABLE** | boundary never closed — the area is a **lower bound**, not a measurement |
+
+Two places that grade does real work:
+
+- The **CSV total sums only usable scans.** Adding up figures already flagged
+  unreliable would give a confident-looking total made of bad parts.
+- The **exported floor plan carries the warning on the drawing.** A printed
+  plan outlives the app; without it a bad scan becomes a piece of paper that
+  looks authoritative.
+
+Exports: dimensioned **SVG** floor plan, **JSON** for other software, and
+**CSV** of every room — which is where a quote actually gets written.
+
+```bash
+curl http://localhost:8080/api/scans.csv
 ```
 
 ## The two screens
