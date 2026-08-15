@@ -232,6 +232,32 @@ async def _send_frame(socket: WebSocket) -> None:
     await socket.send_bytes(pipeline.grid_bytes())
 
 
+def _publish_derived() -> None:
+    """Publish the pose and room estimate for anything downstream.
+
+    Without this the telemetry sink has nothing to persist and Grafana stays
+    empty in the default simulator configuration — the pipeline runs
+    in-process there, so the derived values never touch the broker unless they
+    are put there deliberately.
+
+    Republished at the broadcast rate rather than per packet: a 10 Hz pose is
+    more resolution than a dashboard can show, and the room outline changes
+    far more slowly still.
+    """
+    publisher = getattr(app.state, "mqtt_publisher", None)
+    if publisher is None:
+        return
+
+    try:
+        if pipeline.pose is not None:
+            publisher(Topics.POSE, pipeline.pose.model_dump_json())
+        if pipeline.room is not None:
+            publisher(Topics.ROOM, pipeline.room.model_dump_json())
+    except Exception:
+        # A broker outage must not stop the map from being served.
+        logger.debug("Could not publish derived state", exc_info=True)
+
+
 async def _broadcast_loop(interval_s: float = 0.25) -> None:
     """Push the map to every browser a few times a second.
 
@@ -240,6 +266,11 @@ async def _broadcast_loop(interval_s: float = 0.25) -> None:
     """
     while True:
         await asyncio.sleep(interval_s)
+
+        # Runs regardless of whether a browser is connected: the dashboards
+        # and the time-series history must not depend on someone watching.
+        _publish_derived()
+
         with _clients_lock:
             targets = list(_clients)
         if not targets:
@@ -269,6 +300,28 @@ def _ingest(payload: bytes) -> None:
         logger.warning("Rejected malformed packet: %s", exc.errors()[:2])
         return
     pipeline.process(packet)
+
+
+def connect_publisher() -> None:
+    """Attach an MQTT publisher for the derived pose and room.
+
+    Optional by design: the offline demo must keep working on a laptop with no
+    broker, so a failure here is logged and the map still serves.
+    """
+    try:
+        from robotmap_common.mqtt_client import build_client
+
+        client = build_client(client_id="mapper-publisher")
+        app.state.mqtt_publisher = lambda topic, payload: client.publish(
+            topic, payload
+        )
+        logger.info("Publishing pose and room to MQTT for the telemetry sink")
+    except Exception as exc:
+        app.state.mqtt_publisher = None
+        logger.warning(
+            "No MQTT publisher (%s). Grafana will have no data; the live map "
+            "still works.", exc,
+        )
 
 
 def start_mqtt_source() -> None:
@@ -361,7 +414,16 @@ def main() -> None:
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--no-mqtt-publish",
+        action="store_true",
+        help="Do not publish pose and room (offline laptop demo with no broker)",
+    )
     args = parser.parse_args()
+
+    app.state.mqtt_publisher = None
+    if not args.no_mqtt_publish:
+        connect_publisher()
 
     if args.source == "sim":
         # The simulated room IS the ground truth, so score against it.

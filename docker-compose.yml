@@ -24,8 +24,14 @@ services:
       - mosquitto-data:/mosquitto/data
     restart: unless-stopped
     healthcheck:
-      # The image ships no mosquitto_sub, so probe the listener directly.
-      test: ["CMD-SHELL", "timeout 2 sh -c '</dev/tcp/127.0.0.1/1883' || exit 1"]
+      # Subscribe to the broker's own status topic and exit after one message.
+      # This proves the broker is actually SERVING, not merely that something
+      # holds the port.
+      #
+      # $$SYS rather than $SYS: compose substitutes single-$ variables in this
+      # file before Docker ever sees them, so a lone $SYS would expand to an
+      # empty string and the check would subscribe to nothing.
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/broker/version", "-C", "1", "-W", "3"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -38,14 +44,14 @@ services:
       - "8086:8086"
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: admin
-      DOCKER_INFLUXDB_INIT_PASSWORD: roommapper123
-      DOCKER_INFLUXDB_INIT_ORG: roommapper
-      DOCKER_INFLUXDB_INIT_BUCKET: roommapper
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: roommapper-super-secret-token
+      DOCKER_INFLUXDB_INIT_USERNAME: "${INFLUX_USER:-admin}"
+      DOCKER_INFLUXDB_INIT_PASSWORD: "${INFLUX_PASSWORD:-roommapper123}"
+      DOCKER_INFLUXDB_INIT_ORG: "${INFLUX_ORG:-roommapper}"
+      DOCKER_INFLUXDB_INIT_BUCKET: "${INFLUX_BUCKET:-roommapper}"
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: "${INFLUX_TOKEN:-roommapper-super-secret-token}"
       # A student project generates a lot of 10 Hz telemetry; a week is
       # plenty and keeps the volume from growing without bound.
-      DOCKER_INFLUXDB_INIT_RETENTION: 7d
+      DOCKER_INFLUXDB_INIT_RETENTION: "${INFLUX_RETENTION:-7d}"
     volumes:
       - influxdb-data:/var/lib/influxdb2
       - influxdb-config:/etc/influxdb2
@@ -61,14 +67,21 @@ services:
     image: grafana/grafana:11.3.0
     container_name: roommapper-grafana
     ports:
-      - "3000:3000"
+      # Configurable because port 3000 is very often already taken — the
+      # SmartClean Twin project runs a Grafana there too.
+      - "${GRAFANA_PORT:-3001}:3000"
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
       GF_USERS_ALLOW_SIGN_UP: "false"
       # Land on the twin dashboard rather than an empty home page.
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/digital-twin.json
       GF_LOG_LEVEL: warn
+      # Read by the provisioned datasource, which references them as $VAR
+      # rather than hardcoding the token.
+      INFLUX_TOKEN: "${INFLUX_TOKEN:-roommapper-super-secret-token}"
+      INFLUX_ORG: "${INFLUX_ORG:-roommapper}"
+      INFLUX_BUCKET: "${INFLUX_BUCKET:-roommapper}"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/etc/grafana/dashboards:ro
@@ -113,9 +126,10 @@ services:
       MQTT_HOST: mosquitto
       MQTT_PORT: "1883"
       INFLUX_URL: http://influxdb:8086
-      INFLUX_TOKEN: roommapper-super-secret-token
-      INFLUX_ORG: roommapper
-      INFLUX_BUCKET: roommapper
+      # Must match the token InfluxDB was initialised with, above.
+      INFLUX_TOKEN: "${INFLUX_TOKEN:-roommapper-super-secret-token}"
+      INFLUX_ORG: "${INFLUX_ORG:-roommapper}"
+      INFLUX_BUCKET: "${INFLUX_BUCKET:-roommapper}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     depends_on:
       mosquitto:

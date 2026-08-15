@@ -9,9 +9,12 @@ datasources:
     isDefault: true
     jsonData:
       version: Flux
-      organization: roommapper
-      defaultBucket: roommapper
+      # Grafana expands $VAR in provisioning files from its own environment,
+      # so the token is never written down here. docker-compose passes these
+      # through from .env (or its defaults).
+      organization: $INFLUX_ORG
+      defaultBucket: $INFLUX_BUCKET
       tlsSkipVerify: true
     secureJsonData:
-      token: roommapper-super-secret-token
+      token: $INFLUX_TOKEN
     editable: true

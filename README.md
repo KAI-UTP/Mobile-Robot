@@ -31,8 +31,14 @@ docker compose up --build -d
 |---|---|
 | <http://localhost:8080> | live map |
 | <http://localhost:8080/compare> | **the real room beside the room the robot drew** |
-| <http://localhost:3000> | Grafana dashboards (admin / admin) |
+| <http://localhost:3001> | Grafana dashboards (admin / admin) |
 | <http://localhost:8086> | InfluxDB (admin / roommapper123) |
+
+> Grafana is on **3001**, not 3000 — the SmartClean Twin project usually holds
+> 3000. Change it with `GRAFANA_PORT` in `.env`.
+>
+> Copy `.env.example` to `.env` and change the credentials before running this
+> anywhere but your own machine.
 
 Comes up with the simulator running, so there is data flowing and nothing to
 configure. Grafana's datasource and dashboard are provisioned — no clicking.
