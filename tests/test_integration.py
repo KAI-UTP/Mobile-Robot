@@ -17,7 +17,7 @@ from mapping.room_extraction import RoomExtractor
 from robotmap_common.geometry import RobotGeometry
 from robotmap_common.models import PoseSource
 
-from simulator.explorer import ExploreState, WallFollower
+from autonomy.explorer import ExploreState, WallFollower
 from simulator.virtual_robot import VirtualRobot, VirtualWorld
 
 # 360 counts per wheel revolution — the resolution the BOM specifies.

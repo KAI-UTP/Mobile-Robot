@@ -10,6 +10,7 @@ COPY shared/ ./shared/
 COPY services/localization/ ./services/localization/
 COPY services/mapping/ ./services/mapping/
 COPY services/mapper/ ./services/mapper/
+COPY autonomy/ ./autonomy/
 COPY simulator/ ./simulator/
 
 ENV PYTHONPATH=/app/shared:/app/services:/app

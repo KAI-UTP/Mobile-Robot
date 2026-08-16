@@ -17,7 +17,7 @@ from localization.fusion import PoseFilter
 from robotmap_common.holonomic import HolonomicGeometry
 from robotmap_common.rssi import BeaconLayout, trilaterate
 
-from simulator.explorer import ExploreState, WallFollower
+from autonomy.explorer import ExploreState, WallFollower
 from simulator.virtual_robot import NoiseProfile, VirtualRobot, VirtualWorld
 
 ROOM_W, ROOM_H = 6.0, 4.5

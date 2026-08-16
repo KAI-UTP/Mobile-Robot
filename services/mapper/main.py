@@ -620,8 +620,8 @@ def start_sim_source(room: str, indoor: bool, speed: float, sweep: bool = True) 
     The outline is measured and saved after phase 1 regardless, so a sweep
     that is interrupted still leaves a usable room measurement behind.
     """
-    from simulator.coverage import CoveragePlanner, CoverageState
-    from simulator.explorer import ExploreState, WallFollower
+    from autonomy.coverage import CoveragePlanner, CoverageState
+    from autonomy.explorer import ExploreState, WallFollower
     from simulator.virtual_robot import VirtualRobot, VirtualWorld
 
     worlds = {

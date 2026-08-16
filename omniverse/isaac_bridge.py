@@ -68,7 +68,7 @@ class IsaacSensorBridge:
             logger.info("Publishing to %s", Topics.SENSORS_RAW)
 
         # Wall-following runs on the same controller the real robot will use.
-        from simulator.explorer import WallFollower
+        from autonomy.explorer import WallFollower
 
         self.follower = WallFollower()
 

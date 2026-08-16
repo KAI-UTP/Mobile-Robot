@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from robotmap_common.models import RangeReading
 
-from simulator.coverage import (
+from autonomy.coverage import (
     CoverageConfig,
     CoveragePlanner,
     CoverageState,

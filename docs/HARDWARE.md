@@ -5,10 +5,51 @@ in MYR. Treat them as a budgeting guide, not a quote.
 
 ---
 
+## 0. What the robot actually is
+
+**Read this before section 1.** The build was settled after the rest of this
+document was written, and it went a different way:
+
+| | |
+|---|---|
+| **Drive** | three Feetech **STS3215 12 V** bus servos, kiwi layout at 120° |
+| **Bus** | one servo bus board, servos daisy-chained off it |
+| **Power** | 12 V adapter into the bus board |
+| **Link** | **USB-C from the bus board to the PC** |
+| **Controller** | **none — the PC is the controller** |
+| **Encoders** | the servos' own 12-bit encoders, read back over the bus |
+
+Everything downstream — odometry, occupancy mapping, room extraction, the
+autonomy — runs as ordinary Python on the PC. `services/servo-bus/driver.py`
+owns the serial port and speaks the STS3215 protocol; `services/robot-agent/`
+assembles the sensor packets; `services/pilot/` drives the scan.
+
+**`firmware/esp32_robot/` is from the earlier design and is not used.** It is
+kept because the ESP32 route is still the right answer for a tetherless robot,
+and section 1 below is the comparison that led there. Nothing in the current
+system flashes it or depends on it.
+
+Consequences worth knowing:
+
+- **The robot is tethered by USB-C.** That is fine for measuring one room and
+  is the reason a Bluetooth SPP bridge exists as an alternative link.
+- **Encoder resolution stopped being the limit.** A bus servo reports absolute
+  position from a 12-bit encoder — 4096 counts per revolution against the 20
+  the differential build assumed. Encoder quantisation dominated the old error
+  budget (0.56 m of 0.69 m); it does not any more.
+- **Omni-wheel slip replaced it as the limit.** The rollers that let the robot
+  strafe also slide during ordinary driving, and that sliding is invisible to
+  the encoders. This is why the mapping stack leans on range sensing rather
+  than dead reckoning.
+
+---
+
 ## 1. Choosing the controller
 
-You have not picked a board yet, so here is the comparison that matters for
-*this* project.
+*Historical — see section 0. This is the comparison that was made before the
+servo-bus route was chosen, and it still applies to a tetherless rebuild.*
+
+Here is the comparison that matters for *this* project.
 
 | | **ESP32** (recommended) | Arduino Uno/Nano + HC-05 | Raspberry Pi 4/5 |
 |---|---|---|---|

@@ -454,13 +454,17 @@ Mobile Robot/
 │   │   ├── calibrate.py        Which servo is which wheel, and which way
 │   │   ├── protocols.py        Feetech / Dynamixel / LewanSoul framing
 │   │   └── driver.py           Holonomic drive + watchdog
+│   ├── pilot/                  Autonomous scan on real hardware, with limits
 │   ├── localization/fusion.py  Odometry + IMU + gated GPS → pose
 │   ├── mapping/                Log-odds grid → room polygon + area
 │   ├── mapper/                 Pipeline + live web UI
 │   └── bt-bridge/              Bluetooth serial → MQTT
-├── simulator/                  Virtual robot + wall-following explorer
+├── autonomy/                   Where the robot decides to drive
+│   ├── explorer.py             Wall-following: measures the boundary
+│   └── coverage.py             Row-by-row sweep: finds what is on the floor
+├── simulator/                  Virtual robot and world, for hardware-free dev
 ├── firmware/esp32_robot/       Superseded — kept for the microcontroller route
-├── tests/                      230 tests
+├── tests/                      875 tests
 └── docs/
     ├── OMNIVERSE.md            Movement: Omniverse then real robot
     ├── HARDWARE.md             BOM, wiring, calibration
@@ -471,27 +475,55 @@ Mobile Robot/
 
 ## Running with real hardware
 
-**1. Build the robot.** [docs/HARDWARE.md](docs/HARDWARE.md) has the full BOM
-(≈ RM 310–370), the wiring table, and three traps that will otherwise cost you
-an afternoon — including the 5 V ECHO pin that damages ESP32 GPIOs.
+**There is no microcontroller.** Three Feetech STS3215 12 V bus servos are
+daisy-chained to a servo bus board; the board takes 12 V from an adapter and
+speaks to the PC over USB-C. Everything else — odometry, mapping, autonomy —
+runs on the PC. `firmware/esp32_robot/` is from the earlier design and is not
+used; see [docs/HARDWARE.md](docs/HARDWARE.md).
 
-**2. Flash the firmware.** Edit `firmware/esp32_robot/config.h` (WiFi
-credentials, MQTT host, `TICKS_PER_REVOLUTION`), then flash with the Arduino
-IDE. Requires the `PubSubClient` and `ArduinoJson` libraries.
+**1. Find the bus and check the wiring.**
 
-**3. Start a broker.**
+```bash
+python services/servo-bus/scan.py --list
+```
+
+```bash
+python services/servo-bus/calibrate.py --port COM5 --check-order
+```
+
+Run `--check-order` before anything drives itself. The servo IDs must be in the
+same order as the wheel angles; get it wrong and the robot drives off at the
+wrong angle while looking perfectly healthy.
+
+**2. Start a broker.**
 
 ```bash
 docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto
 ```
 
-**4. Start the mapper.**
+**3. Start the mapper.**
 
 ```bash
 python services/mapper/main.py --source mqtt
 ```
 
-**Bluetooth instead of WiFi?** Find the port, then bridge it:
+**4. Scan the room.** Dry-run it first — this prints the commands it would send
+and touches no hardware:
+
+```bash
+python services/pilot/main.py --dry-run
+```
+
+```bash
+python services/pilot/main.py --servo-port COM5
+```
+
+The pilot runs the same `WallFollower` and `CoveragePlanner` that CI tests
+against the virtual robot. That is the point of keeping them in `autonomy/`
+with no simulator types in their signatures: a passing test says something
+about the hardware.
+
+**Bluetooth instead of USB?** Find the port, then bridge it:
 
 ```bash
 python services/bt-bridge/main.py --list
@@ -500,6 +532,23 @@ python services/bt-bridge/main.py --list
 ```bash
 python services/bt-bridge/main.py --port COM5
 ```
+
+### Before you let it drive itself
+
+An autonomous robot with 12 V servos fails physically, so the safety behaviour
+is specified rather than assumed, and tested in `tests/test_pilot.py`:
+
+- **The wheels stop when the pilot does** — every exit path, exception and
+  Ctrl-C included.
+- **Stale telemetry stops the robot.** A frozen world model while the robot
+  keeps moving is exactly when it hits something.
+- **The driver's watchdog is the backstop.** It halts the wheels if no command
+  arrives, so even `kill -9` stops the robot within `watchdog_s`.
+- **A bump during the perimeter lap halts the scan.** Wall-following has no
+  recovery behaviour — it assumed the sensors saw the wall, and a contact means
+  they did not.
+- **Speed is limited in the pilot *and* in the driver**, independently, because
+  the one that matters is whichever is lower.
 
 ---
 
