@@ -51,7 +51,10 @@ WALL_HEIGHT = 2.4
 WALL_THICK = 0.12
 
 ROBOT_ID = "MR3W01"
-POSE_FILE = os.path.join(tempfile.gettempdir(), f"roommapper_{ROBOT_ID}_pose.json")
+POSE_FILE = os.environ.get(
+    "POSE_FILE_PATH",
+    os.path.join(tempfile.gettempdir(), f"roommapper_{ROBOT_ID}_pose.json"),
+)
 USE_MQTT = False
 MQTT_HOST = "localhost"
 
@@ -83,7 +86,19 @@ SHOW_BEACON_RANGES = False   # rings showing inferred distance; busy but instruc
 # comparison, in 3D, in Omniverse rather than in a browser canvas. Read live
 # from the mapper over plain HTTP, so nothing needs installing inside Kit.
 SHOW_MEASURED = True
-MAPPER_URL = "http://localhost:8080"
+
+# Which mapper the measured room is read from.
+#
+# This MUST be the same mapper that is writing POSE_FILE, or the two halves of
+# the scene show two different robots in two different rooms and the comparison
+# means nothing. It happened: the robot on the left followed a furnished-room
+# mapper on port 8082 while the room on the right was read from a
+# rectangular-room mapper on 8080, reporting 27.97 m2 and no obstacles beside a
+# robot that had measured 23.37 m2 and found one.
+#
+# Settable from the environment so a mapper on a non-default port can be
+# followed without editing this file.
+MAPPER_URL = os.environ.get("MAPPER_URL", "http://localhost:8080")
 MEASURED_GAP_M = 2.0         # clear floor between the two rooms
 MEASURED_POLL_S = 2.0        # the outline changes far more slowly than the pose
 

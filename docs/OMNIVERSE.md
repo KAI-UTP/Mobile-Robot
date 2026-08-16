@@ -87,6 +87,28 @@ kit.exe apps/omni.app.full.kit --exec C:\kitscene\kit_room_3d.py
 >
 > Pasting into the Script Editor avoids the problem entirely.
 
+#### Both halves must come from the same robot
+
+The scene reads the robot's position from `POSE_FILE_PATH` and the measured
+room from `MAPPER_URL`. Nothing links them, so it is entirely possible to watch
+a robot from one mapper beside a room measured by another — which happened
+here: the robot followed a furnished-room mapper on port 8082 while the room
+beside it was read from a rectangular-room mapper on 8080, showing 27.97 m² and
+no obstacles next to a robot that had measured 23.37 m² and found one. A twin
+whose halves disagree is worse than no twin.
+
+Run one mapper and point both at it:
+
+```bash
+python services/mapper/main.py --source sim --room furnished --port 8083
+MAPPER_URL=http://localhost:8083 kit.exe apps/omni.app.full.kit --exec C:\kitscene\kit_room_3d.py
+```
+
+> **Docker holds the port after the container stops.** `docker compose stop
+> mapper` leaves `wslrelay` listening on 8080 and forwarding to a container
+> that is gone, so a local mapper started on the same port binds without error
+> and every request times out. Use `docker compose down`, or a different port.
+
 The robot builds itself a room and runs through a movement sequence: forward,
 strafe left, strafe right, rotate in place, diagonal, then translate *while*
 rotating. A yellow nose marker shows which way it's facing — without it,
