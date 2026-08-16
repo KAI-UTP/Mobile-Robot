@@ -40,19 +40,35 @@ class FakePrim:
         self.opacity = None
         self.radius = None
         self.height = None
+        # Every other Create*Attr the script sets, by name. Assigned before
+        # __getattr__ can be reached, which would otherwise recurse.
+        self.attrs: dict = {}
 
-    # Every Create*Attr the script calls. They only need to not explode.
-    def CreateSizeAttr(self, *_): pass
+    # The handful whose values the tests actually assert on.
     def CreateRadiusAttr(self, value): self.radius = value
     def CreateHeightAttr(self, value): self.height = value
-    def CreateAxisAttr(self, *_): pass
     def CreateDisplayColorAttr(self, value): self.colour = tuple(value[0])
-    def CreateIntensityAttr(self, *_): pass
-    def CreateColorAttr(self, *_): pass
-    def CreateAngleAttr(self, *_): pass
-    def CreateExtentAttr(self, *_): pass
+
     def GetPrim(self): return self
     def __bool__(self): return True
+
+    def __getattr__(self, name):
+        """Accept any other `Create<Something>Attr`, recording that it was set.
+
+        USD prims expose one of these per schema attribute and the scene uses
+        many — size, axis, intensity, width, extent. Enumerating them means the
+        stub fails on a legitimate USD call that the shipped script is entitled
+        to make, which is a broken test rather than a caught bug.
+
+        Deliberately narrow: only the `Create*Attr` idiom is accepted, so a
+        genuine typo or a call to something that is not a USD attribute setter
+        still raises.
+        """
+        if name.startswith("Create") and name.endswith("Attr"):
+            def setter(value=None, *_, **__):
+                self.attrs[name] = value
+            return setter
+        raise AttributeError(name)
 
 
 class FakeStage:
