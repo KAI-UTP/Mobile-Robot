@@ -1,7 +1,24 @@
 apiVersion: 1
 
+# Removed first, so changing the uid below replaces the datasource rather than
+# leaving the old one beside it. Grafana keeps provisioned datasources in its
+# own database, which lives in a named volume and therefore outlives an edit
+# to this file.
+deleteDatasources:
+  - name: InfluxDB
+    orgId: 1
+
 datasources:
   - name: InfluxDB
+    # Pinned, and it MUST match the `datasource.uid` the dashboard panels use.
+    #
+    # Without this Grafana assigns a random uid on first provision — it was
+    # P951FEA4DE68E13C5 — while every panel in digital-twin.json asks for
+    # "influxdb". The API answers "Data source not found" and all eleven panels
+    # come up empty, on a dashboard whose data pipeline is working perfectly:
+    # 9544 pose points, 1688 sensor and 1390 GPS in the last twenty minutes,
+    # none of it reachable.
+    uid: influxdb
     type: influxdb
     access: proxy
     # Container-to-container, so the service name rather than localhost.

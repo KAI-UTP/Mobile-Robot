@@ -2,7 +2,7 @@
 REM ===================================================================
 REM  Digital Twin - one click, all three windows
 REM
-REM   1. Grafana        http://localhost:3000   the data
+REM   1. Grafana        http://localhost:3001   the data
 REM   2. Web app        http://localhost:8080   the robot's own 2D map
 REM   3. Omniverse                              the physical world
 REM
@@ -18,6 +18,9 @@ REM ===================================================================
 
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
+
+REM  Must match GRAFANA_PORT in docker-compose.yml.
+if not defined GRAFANA_PORT set "GRAFANA_PORT=3001"
 
 echo.
 echo  ===============================================================
@@ -131,14 +134,19 @@ if not defined KIT (
 REM -- 5. The two browser windows -------------------------------------
 echo  [5/5] Opening the dashboards...
 start "" http://localhost:8080
-start "" http://localhost:3000
+REM  3001, not 3000. Port 3000 is very often already taken - the
+REM  SmartClean Twin project runs a Grafana there - so docker-compose
+REM  publishes this one on GRAFANA_PORT, default 3001. Opening 3000
+REM  showed the OTHER project's Grafana, with its own datasource and
+REM  its own dashboards, which looks close enough to be believed.
+start "" http://localhost:%GRAFANA_PORT%
 
 echo.
 echo  ===============================================================
 echo   Running.
 echo.
 echo     Web app     http://localhost:8080   the robot's 2D map
-echo     Grafana     http://localhost:3000   login admin / admin
+echo     Grafana     http://localhost:%GRAFANA_PORT%   login admin / admin
 echo     Omniverse   the 3D window, once the renderer finishes
 echo.
 echo   Try this:
