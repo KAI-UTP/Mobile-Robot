@@ -422,6 +422,52 @@ class FilePose:
         return self.latest
 
 
+class HttpPose:
+    """Reads the pose from the same mapper the room comes from.
+
+    The file is faster and needs no web server, but it needs the file — and
+    that turned out to be the thing nobody has. The default path is this
+    machine's temp directory, the mapper runs in a container and writes to its
+    own, and the scene is normally *pasted into the Script Editor*, where there
+    is no opportunity to set an environment variable and no `__file__` to find
+    the repository from. So the robot silently fell back to the canned demo lap
+    while the room beside it was live: the two halves of one twin, again coming
+    from two different places.
+
+    `/api/state` already serves the pose, and `MAPPER_URL` is already needed
+    for the room. One source answers both.
+    """
+
+    def __init__(self, url=None):
+        self.url = url or MAPPER_URL
+        self.latest = None
+        self._complained = False
+
+    def read(self):
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(f"{self.url}/api/state", timeout=1.5) as reply:
+                state = json.loads(reply.read().decode("utf-8"))
+        except Exception as exc:
+            if not self._complained:
+                print(f"[room] pose fetch failed: {exc}")
+                self._complained = True
+            return self.latest
+
+        pose = state.get("pose")
+        if not pose:
+            return self.latest
+
+        self.latest = {
+            "x_m": pose["x_m"],
+            "y_m": pose["y_m"],
+            "heading_deg": pose["heading_deg"],
+            "timestamp": pose.get("timestamp"),
+        }
+        return self.latest
+
+
 class DemoPose:
     """A scripted preview lap, for when nothing is publishing.
 
@@ -998,11 +1044,20 @@ def run_room():
             print(f"[room] no room from the mapper at {MAPPER_URL} yet")
             print("       start services/mapper/main.py --source sim")
 
+    # The file first — cheaper, and needs no web server — then the mapper over
+    # HTTP, which is what actually works when this file is pasted into the
+    # Script Editor with nothing set. Only then the canned lap.
     source = FilePose()
-    if source.read() is None:
-        print("[room] no live pose found — running the built-in demo lap")
-        print("       start services/twin-control/main.py for live data")
-        source = DemoPose()
+    if source.read() is not None:
+        print(f"[room] following the live robot from {POSE_FILE}")
+    else:
+        source = HttpPose()
+        if source.read() is not None:
+            print(f"[room] following the live robot from {MAPPER_URL}/api/state")
+        else:
+            print("[room] no live pose found — running the built-in demo lap")
+            print("       start services/mapper/main.py --source sim")
+            source = DemoPose()
 
     _scene = RoomScene(stage, source, measured)
     _scene.start()

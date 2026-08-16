@@ -878,3 +878,63 @@ def test_an_empty_room_builds_no_furniture_prims(kit, monkeypatch):
         if any(k in path for k in ("Sofa", "Table", "Chair"))
     ]
     assert not furniture, f"furniture drawn in an empty room: {furniture}"
+
+
+# ── Where the robot's position comes from ────────────────────────────────────
+#
+# The scene needs a pose and a room, and for a long time it took them from two
+# different places: the room over HTTP from the mapper, the robot from a file
+# whose default path is this machine's temp directory. The mapper writes inside
+# a container, and the scene is normally pasted into the Script Editor where
+# there is no chance to set an environment variable — so the room went live and
+# the robot silently ran the canned demo lap beside it.
+
+
+def test_the_pose_can_come_from_the_mapper_over_http(kit, monkeypatch):
+    """The same source the room already comes from."""
+    module, _ = kit
+    payload = {"pose": {
+        "x_m": 1.25, "y_m": 2.5, "heading_deg": 90.0,
+        "timestamp": "2026-08-16T00:00:00Z",
+    }}
+    monkeypatch.setattr("urllib.request.urlopen", _stub_fetch(payload))
+
+    pose = module.HttpPose().read()
+    assert pose["x_m"] == 1.25
+    assert pose["y_m"] == 2.5
+    assert pose["heading_deg"] == 90.0
+
+
+def test_an_unreachable_mapper_yields_no_pose(kit, monkeypatch):
+    """So the caller can fall through to the demo lap rather than freezing the
+    robot at the origin, which reads as the scene being broken."""
+    module, _ = kit
+    monkeypatch.setattr("urllib.request.urlopen", _stub_fetch(fail=True))
+    assert module.HttpPose().read() is None
+
+
+def test_a_dropped_request_keeps_the_last_pose(kit, monkeypatch):
+    """One timeout mid-run must not teleport the robot back to the origin."""
+    module, _ = kit
+    payload = {"pose": {"x_m": 3.0, "y_m": 1.0, "heading_deg": 0.0}}
+    monkeypatch.setattr("urllib.request.urlopen", _stub_fetch(payload))
+    source = module.HttpPose()
+    assert source.read()["x_m"] == 3.0
+
+    monkeypatch.setattr("urllib.request.urlopen", _stub_fetch(fail=True))
+    assert source.read()["x_m"] == 3.0
+
+
+def test_http_is_tried_before_the_demo_lap(kit, monkeypatch):
+    """The ordering that was the whole bug: a live mapper must win over the
+    canned lap even when no pose file exists."""
+    module, _ = kit
+    payload = {"pose": {"x_m": 2.0, "y_m": 2.0, "heading_deg": 45.0}}
+    monkeypatch.setattr("urllib.request.urlopen", _stub_fetch(payload))
+
+    # No pose file anywhere.
+    monkeypatch.setattr(module, "POSE_FILE", "/definitely/not/a/path.json")
+
+    file_source = module.FilePose(path="/definitely/not/a/path.json")
+    assert file_source.read() is None
+    assert module.HttpPose().read() is not None
