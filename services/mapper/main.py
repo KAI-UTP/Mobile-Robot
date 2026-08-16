@@ -23,6 +23,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +53,10 @@ logging.basicConfig(
 logger = logging.getLogger("mapper")
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Wall-clock spacing between raw sensor packets put on the broker. 10 Hz is
+# what the real robot publishes, and more than a dashboard can show anyway.
+RAW_PUBLISH_INTERVAL_S = 0.1
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -571,6 +576,46 @@ def _write_pose_file() -> None:
         logger.debug("Could not write the pose file", exc_info=True)
 
 
+_last_raw_publish = 0.0
+
+
+def publish_raw_packet(packet: SensorPacket) -> None:
+    """Put the simulator's sensor packets on the broker, as a robot would.
+
+    In simulator mode the robot runs inside this process, so its raw packets
+    never touch MQTT unless they are put there deliberately — and several
+    things downstream only ever see the robot through the broker:
+
+    * Grafana's GNSS and range panels are fed from `gps_status` and
+      `robot_sensors`, which the telemetry sink derives from these packets.
+      Without this, half the dashboard is permanently blank in the default
+      configuration — which looks like a broken dashboard rather than a
+      missing publisher.
+    * `services/pilot` waits for `sensors/raw` before it will move at all, so
+      it could not be exercised against the simulator either.
+
+    Throttled on wall-clock time rather than published per packet. `--speed`
+    fast-forwards the simulation, and at speed 25 that would be 250 messages a
+    second into InfluxDB for a demo nobody can read that fast.
+    """
+    global _last_raw_publish
+
+    publisher = getattr(app.state, "mqtt_publisher", None)
+    if publisher is None:
+        return
+
+    now = time.monotonic()
+    if now - _last_raw_publish < RAW_PUBLISH_INTERVAL_S:
+        return
+    _last_raw_publish = now
+
+    try:
+        publisher(Topics.SENSORS_RAW, packet.model_dump_json())
+    except Exception:
+        # A broker outage must not stop the map from being built.
+        logger.debug("Could not publish the raw packet", exc_info=True)
+
+
 def _publish_derived() -> None:
     """Publish the pose and room estimate for anything downstream.
 
@@ -838,6 +883,7 @@ def start_sim_source(
                 return
             packet = robot.build_packet(dt_ms=int(dt_s * 1000))
             pipeline.process(packet)
+            publish_raw_packet(packet)
 
             command = follower.step(
                 packet.ranges,
@@ -891,6 +937,7 @@ def start_sim_source(
                 return
             packet = robot.build_packet(dt_ms=int(dt_s * 1000))
             pipeline.process(packet)
+            publish_raw_packet(packet)
             pose = pipeline.pose
 
             command = planner.step(
