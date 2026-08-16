@@ -1324,7 +1324,11 @@ def main() -> None:
     parser.add_argument(
         "--hardware",
         choices=["simulated", "actual", "with-lidar"],
-        default="simulated",
+        # Falls back to the environment, so `HARDWARE=actual docker compose up`
+        # works. Hardcoding the default here overrode the env var that the
+        # module already reads at import — the setting looked configurable from
+        # compose and silently was not.
+        default=os.environ.get("HARDWARE", "simulated"),
         help=(
             "What sensors to assume are fitted. 'actual' is the robot that "
             "exists — servos, GNSS, Bluetooth, no range sensing — and maps by "

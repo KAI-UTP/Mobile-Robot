@@ -105,6 +105,13 @@ services:
       REFERENCE_ROOM: "${REFERENCE_ROOM:-rectangular}"
       SCAN_DIR: /data/scans
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # Which sensors to assume are fitted, and therefore how the room gets
+      # mapped. 'actual' is the robot that exists — servos, GNSS, Bluetooth,
+      # no range sensing — which maps by driving into things and takes about
+      # 435 m to cover a room instead of 23. See robotmap_common.hardware.
+      #
+      #   HARDWARE=actual docker compose up -d mapper
+      HARDWARE: "${HARDWARE:-simulated}"
       # Written where the HOST can read it — see the volume below.
       POSE_FILE_PATH: /data/run/roommapper_${ROBOT_ID:-MR3W01}_pose.json
     volumes:
