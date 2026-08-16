@@ -41,7 +41,7 @@ import time
 
 import omni.kit.app
 import omni.usd
-from pxr import Gf, Sdf, UsdGeom, UsdLux, Vt
+from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, Vt
 
 # ── Configuration ───────────────────────────────────────────────────────────
 
@@ -81,6 +81,15 @@ POSE_STALE_AFTER_S = 15.0
 SHOW_ODOMETRY_GHOST = True
 SHOW_RSSI_MARKER = True
 SHOW_BEACON_RANGES = False   # rings showing inferred distance; busy but instructive
+
+# Give the walls and furniture colliders, and the robot a kinematic body.
+#
+# This is what makes the room solid to PhysX, so anything dynamic collides with
+# it and Isaac Sim can drive the robot against it for real. It does NOT make
+# the blue marker stop on its own — that marker mirrors the pose the mapper
+# reports, and collision for it is decided in the mapper's simulator. See
+# `make_robot_physical`.
+ENABLE_PHYSICS = True
 
 # Build the room the ROBOT drew, standing beside the real one — the two-screen
 # comparison, in 3D, in Omniverse rather than in a browser canvas. Read live
@@ -486,6 +495,131 @@ def _shortest_angle(target, current):
     return diff + 360.0 if diff <= -180.0 else diff
 
 
+def build_camera(stage):
+    """A camera framing both rooms, made the active viewport view.
+
+    Without this the viewport keeps whatever default camera the app started
+    with, which knows nothing about where this scene was built and generally
+    opens inside the floor slab — a flat grey frame that reads as "nothing
+    rendered".
+
+    Framing. The scene spans x 0 to ROOM_W on the left and, with the measured
+    room, out to about 14 m; the camera therefore sits back on -y, high enough
+    to look down into both rooms at once rather than at the wall between the
+    viewer and them.
+    """
+    # Centre of everything worth seeing.
+    span_x = ROOM_W + MEASURED_GAP_M + ROOM_W if SHOW_MEASURED else ROOM_W
+    centre_x = span_x / 2.0
+    centre_y = ROOM_H / 2.0
+
+    eye_y = -14.0
+    eye_z = 10.0
+
+    camera = UsdGeom.Camera.Define(stage, Sdf.Path(f"{ROOT}/Camera"))
+
+    # A USD camera looks down its own -Z with +Y up. Rotating +90° about X
+    # aims it along world +Y — level, in a Z-up stage. Taking that back by the
+    # pitch angle tilts it down onto the floor.
+    pitch_deg = math.degrees(math.atan2(eye_z - 0.6, centre_y - eye_y))
+    UsdGeom.XformCommonAPI(camera).SetTranslate(Gf.Vec3d(centre_x, eye_y, eye_z))
+    UsdGeom.XformCommonAPI(camera).SetRotate(Gf.Vec3f(90.0 - pitch_deg, 0.0, 0.0))
+
+    # Wider than the 50 mm default, which at this distance frames about a third
+    # of the scene and crops the measured room off the side.
+    camera.CreateFocalLengthAttr(24.0)
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.1, 1000.0))
+
+    # Point the viewport at it. Wrapped because the scene is also loaded by the
+    # test harness and by Kit apps with no viewport at all, and failing to
+    # switch camera is not a reason to lose the room.
+    try:
+        from omni.kit.viewport.utility import get_active_viewport
+
+        viewport = get_active_viewport()
+        if viewport is not None:
+            viewport.camera_path = f"{ROOT}/Camera"
+            print(f"[room] viewport camera set to {ROOT}/Camera")
+    except Exception as exc:
+        print(f"[room] could not set the viewport camera ({exc}).")
+        print(f"       Select {ROOT}/Camera in the Stage tree and press F.")
+
+
+# ── Physics ─────────────────────────────────────────────────────────────────
+
+
+def add_collider(stage, path, approximation="convexHull"):
+    """Make one prim solid.
+
+    Purely a USD authoring step: it tags the geometry so a physics engine will
+    collide against it. Nothing here simulates anything, and adding it does not
+    make the robot stop — see `make_robot_physical` for why that is a separate
+    question.
+    """
+    prim = stage.GetPrimAtPath(Sdf.Path(path))
+    if not prim:
+        return False
+    try:
+        UsdPhysics.CollisionAPI.Apply(prim)
+        mesh_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+        mesh_api.CreateApproximationAttr(approximation)
+        return True
+    except Exception:
+        return False
+
+
+def make_solid(stage):
+    """Give every wall and every piece of furniture a collider.
+
+    What this buys and what it does not
+    -----------------------------------
+    It makes the room *physically real* to PhysX: anything dynamic dropped into
+    the scene will rest on the floor and stop at the sofa, and Isaac Sim can
+    drive the robot against it for real.
+
+    It does NOT by itself stop the blue robot marker, because that marker is
+    not simulated — it is placed each frame at the pose the mapper reports.
+    Collision for it is decided in the mapper's own simulator, and the marker
+    only ever mirrors the result. Making it a dynamic body instead would mean
+    the twin no longer shows where the robot actually is, which is the one job
+    it has.
+    """
+    solid = 0
+    for parent in (f"{ROOT}/Room", f"{ROOT}/Furniture"):
+        root = stage.GetPrimAtPath(Sdf.Path(parent))
+        if not root:
+            continue
+        for prim in root.GetChildren():
+            if add_collider(stage, prim.GetPath().pathString):
+                solid += 1
+    print(f"[room] {solid} colliders — walls and furniture are solid to physics")
+    return solid
+
+
+def make_robot_physical(stage, path=None):
+    """Make the robot a KINEMATIC body: it pushes, and is not pushed.
+
+    Kinematic rather than dynamic on purpose. A dynamic robot would be moved by
+    PhysX, and would then disagree with the pose the mapper reports — the twin
+    would be showing a robot that does not exist. Kinematic keeps the mapper
+    authoritative while still letting the robot shove dynamic props around and
+    generate contact events that Isaac Sim can report.
+    """
+    path = path or f"{ROOT}/RobotTrue"
+    prim = stage.GetPrimAtPath(Sdf.Path(path))
+    if not prim:
+        return False
+    try:
+        body = UsdPhysics.RigidBodyAPI.Apply(prim)
+        body.CreateKinematicEnabledAttr(True)
+        for child in prim.GetChildren():
+            add_collider(stage, child.GetPath().pathString)
+        return True
+    except Exception as exc:
+        print(f"[room] could not make the robot physical: {exc}")
+        return False
+
+
 # ── The room the robot drew ─────────────────────────────────────────────────
 
 
@@ -762,6 +896,17 @@ _scene = None
 def build_room():
     """Build the scene without animating it."""
     stage = omni.usd.get_context().get_stage()
+
+    # Z is up.
+    #
+    # Everything below places height on Z — the floor at z≈0, walls rising to
+    # z=2.4 — which is the robotics convention and matches the mapper's
+    # coordinates. A Kit stage defaults to Y-up, and in a Y-up stage this room
+    # is built lying on its side: the viewport opens inside a wall and shows a
+    # flat grey field with the scene apparently missing. It is not missing, it
+    # is edge-on.
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+
     UsdGeom.Xform.Define(stage, Sdf.Path(ROOT))
 
     build_shell(stage)
@@ -769,6 +914,11 @@ def build_room():
     build_beacons(stage)
     build_lighting(stage)
     build_all_robots(stage)
+    build_camera(stage)
+
+    if ENABLE_PHYSICS:
+        make_solid(stage)
+        make_robot_physical(stage)
 
     print()
     print("  LEFT — the room that exists")

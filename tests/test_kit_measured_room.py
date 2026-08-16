@@ -31,8 +31,9 @@ KIT_SCRIPT = Path(__file__).resolve().parents[1] / "omniverse" / "kit_room_3d.py
 
 
 class FakePrim:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, stage=None) -> None:
         self.path = path
+        self.stage = stage
         self.translate = (0.0, 0.0, 0.0)
         self.scale = (1.0, 1.0, 1.0)
         self.rotate = (0.0, 0.0, 0.0)
@@ -43,6 +44,8 @@ class FakePrim:
         # Every other Create*Attr the script sets, by name. Assigned before
         # __getattr__ can be reached, which would otherwise recurse.
         self.attrs: dict = {}
+        # UsdPhysics schemas applied to this prim, by name.
+        self.schemas: set = set()
 
     # The handful whose values the tests actually assert on.
     def CreateRadiusAttr(self, value): self.radius = value
@@ -51,6 +54,19 @@ class FakePrim:
 
     def GetPrim(self): return self
     def __bool__(self): return True
+
+    def GetPath(self):
+        return types.SimpleNamespace(pathString=self.path)
+
+    def GetChildren(self):
+        """Direct children, by path prefix — enough for the physics walk."""
+        if self.stage is None:
+            return []
+        prefix = self.path + "/"
+        return [
+            prim for path, prim in self.stage.prims.items()
+            if path.startswith(prefix) and "/" not in path[len(prefix):]
+        ]
 
     def __getattr__(self, name):
         """Accept any other `Create<Something>Attr`, recording that it was set.
@@ -76,7 +92,7 @@ class FakeStage:
         self.prims: dict[str, FakePrim] = {}
 
     def define(self, path: str) -> FakePrim:
-        prim = FakePrim(str(path))
+        prim = FakePrim(str(path), stage=self)
         self.prims[str(path)] = prim
         return prim
 
@@ -117,10 +133,27 @@ def _build_stub_modules(stage: FakeStage):
         def CreateDisplayOpacityAttr(self, value):
             self.prim.opacity = value[0]
 
+    class _Applied:
+        """A UsdPhysics schema applied to a prim, recorded on the prim."""
+
+        def __init__(self, name):
+            self.name = name
+
+        def Apply(self, prim):
+            prim.schemas.add(self.name)
+            return prim
+
     usdgeom = types.SimpleNamespace(
         Cube=_Definable, Cylinder=_Definable, Sphere=_Definable,
-        Xform=_Definable, Mesh=_Definable,
+        Xform=_Definable, Mesh=_Definable, Camera=_Definable,
         XformCommonAPI=_XformCommonAPI, Gprim=_Gprim,
+        SetStageUpAxis=lambda _stage, axis: setattr(stage, "up_axis", axis),
+        Tokens=types.SimpleNamespace(x="x", y="y", z="z"),
+    )
+    usdphysics = types.SimpleNamespace(
+        CollisionAPI=_Applied("collision"),
+        MeshCollisionAPI=_Applied("mesh_collision"),
+        RigidBodyAPI=_Applied("rigid_body"),
     )
     usdlux = types.SimpleNamespace(
         DistantLight=_Definable, SphereLight=_Definable,
@@ -128,12 +161,13 @@ def _build_stub_modules(stage: FakeStage):
     )
     gf = types.SimpleNamespace(
         Vec3d=lambda *a: tuple(a), Vec3f=lambda *a: tuple(a),
+        Vec2f=lambda *a: tuple(a),
     )
     sdf = types.SimpleNamespace(Path=str)
     vt = types.SimpleNamespace(
         Vec3fArray=lambda values: list(values), FloatArray=lambda values: list(values),
     )
-    return usdgeom, usdlux, gf, sdf, vt
+    return usdgeom, usdlux, gf, sdf, vt, usdphysics
 
 
 def _load_kit_module(stage: FakeStage) -> types.ModuleType:
@@ -145,12 +179,12 @@ def _load_kit_module(stage: FakeStage) -> types.ModuleType:
     source = source.replace("\nrun_room()\n", "\n")
     assert "\nrun_room()\n" not in source
 
-    usdgeom, usdlux, gf, sdf, vt = _build_stub_modules(stage)
+    usdgeom, usdlux, gf, sdf, vt, usdphysics = _build_stub_modules(stage)
 
     module = types.ModuleType("kit_room_3d")
     module.__dict__.update(
         {
-            "UsdGeom": usdgeom, "UsdLux": usdlux,
+            "UsdGeom": usdgeom, "UsdLux": usdlux, "UsdPhysics": usdphysics,
             "Gf": gf, "Sdf": sdf, "Vt": vt,
         }
     )
@@ -616,6 +650,110 @@ def test_a_stale_pose_file_is_ignored(kit):
     old = _time.time() - module.POSE_STALE_AFTER_S - 60
     os.utime(path, (old, old))
     assert source.read() is None, "a stale file must be ignored"
+
+
+# ── The viewport actually shows the room ─────────────────────────────────────
+
+
+def test_the_stage_is_set_to_z_up(kit):
+    """Every height in this scene is on Z — floor at 0, walls to 2.4 m. A Kit
+    stage defaults to Y-up, and in a Y-up stage the room is built lying on its
+    side: the viewport opens inside a wall and shows a flat grey field that
+    reads as 'nothing rendered'."""
+    module, stage = kit
+    module.build_room()
+
+    assert getattr(stage, "up_axis", None) == "z"
+
+
+def test_a_camera_is_created(kit):
+    """Otherwise the viewport keeps whatever camera the app started with, which
+    knows nothing about where this scene was built."""
+    module, stage = kit
+    module.build_room()
+
+    assert f"{module.ROOT}/Camera" in stage.prims
+
+
+def test_the_camera_can_see_both_rooms(kit):
+    """It is a two-screen comparison; a camera framing only the left half
+    defeats the point."""
+    module, stage = kit
+    module.build_room()
+    camera = stage.prims[f"{module.ROOT}/Camera"]
+
+    span_x = module.ROOM_W + module.MEASURED_GAP_M + module.ROOM_W
+    # Centred across both rooms, and standing back far enough to see them.
+    assert camera.translate[0] == pytest.approx(span_x / 2.0, abs=0.5)
+    assert camera.translate[1] < 0, "camera must stand back from the rooms"
+    assert camera.translate[2] > 2.4, "camera must be above the walls"
+
+
+def test_the_camera_is_tilted_down_at_the_floor(kit):
+    """Level or upside down are both easy to author by accident, and both show
+    an empty frame."""
+    module, stage = kit
+    module.build_room()
+    camera = stage.prims[f"{module.ROOT}/Camera"]
+
+    # 90 deg about X is level in a Z-up stage; less than that looks downwards.
+    pitch = camera.rotate[0]
+    assert 30.0 < pitch < 90.0, f"camera pitch {pitch} is not looking at the floor"
+
+
+def test_the_camera_is_wider_than_the_default_lens(kit):
+    """A 50 mm lens at this distance crops the measured room off the side."""
+    module, stage = kit
+    module.build_room()
+    camera = stage.prims[f"{module.ROOT}/Camera"]
+
+    assert camera.attrs.get("CreateFocalLengthAttr", 50.0) < 35.0
+
+
+# ── Physics ──────────────────────────────────────────────────────────────────
+
+
+def test_walls_and_furniture_get_colliders(kit):
+    module, stage = kit
+    module.build_room()
+
+    solid = [p for p in stage.prims.values() if "collision" in p.schemas]
+    assert len(solid) > 10, "the room is not solid to physics"
+
+
+def test_the_sofa_is_solid(kit):
+    """The object the robot was seen driving through."""
+    module, stage = kit
+    module.build_room()
+
+    sofa = [
+        p for path, p in stage.prims.items()
+        if "Sofa" in path and "collision" in p.schemas
+    ]
+    assert sofa, "the sofa has no collider"
+
+
+def test_the_robot_is_kinematic_not_dynamic(kit):
+    """Dynamic would let PhysX move the robot, and it would then disagree with
+    the pose the mapper reports — a twin showing a robot that does not exist.
+    Kinematic keeps the mapper authoritative."""
+    module, stage = kit
+    module.build_room()
+
+    robot = stage.prims[f"{module.ROOT}/RobotTrue"]
+    assert "rigid_body" in robot.schemas
+    assert robot.attrs.get("CreateKinematicEnabledAttr") is True
+
+
+def test_physics_can_be_turned_off(kit):
+    """It is authoring, not simulation, but a scene meant purely for viewing
+    should not be forced to carry it."""
+    module, stage = kit
+    module.ENABLE_PHYSICS = False
+    module.build_room()
+
+    solid = [p for p in stage.prims.values() if "collision" in p.schemas]
+    assert solid == []
 
 
 # ── The file itself ──────────────────────────────────────────────────────────
