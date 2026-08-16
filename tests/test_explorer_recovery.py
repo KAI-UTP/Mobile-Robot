@@ -193,3 +193,101 @@ def test_the_furnished_room_can_be_mapped_again():
 
     assert result.outline.is_closed
     assert result.outline.area_m2 > 20.0, "the lap was abandoned"
+
+
+# ── Closing the loop on something that is actually a loop ────────────────────
+#
+# Distance and proximity alone are far too weak a test for "I have been round
+# the room". Measured in the furnished room, the robot drove a 3.18 m hook near
+# the bin, curled back to within 0.49 m of where following began, and declared
+# the boundary complete — 10.19 m2 of a 27 m2 room, 6.9 % of the floor ever
+# visited. Both thresholds were satisfied by a curl that went nowhere.
+
+
+def _follow_path(follower, points):
+    """Walk the follower along a path, bypassing the sensor model.
+
+    The winding accumulator only reads the pose, so a path is enough to
+    exercise it, and a synthetic path is far clearer than steering a simulated
+    robot into the right shape.
+    """
+    follower.start_x, follower.start_y = points[0]
+    follower.lap_distance_m = 999.0        # distance is not what is under test
+    for x, y in points:
+        follower._accumulate_winding(x, y)
+    return follower
+
+
+def _ring(cx, cy, radius, turns=1.0, steps=180, clockwise=False):
+    import math
+
+    sign = -1.0 if clockwise else 1.0
+    return [
+        (
+            cx + radius * math.cos(sign * 2 * math.pi * turns * i / steps),
+            cy + radius * math.sin(sign * 2 * math.pi * turns * i / steps),
+        )
+        for i in range(steps + 1)
+    ]
+
+
+def test_a_full_circuit_winds_a_full_turn():
+    follower = WallFollower()
+    _follow_path(follower, _ring(3.0, 2.0, 2.0))
+
+    assert follower.winding_deg == pytest.approx(360.0, abs=15.0)
+
+
+def test_a_hook_does_not_close_the_loop():
+    """The 3.18 m curl that reported 10.19 m2 of a 27 m2 room."""
+    follower = WallFollower()
+    # A quarter turn and back to near the start: short, curled, going nowhere.
+    _follow_path(follower, _ring(1.0, 1.0, 0.4, turns=0.25))
+
+    assert abs(follower.winding_deg) < WallFollower().config.min_loop_winding_deg
+    assert not follower._check_loop_closed(*_ring(1.0, 1.0, 0.4, turns=0.25)[0])
+
+
+def test_a_full_circuit_does_close_the_loop():
+    """The guard must not stop the rooms that work from finishing."""
+    follower = WallFollower()
+    path = _ring(3.0, 2.0, 2.0)
+    _follow_path(follower, path)
+
+    assert follower._check_loop_closed(*path[0])
+
+
+def test_circling_furniture_the_wrong_way_is_not_a_room():
+    """Keeping the wall on the right, a lap round the inside of a room turns
+    left throughout; a lap round the outside of a table turns right. The sign
+    is what tells the two apart."""
+    follower = WallFollower()
+    assert follower.config.follow_right_wall
+    path = _ring(3.0, 2.0, 0.6, clockwise=True)
+    _follow_path(follower, path)
+
+    assert follower.winding_deg < 0
+    assert not follower._check_loop_closed(*path[0])
+
+
+def test_steering_jitter_does_not_accumulate():
+    """The follower corrects constantly to hold its offset from the wall. If
+    that jitter counted, a straight run along a wall would wind its way to a
+    false closure on its own."""
+    import random
+
+    rng = random.Random(3)
+    follower = WallFollower()
+    path = [(x * 0.05, rng.uniform(-0.01, 0.01)) for x in range(400)]
+    _follow_path(follower, path)
+
+    assert abs(follower.winding_deg) < 90.0
+
+
+def test_a_reset_forgets_the_winding():
+    follower = WallFollower()
+    _follow_path(follower, _ring(3.0, 2.0, 2.0))
+    assert follower.winding_deg != 0.0
+
+    follower.reset()
+    assert follower.winding_deg == 0.0

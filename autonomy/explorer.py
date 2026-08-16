@@ -63,6 +63,28 @@ class ExploreConfig:
     min_loop_distance_m: float = 3.0
     loop_close_radius_m: float = 0.5
 
+    # ...and has actually been round something.
+    #
+    # Distance and proximity alone are far too weak a test. Measured in the
+    # furnished room, the robot drove a 3.18 m hook near the bin, curled back
+    # to within 0.49 m of where following began, and declared the boundary
+    # complete — 10.19 m2 of a 27 m2 room, 6.9 % of the floor ever visited.
+    # Both thresholds were satisfied by a curl that went nowhere.
+    #
+    # A circuit of a room turns through a full revolution; a hook does not.
+    # Accumulating the path's own course change costs nothing, needs no
+    # heading input, and makes no assumption about the room's size or shape —
+    # which matters, because the shape is exactly what is being measured.
+    #
+    # The sign says *what* was circled. Keeping the wall on the right, a lap
+    # round the inside of a room turns consistently left; a lap round the
+    # outside of a table turns consistently right. So the sign rejects the
+    # robot circling the furniture and calling it the room.
+    min_loop_winding_deg: float = 240.0
+    # Course is taken between points this far apart. Too fine and steering
+    # jitter dominates the sum; too coarse and a small room stops registering.
+    winding_sample_m: float = 0.15
+
     # Recovery from running into something the range sensors missed.
     #
     # Needed because real rooms have furniture against the walls — a bin, a
@@ -101,6 +123,12 @@ class WallFollower:
         self.start_x: float | None = None
         self.start_y: float | None = None
         self.loop_closed = False
+        # How far the path has turned since following began, in degrees, signed.
+        # A full circuit is about +-360; see `min_loop_winding_deg`.
+        self.winding_deg = 0.0
+        self._winding_x: float | None = None
+        self._winding_y: float | None = None
+        self._winding_course_deg: float | None = None
         # Counts consecutive cycles with the wall missing, so one dropped
         # ultrasonic reading does not trigger a corner manoeuvre.
         self._wall_lost_cycles = 0
@@ -185,6 +213,7 @@ class WallFollower:
         self.distance_travelled_m += step_distance
         if self.start_x is not None:
             self.lap_distance_m += step_distance
+            self._accumulate_winding(x_m, y_m)
         return command
 
     def _decide(
@@ -305,12 +334,43 @@ class WallFollower:
         self._wall_lost_cycles = 0
         return None
 
+    def _accumulate_winding(self, x_m: float, y_m: float) -> None:
+        """Add this step's course change to the running total.
+
+        Sampled over a fixed distance rather than every cycle: the follower
+        steers constantly to hold its offset from the wall, and at 0.1 s
+        intervals that jitter swamps the turn actually being made. Over 0.15 m
+        the corrections cancel and the corners survive.
+        """
+        if self._winding_x is None:
+            self._winding_x, self._winding_y = x_m, y_m
+            return
+
+        dx, dy = x_m - self._winding_x, y_m - self._winding_y
+        if math.hypot(dx, dy) < self.config.winding_sample_m:
+            return
+
+        course = math.degrees(math.atan2(dy, dx))
+        if self._winding_course_deg is not None:
+            change = (course - self._winding_course_deg + 180.0) % 360.0 - 180.0
+            self.winding_deg += change
+
+        self._winding_course_deg = course
+        self._winding_x, self._winding_y = x_m, y_m
+
     def _check_loop_closed(self, x_m: float, y_m: float) -> bool:
         if self.loop_closed:
             return True
         if self.start_x is None or self.start_y is None:
             return False
         if self.lap_distance_m < self.config.min_loop_distance_m:
+            return False
+
+        # Been round something, the right way round. Keeping the wall on the
+        # right, a circuit of a room's inside turns left throughout; circling a
+        # table turns right. Without this a 3.18 m hook closed the loop.
+        expected = 1.0 if self.config.follow_right_wall else -1.0
+        if self.winding_deg * expected < self.config.min_loop_winding_deg:
             return False
 
         back_home = (
@@ -327,6 +387,8 @@ class WallFollower:
         self.lap_distance_m = 0.0
         self.start_x = self.start_y = None
         self.loop_closed = False
+        self.winding_deg = 0.0
+        self._winding_x = self._winding_y = self._winding_course_deg = None
         self._wall_lost_cycles = 0
         self._recover_remaining_m = 0.0
         self._recover_turn_remaining_deg = 0.0
