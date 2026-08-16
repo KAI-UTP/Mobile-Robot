@@ -13,6 +13,7 @@ import threading
 from datetime import UTC, datetime
 
 from localization.fusion import FilterConfig, PoseFilter
+from mapping.costmap import Costmap
 from mapping.occupancy_grid import OccupancyGrid
 from mapping.room_extraction import RoomExtractor
 from robotmap_common.geometry import RobotGeometry
@@ -44,6 +45,12 @@ class MappingPipeline:
             resolution_m=resolution_m, initial_size_m=8.0, max_range_m=max_range_m
         )
         self.extractor = RoomExtractor()
+
+        # Obstacles grown by the robot's own size. Kept apart from the grid
+        # because the two answer different questions: the grid says what is
+        # there, this says where the robot may go. Change the chassis and this
+        # changes while the evidence does not.
+        self.costmap = Costmap()
 
         # Re-extracting the outline on every packet is wasted work: the room
         # cannot change meaningfully in 100 ms, and the trace is the most
@@ -130,6 +137,29 @@ class MappingPipeline:
             "scan continues",
             self.contacts, pose.x_m, pose.y_m, reason,
         )
+
+    def costmap_bytes(self) -> bytes:
+        """The map inflated by the robot's radius, for planning and for display.
+
+        Nav2's inflation layer, without ROS: obstacles grown by the chassis so
+        a planner can treat the robot as a point, plus a decaying penalty
+        beyond that so it prefers the middle of a gap to its edge.
+
+        Computed on demand rather than kept in step with every packet. It is a
+        derived view — the evidence is the occupancy grid — and a full-map
+        distance transform per packet at 10 Hz would cost far more than the
+        handful of times anyone actually looks at it.
+        """
+        with self._lock:
+            occupied = self.grid.occupied_mask()
+            cost = self.costmap.build(occupied, self.grid.resolution_m)
+            return cost.tobytes()
+
+    def costmap_summary(self) -> dict:
+        with self._lock:
+            occupied = self.grid.occupied_mask()
+            cost = self.costmap.build(occupied, self.grid.resolution_m)
+            return self.costmap.summarise(cost, self.grid.resolution_m)
 
     def freeze_outline(self) -> None:
         """Keep the outline measured so far, and stop revising it.

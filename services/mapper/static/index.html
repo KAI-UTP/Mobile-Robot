@@ -113,6 +113,23 @@
   </div>
 
   <div class="card">
+    <h2>Costmap</h2>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="costmapToggle" onchange="toggleCostmap()">
+      <span>Show inflation layer</span>
+    </label>
+    <div class="row"><span>Cannot enter</span><b id="cmForbidden">—</b></div>
+    <div class="row"><span>Discouraged</span><b id="cmInflated">—</b></div>
+    <div class="note">
+      Obstacles grown by the robot's radius, as Nav2 does it. A planner treats
+      the robot as a point, which is only safe once obstacles are grown by its
+      body — so this is the map the robot navigates by, not the one it measured.
+      <b>Cannot enter</b> is floor within one radius of something solid: the
+      robot's centre can never go there at any heading.
+    </div>
+  </div>
+
+  <div class="card">
     <h2>What is on the floor</h2>
     <div class="row"><span>Obstacles found</span><b id="obsCount">—</b></div>
     <div class="row"><span>Blocked</span><b id="blocked">—</b></div>
@@ -245,6 +262,10 @@ function drawGrid(T) {
                        T.y(meta.origin_y_m + meta.height * meta.resolution_m),
                        meta.width  * meta.resolution_m * T.scale,
                        meta.height * meta.resolution_m * T.scale);
+    // The inflation layer sits on the occupancy image and under everything
+    // else, so it reads as ground the robot stands on rather than as an
+    // overlay floating above the map.
+    drawCostmapLayer(T);
     drawTrail(T); drawRoom(T); drawObstacles(T); drawRobot(T);
   });
 }
@@ -275,6 +296,84 @@ function drawRoom(T) {
   ctx.closePath();
   ctx.stroke();
   ctx.setLineDash([]);
+}
+
+// ── Costmap: obstacles grown by the robot's own size ────────────────────────
+//
+// Nav2's inflation layer. A planner reasons about the robot as a point, which
+// is only safe once obstacles are grown by its radius — so this is the map the
+// robot actually navigates by, as opposed to the one it measured.
+//
+// Drawn UNDER the room outline and the robot so it reads as ground the robot
+// is standing on, not as something floating over the map.
+
+let costmap = null;
+let showCostmap = false;
+
+async function refreshCostmap() {
+  if (!showCostmap) { costmap = null; return; }
+  try {
+    const buf = await fetch('/api/costmap').then(r => r.arrayBuffer());
+    costmap = new Uint8Array(buf);
+
+    const s = await fetch('/api/costmap/summary').then(r => r.json());
+    // Lethal and inscribed are added together deliberately: both are floor the
+    // robot's centre can never occupy, and splitting them here would invite
+    // the reader to think the inscribed band is somehow passable.
+    document.getElementById('cmForbidden').textContent =
+      (s.lethal_m2 + s.inscribed_m2).toFixed(2) + ' m²';
+    document.getElementById('cmInflated').textContent =
+      s.inflated_m2.toFixed(2) + ' m²';
+  } catch (err) {
+    costmap = null;
+  }
+}
+
+function toggleCostmap() {
+  showCostmap = document.getElementById('costmapToggle').checked;
+  refreshCostmap().then(draw);
+}
+
+function drawCostmapLayer(T) {
+  if (!showCostmap || !costmap || !meta) return;
+  // The costmap is fetched separately from the grid, so the two can be one
+  // poll out of step while the map is growing. Drawing a stale, smaller buffer
+  // over a larger grid would misplace every cell, so skip a frame instead.
+  if (costmap.length < meta.width * meta.height) return;
+
+  const img = ctx.createImageData(meta.width, meta.height);
+  for (let row = 0; row < meta.height; row++) {
+    for (let col = 0; col < meta.width; col++) {
+      const value = costmap[row * meta.width + col];
+      // Flip vertically: image row 0 is the top, world row 0 is the bottom.
+      const p = (((meta.height - 1 - row) * meta.width) + col) * 4;
+      if (value === 0) { img.data[p + 3] = 0; continue; }
+
+      let r, g, b;
+      if (value >= 254)      { r = 0;   g = 255; b = 255; }  // lethal
+      else if (value >= 253) { r = 255; g = 0;   b = 255; }  // inscribed
+      else {
+        // Magenta fading out with cost, the same reading as an RViz costmap.
+        const t = value / 252;
+        r = 90 + 165 * t; g = 0; b = 120 + 135 * t;
+      }
+      img.data[p] = r; img.data[p+1] = g; img.data[p+2] = b;
+      img.data[p+3] = value >= 253 ? 190 : 40 + 130 * (value / 252);
+    }
+  }
+
+  // Drawn synchronously via a scratch canvas rather than createImageBitmap:
+  // this runs inside another layer's async callback, and a second async hop
+  // would land after the robot and outline had already been painted.
+  const scratch = document.createElement('canvas');
+  scratch.width = meta.width; scratch.height = meta.height;
+  scratch.getContext('2d').putImageData(img, 0, 0);
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(scratch, T.x(meta.origin_x_m),
+                         T.y(meta.origin_y_m + meta.height * meta.resolution_m),
+                         meta.width  * meta.resolution_m * T.scale,
+                         meta.height * meta.resolution_m * T.scale);
 }
 
 function drawObstacles(T) {
@@ -433,7 +532,10 @@ function connect() {
       }
     } else {
       grid = new Int8Array(ev.data);
-      draw();
+      // The costmap is derived, not streamed: a full distance transform on
+      // every websocket frame would cost far more than it is worth, and it
+      // only changes when the obstacles do.
+      refreshCostmap().then(draw);
     }
   };
 }
@@ -447,6 +549,7 @@ function startPolling() {
       state = s; meta = s.grid; updatePanel();
       const buf = await fetch('/api/grid').then(r => r.arrayBuffer());
       grid = new Int8Array(buf);
+      await refreshCostmap();
       draw();
     } catch (e) {
       document.getElementById('status').textContent = 'server unreachable';

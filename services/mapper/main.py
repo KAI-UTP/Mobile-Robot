@@ -475,6 +475,28 @@ async def get_grid() -> Response:
     return Response(content=pipeline.grid_bytes(), media_type="application/octet-stream")
 
 
+@app.get("/api/costmap")
+async def get_costmap() -> Response:
+    """The map inflated by the robot's radius — Nav2's inflation layer.
+
+    One byte per cell, 0-254, on the same grid as `/api/grid`: 254 is the
+    obstacle, 253 is within a chassis radius of one and equally forbidden, and
+    anything between decays with distance. Served raw for the same reason the
+    occupancy grid is — a 300x300 map is 90 KB of bytes and about 900 KB as
+    JSON numbers.
+    """
+    return Response(
+        content=pipeline.costmap_bytes(), media_type="application/octet-stream"
+    )
+
+
+@app.get("/api/costmap/summary")
+async def get_costmap_summary() -> JSONResponse:
+    """How much floor each band covers, which is the number a planner cares
+    about: `inscribed_m2` is floor the robot can see but can never occupy."""
+    return JSONResponse(pipeline.costmap_summary())
+
+
 @app.post("/api/command")
 async def post_command(body: dict) -> JSONResponse:
     """Same actions as the WebSocket, for clients without one."""
