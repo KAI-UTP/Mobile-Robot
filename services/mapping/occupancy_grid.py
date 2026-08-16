@@ -59,6 +59,28 @@ class OccupancyGrid:
     # it. See `_integrate_ray` for why this matters.
     LOG_ODDS_BLOCKING = 2.0
 
+    # What one bumper contact is worth.
+    #
+    # Far stronger than a range reading, and deliberately so. An ultrasonic
+    # pulse infers an obstacle from an echo and is wrong often — off a shallow
+    # wall, a soft sofa, a chair leg narrower than the beam. A bumper is a
+    # switch closed by the object itself: the robot is touching it. There is no
+    # inference to be wrong about.
+    #
+    # Applied by ASSIGNMENT rather than accumulation, and set above
+    # LOG_ODDS_BLOCKING so one contact immediately makes the cell opaque.
+    #
+    # Accumulating does not work, which is not obvious until measured: a cell
+    # in a well-observed room sits at the clamp, LOG_ODDS_MIN, and adding one
+    # contact's worth of evidence to -6.0 leaves it at -3.06 — still firmly
+    # "free", so the object the robot is touching does not appear on the map at
+    # all. It only ever worked for objects the sonar had never seen.
+    #
+    # Assignment is also the honest model. Those free readings were echoes,
+    # inferred and often wrong; this is a switch closed by the object itself.
+    # Direct evidence supersedes inference rather than being averaged with it.
+    P_CONTACT = 0.95
+
     def __init__(
         self,
         resolution_m: float = 0.05,
@@ -74,6 +96,17 @@ class OccupancyGrid:
         cells = int(initial_size_m / resolution_m)
         self.grid = np.zeros((cells, cells), dtype=np.float32)
 
+        # Which cells the robot has physically run into.
+        #
+        # Kept apart from the log-odds because the two answer different
+        # questions. The grid says how likely a cell is to be occupied; this
+        # says how the evidence was obtained, and contact evidence is treated
+        # differently downstream: an object the robot has touched is furniture
+        # on the floor whether or not free space has been observed all the way
+        # around it, which is what the hole-filling test would otherwise
+        # require. One touch and a retreat never encloses anything.
+        self.contact_mask = np.zeros((cells, cells), dtype=bool)
+
         # World coordinate of cell (0, 0). Starts centred so the robot has
         # room to drive in every direction from its origin.
         self.origin_x_m = -initial_size_m / 2.0
@@ -81,9 +114,11 @@ class OccupancyGrid:
 
         self.l_occupied = _log_odds(self.P_OCCUPIED)
         self.l_free = _log_odds(self.P_FREE)
+        self.l_contact = _log_odds(self.P_CONTACT)
 
         self.updates_applied = 0
         self.rays_rejected = 0
+        self.contacts_recorded = 0
 
     # ── Coordinate conversion ─────────────────────────────────────────────
 
@@ -128,11 +163,14 @@ class OccupancyGrid:
 
         # Pad with zeros — log-odds 0 is exactly "unknown", which is the
         # correct prior for ground we have never seen.
+        padding = ((pad_bottom, pad_top), (pad_left, pad_right))
         self.grid = np.pad(
-            self.grid,
-            ((pad_bottom, pad_top), (pad_left, pad_right)),
-            mode="constant",
-            constant_values=0.0,
+            self.grid, padding, mode="constant", constant_values=0.0
+        )
+        # Grown in lockstep, or every recorded contact silently shifts by the
+        # padding the moment the robot drives past the edge of the map.
+        self.contact_mask = np.pad(
+            self.contact_mask, padding, mode="constant", constant_values=False
         )
         self.origin_x_m -= pad_left * self.resolution_m
         self.origin_y_m -= pad_bottom * self.resolution_m
@@ -235,6 +273,13 @@ class OccupancyGrid:
         The robot is demonstrably standing there, so those cells cannot be
         walls. This closes the small unknown gaps that range sensors mounted
         above floor level leave behind.
+
+        Cells already known solid are left alone. This circle is a little wider
+        than the chassis and the bumper sits just outside it, so a robot
+        stopped against an obstacle would otherwise scrub out the contact it
+        has just recorded — at ten packets a second, within about half a
+        second of touching it. The robot's own position is an estimate; a
+        closed bumper switch is not, so the contact wins.
         """
         radius_cells = int(math.ceil(radius_m / self.resolution_m))
         centre_col, centre_row = self.world_to_cell(pose.x_m, pose.y_m)
@@ -244,8 +289,68 @@ class OccupancyGrid:
                 if d_col * d_col + d_row * d_row > radius_cells * radius_cells:
                     continue
                 col, row = centre_col + d_col, centre_row + d_row
+                if not self.in_bounds(col, row):
+                    continue
+                if self.grid[row, col] >= self.LOG_ODDS_BLOCKING:
+                    continue
+                self._update_cell(col, row, self.l_free)
+
+    def mark_contact(
+        self,
+        pose: PoseEstimate,
+        bumper_offset_m: float = 0.10,
+        contact_width_m: float = 0.16,
+    ) -> int:
+        """Record something the robot has physically run into.
+
+        This is what puts a red patch on the map for an obstacle the range
+        sensors never saw. Ultrasonic misses plenty of real furniture: a chair
+        leg narrower than the beam, a sofa that absorbs the pulse, anything
+        angled enough to reflect the echo away, and everything below the
+        sensor's mounting height. The bumper is what catches those, and until
+        the contact is written into the grid it exists only in the controller's
+        head — the robot avoids the object but never draws it.
+
+        Geometry. The switch is on the robot's nose, so the object is
+        `bumper_offset_m` ahead of the reported centre, not underneath it.
+        Marking the centre would put the obstacle where the robot is standing,
+        which is the one place it certainly is not.
+
+        Only the contact patch is marked, not a guess at the object's extent.
+        The robot knows it touched something roughly its own width across; it
+        knows nothing about how far back the thing goes. Repeated contacts
+        along a sofa fill the rest in honestly, one touch at a time.
+
+        Returns the number of cells marked.
+        """
+        heading = math.radians(pose.heading_deg)
+        contact_x = pose.x_m + bumper_offset_m * math.cos(heading)
+        contact_y = pose.y_m + bumper_offset_m * math.sin(heading)
+
+        self.ensure_contains(contact_x, contact_y)
+
+        radius_cells = max(1, int(round(contact_width_m / 2.0 / self.resolution_m)))
+        centre_col, centre_row = self.world_to_cell(contact_x, contact_y)
+
+        marked = 0
+        for d_row in range(-radius_cells, radius_cells + 1):
+            for d_col in range(-radius_cells, radius_cells + 1):
+                if d_col * d_col + d_row * d_row > radius_cells * radius_cells:
+                    continue
+                col, row = centre_col + d_col, centre_row + d_row
                 if self.in_bounds(col, row):
-                    self._update_cell(col, row, self.l_free)
+                    # Assigned, not added — see P_CONTACT. `max` so a contact
+                    # never argues DOWN a cell that other evidence has already
+                    # made more certainly occupied.
+                    self.grid[row, col] = max(
+                        float(self.grid[row, col]), self.l_contact
+                    )
+                    self.contact_mask[row, col] = True
+                    marked += 1
+
+        self.contacts_recorded += 1
+        self.updates_applied += marked
+        return marked
 
     # ── Queries ───────────────────────────────────────────────────────────
 
@@ -291,5 +396,7 @@ class OccupancyGrid:
 
     def clear(self) -> None:
         self.grid[:] = 0.0
+        self.contact_mask[:] = False
         self.updates_applied = 0
         self.rays_rejected = 0
+        self.contacts_recorded = 0

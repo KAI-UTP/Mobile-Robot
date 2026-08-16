@@ -582,6 +582,33 @@ is specified rather than assumed, and tested in `tests/test_pilot.py`:
   keeps moving is exactly when it hits something.
 - **The driver's watchdog is the backstop.** It halts the wheels if no command
   arrives, so even `kill -9` stops the robot within `watchdog_s`.
+- **Touching something draws it.** A bumper contact is written straight into
+  the occupancy grid as blocked floor, so it shows up as a red patch on the 2D
+  map, in the browser 3D twin, and in Omniverse — then the scan carries on. An
+  obstacle is information, not a failure.
+
+  This matters because the range sensors miss a lot of real furniture: a chair
+  leg narrower than the ultrasonic beam, a sofa that absorbs the pulse,
+  anything angled enough to reflect the echo away, and everything below the
+  sensor's mounting height. The bumper is what catches those.
+
+  Three things had to be true for it to work, and none were obvious:
+
+  * **A contact is assigned, not accumulated.** A cell in a well-observed room
+    sits at the log-odds clamp, and adding one contact's worth of evidence to
+    −6.0 leaves it at −3.06 — still firmly "free", so the object the robot is
+    touching never appears. It only ever worked for objects the sonar had never
+    seen. Direct evidence supersedes inference rather than averaging with it.
+  * **The free circle under the robot must not scrub it out.** That circle is
+    slightly wider than the chassis and the bumper sits just outside it, so a
+    robot stopped against an obstacle erased the contact within about half a
+    second at 10 Hz.
+  * **A touched object counts without being circled.** Obstacles are otherwise
+    found by hole-filling, which needs free space observed all the way around
+    them; a single touch-and-retreat never encloses anything. Measured on a
+    slim pillar the sonar kept missing: 2 contacts recorded, 0.00 m² reported.
+    Contacts are now tested against the room outline instead — inside it is
+    furniture, on it is wall.
 - **Scan again** (button on the map and twin pages, or `POST /api/rescan`)
   wipes the map and drives the whole scan from the start, repeating the run it
   was configured with rather than a default one — two scans of "the same room"

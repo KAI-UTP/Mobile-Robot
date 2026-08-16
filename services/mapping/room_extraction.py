@@ -72,6 +72,46 @@ _NEIGHBOURS_CW = [
 ]
 
 
+def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> bool:
+    """Even-odd ray cast. True when the point is inside the ring."""
+    inside = False
+    count = len(polygon)
+    for i in range(count):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % count]
+        if (y1 > y) != (y2 > y):
+            crossing_x = x1 + (y - y1) / (y2 - y1) * (x2 - x1)
+            if crossing_x > x:
+                inside = not inside
+    return inside
+
+
+def _shrink_polygon(
+    polygon: list[tuple[float, float]], margin_m: float
+) -> list[tuple[float, float]]:
+    """Pull a polygon in towards its centroid by roughly `margin_m`.
+
+    Used to keep a contact against a wall from registering as furniture. Exact
+    polygon offsetting is not worth it here: the margin is a cell or two, the
+    rooms are convex enough, and being slightly wrong costs a red patch one
+    cell from the wall rather than a wrong measurement.
+    """
+    count = len(polygon)
+    cx = sum(p[0] for p in polygon) / count
+    cy = sum(p[1] for p in polygon) / count
+
+    shrunk = []
+    for x, y in polygon:
+        dx, dy = cx - x, cy - y
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            shrunk.append((x, y))
+            continue
+        step = min(margin_m, length * 0.9)
+        shrunk.append((x + dx / length * step, y + dy / length * step))
+    return shrunk
+
+
 class RoomExtractor:
     """Extracts a room polygon from an occupancy grid."""
 
@@ -122,11 +162,27 @@ class RoomExtractor:
             logger.warning("Flood-fill seed outside grid bounds")
             return mask
 
-        # The robot's own cell may read unknown if it has not been observed;
-        # accept it as the seed regardless, since the robot is standing there.
         if not free[seed_row, seed_col]:
-            free = free.copy()
-            free[seed_row, seed_col] = True
+            # The seed cell is not free. Two quite different reasons:
+            #
+            # Unobserved — the robot's own cell may never have been seen. It is
+            # standing there, so accept it.
+            #
+            # Occupied — the robot's REPORTED position can land inside an
+            # obstacle it marked moments ago, because odometry drifts and a
+            # bumper contact is stamped 10 cm ahead of an estimated pose.
+            # Forcing that single cell free boxes the fill inside the patch: it
+            # fills one cell, gives up, and the whole room comes back EMPTY.
+            # Measured: a 20.45 m2 room became 0.00 m2 from one contact.
+            #
+            # So look for real floor nearby and start from there instead. The
+            # robot drove in from somewhere, and that somewhere is adjacent.
+            nearby = self._nearest_free(free, seed_col, seed_row, radius_cells=12)
+            if nearby is not None:
+                seed_col, seed_row = nearby
+            else:
+                free = free.copy()
+                free[seed_row, seed_col] = True
 
         queue = deque([(seed_col, seed_row)])
         mask[seed_row, seed_col] = True
@@ -143,6 +199,24 @@ class RoomExtractor:
                 queue.append((n_col, n_row))
 
         return mask
+
+    @staticmethod
+    def _nearest_free(
+        free: np.ndarray, col: int, row: int, radius_cells: int
+    ) -> tuple[int, int] | None:
+        """Closest free cell to (col, row), searched outward in rings."""
+        height, width = free.shape
+        for radius in range(1, radius_cells + 1):
+            for d_row in range(-radius, radius + 1):
+                for d_col in range(-radius, radius + 1):
+                    # Only the rim of each square, so nearer cells win.
+                    if max(abs(d_row), abs(d_col)) != radius:
+                        continue
+                    n_col, n_row = col + d_col, row + d_row
+                    if 0 <= n_col < width and 0 <= n_row < height:
+                        if free[n_row, n_col]:
+                            return n_col, n_row
+        return None
 
     # ── Step 2: morphological opening ─────────────────────────────────────
 
@@ -464,7 +538,7 @@ class RoomExtractor:
         observed_area = observed_cells * cell_area
         coverage = min(100.0, (observed_area / area * 100.0) if area > 0 else 0.0)
 
-        obstacles = self.find_obstacles(grid, observed_free)
+        obstacles = self.find_obstacles(grid, observed_free, room_polygon=simplified)
         blocked = sum(o["area_m2"] for o in obstacles)
 
         return RoomOutline(
@@ -513,8 +587,37 @@ class RoomExtractor:
 
     # ── Obstacles inside the room ─────────────────────────────────────────
 
+    @staticmethod
+    def _contacts_inside(
+        grid: OccupancyGrid,
+        contacts: np.ndarray,
+        room_polygon: list[tuple[float, float]] | None,
+        fallback: np.ndarray,
+    ) -> np.ndarray:
+        """Contact cells that lie strictly inside the room outline.
+
+        Without a polygon there is nothing to be inside of, so it falls back to
+        the filled footprint — conservative, and the case where the room is not
+        yet closed enough to have an outline at all.
+        """
+        if not room_polygon or len(room_polygon) < 3:
+            return contacts & fallback
+
+        inset = _shrink_polygon(room_polygon, grid.resolution_m * 1.5)
+
+        keep = np.zeros_like(contacts, dtype=bool)
+        for row, col in np.argwhere(contacts):
+            x, y = grid.cell_to_world(int(col), int(row))
+            if _point_in_polygon(x, y, inset):
+                keep[row, col] = True
+        return keep
+
     def find_obstacles(
-        self, grid: OccupancyGrid, interior: np.ndarray, min_area_m2: float = 0.02
+        self,
+        grid: OccupancyGrid,
+        interior: np.ndarray,
+        min_area_m2: float = 0.02,
+        room_polygon: list[tuple[float, float]] | None = None,
     ) -> list[dict]:
         """Occupied islands sitting inside the room — furniture, not walls.
 
@@ -562,6 +665,33 @@ class RoomExtractor:
         # region, because the hole-fill already flowed around the object and
         # filled its unobserved middle.
         candidates = room_footprint & ~interior
+
+        # Anything the robot has physically run into counts, enclosed or not.
+        #
+        # The enclosure test above needs free space observed all the way around
+        # an object before it registers, which is right for something seen at a
+        # distance — a gap in the sweep is not furniture. But a bumper contact
+        # is not an inference. The robot touched something, so something is
+        # there, and requiring it to drive a full circuit before drawing it
+        # means a single touch-and-retreat reports an empty room. Measured on a
+        # slim pillar the sonar kept missing: 2 contacts recorded, 0.00 m2
+        # blocked reported.
+        #
+        # Tested against the room OUTLINE rather than the filled footprint. The
+        # footprint is the observed free space plus its enclosed gaps, and a
+        # robot that has driven one corridor past an object has not enclosed
+        # it — so masking by the footprint discards exactly the contacts this
+        # is meant to keep. The outline is the room, and inside the room is
+        # where furniture is.
+        #
+        # A contact on the boundary itself is a wall, not furniture, and is
+        # excluded by the same test.
+        contacts = getattr(grid, "contact_mask", None)
+        if contacts is not None and contacts.any():
+            candidates = candidates | self._contacts_inside(
+                grid, contacts, room_polygon, room_footprint
+            )
+
         if not candidates.any():
             return []
 

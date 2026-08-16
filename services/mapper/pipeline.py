@@ -56,6 +56,11 @@ class MappingPipeline:
         self.packets_processed = 0
         self.packets_rejected = 0
 
+        # Bumper contacts folded into the map. Edge-triggered, so this counts
+        # objects touched rather than packets spent touching one.
+        self.contacts = 0
+        self._bumper_was_active = False
+
         # The pipeline is driven from a network callback and read by the web
         # server, so every mutation is guarded.
         self._lock = threading.Lock()
@@ -70,6 +75,26 @@ class MappingPipeline:
 
             self.grid.integrate_scan(pose, packet.ranges)
             self.grid.mark_robot_footprint(pose)
+
+            # Anything the robot ran into goes on the map. The range sensors
+            # miss a lot of real furniture — chair legs narrower than the
+            # beam, soft sofas, anything below the sensor's mounting height —
+            # and the bumper is what catches those. Recorded after the
+            # footprint so a robot stopped against an obstacle marks it rather
+            # than erasing it.
+            #
+            # Only on the closing edge. The switch stays shut for as long as
+            # the robot is against the object, and re-marking every packet
+            # would smear one touch into a wall as the robot backs away.
+            if packet.bumper_active and not self._bumper_was_active:
+                self.grid.mark_contact(pose)
+                self.contacts += 1
+                logger.info(
+                    "Contact %d recorded at (%.2f, %.2f) — drawn as blocked "
+                    "floor; scan continues",
+                    self.contacts, pose.x_m, pose.y_m,
+                )
+            self._bumper_was_active = packet.bumper_active
 
             # Record the trail sparsely — one point per 5 cm of travel keeps
             # the browser payload small over a long run.
@@ -117,6 +142,8 @@ class MappingPipeline:
                 self.room = None
             self.trail.clear()
             self.packets_processed = 0
+            self.contacts = 0
+            self._bumper_was_active = False
             logger.info("Pipeline reset (clear_map=%s)", clear_map)
 
     # ── Output ────────────────────────────────────────────────────────────
@@ -151,6 +178,7 @@ class MappingPipeline:
                     **self.filter.diagnostics(),
                     "packets_processed": self.packets_processed,
                     "packets_rejected": self.packets_rejected,
+                    "contacts": self.contacts,
                 },
             }
 
