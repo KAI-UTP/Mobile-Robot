@@ -62,6 +62,31 @@ Open *Window > Script Editor*, paste
 [`omniverse/kit_holonomic.py`](../omniverse/kit_holonomic.py), press
 **Ctrl+Enter**.
 
+#### Launching Kit from the command line
+
+If you have the Kit SDK rather than a Launcher app — packman leaves a kernel at
+`C:\packman-repo\chk\kit-kernel\<version>\` — you can start it with a scene
+already running:
+
+```bash
+kit.exe apps/omni.app.full.kit --exec C:\kitscene\kit_room_3d.py
+```
+
+> **`--exec` cannot take a path containing spaces.** Kit splits the argument at
+> the first space and reports `Can't find a file to execute: D:/UTP/00` for a
+> script under `D:\UTP\00 Reseach Project\`. Quoting does not help. 8.3 short
+> names are usually disabled on non-system drives, so `GetFile().ShortPath`
+> hands back the long path unchanged and fails the same way.
+>
+> Copy the script somewhere without spaces and run that. It only uses the
+> standard library, so a copy behaves identically:
+>
+> ```bash
+> cp omniverse/kit_room_3d.py /c/kitscene/kit_room_3d.py
+> ```
+>
+> Pasting into the Script Editor avoids the problem entirely.
+
 The robot builds itself a room and runs through a movement sequence: forward,
 strafe left, strafe right, rotate in place, diagonal, then translate *while*
 rotating. A yellow nose marker shows which way it's facing — without it,

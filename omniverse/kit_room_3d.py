@@ -381,19 +381,45 @@ class FilePose:
 
 
 class DemoPose:
-    """Drives a lap on its own when nothing is publishing.
+    """A scripted preview lap, for when nothing is publishing.
 
-    So the scene is worth looking at with no stack running — and the RSSI
-    marker still behaves correctly, because its wander is drawn from the same
-    error the accuracy tests measured rather than invented.
+    NOT a simulation. It interpolates between waypoints and has no collision
+    model, no sensors and no mapping — it exists so the scene is worth looking
+    at before any of the stack is running.
+
+    That distinction caused a real problem worth recording. The original lap
+    was a simple rectangle inset 0.6 m from the walls, which in a *furnished*
+    room drove straight through three things:
+
+        bin      x 5.39-5.71, y 0.44-0.76   crossed by the bottom leg at y=0.6
+        cabinet  x 5.38-5.83, y 1.85-3.35   crossed by the right leg at x=5.4
+        sofa     x 0.10-2.10, y 3.28-4.13   crossed by the top leg at y=3.9
+
+    A robot gliding through the sofa is exactly what a viewer reads as "the
+    collision detection does not work", when in truth the collision model lives
+    in the simulator and this path was never subject to it. The waypoints below
+    keep to genuinely clear floor instead.
+
+    For the real behaviour — the robot stopping against furniture, recording
+    the contact and drawing it — run the mapper, which publishes to POSE_FILE
+    and takes over from this.
     """
 
     def __init__(self):
         self.t = 0.0
         self.rng = random.Random(7)
-        # Wall-following path, inset from the walls by the standoff distance.
+        # Routed through floor that is provably clear, checked against every
+        # footprint in `build_furniture` by
+        # test_the_demo_lap_does_not_drive_through_the_furniture.
+        #
+        # It is not a full circuit of the room, and it cannot be. The table
+        # with its four chairs occupies x 1.4-3.8, y 1.3-3.3 and the sofa
+        # occupies the top left, leaving no continuous ring wide enough for the
+        # robot. Pretending otherwise is what drove the old path through the
+        # sofa. A preview that covers the open half honestly beats a lap that
+        # looks complete by ignoring the furniture.
         self.waypoints = [
-            (0.6, 0.6), (5.4, 0.6), (5.4, 3.9), (0.6, 3.9),
+            (0.8, 0.9), (5.1, 0.9), (5.1, 3.9), (4.3, 3.9), (4.3, 0.9),
         ]
         self.index = 0
         self.x, self.y = self.waypoints[0]

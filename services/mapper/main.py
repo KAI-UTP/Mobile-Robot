@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import sys
+import tempfile
 import threading
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -96,6 +97,19 @@ app.state.robot_start = (
 # can only clear the map and wait for the robot to be driven round again.
 app.state.sim_settings = None
 app.state.coverage = None
+app.state.collisions = None
+
+# Mirror the pose into the file the Omniverse scene polls, so the robot shown
+# there is the one actually driving the map — collisions, contacts and all —
+# rather than Kit's scripted fallback lap.
+app.state.write_pose_file = os.environ.get("POSE_FILE", "1") not in ("0", "")
+app.state.pose_file_path = os.environ.get(
+    "POSE_FILE_PATH",
+    os.path.join(
+        tempfile.gettempdir(),
+        f"roommapper_{os.environ.get('ROBOT_ID', 'MR3W01')}_pose.json",
+    ),
+)
 
 # Every connected browser. Guarded because packets arrive on an MQTT thread.
 _clients: set[WebSocket] = set()
@@ -526,6 +540,37 @@ async def _send_frame(socket: WebSocket) -> None:
     await socket.send_bytes(pipeline.grid_bytes())
 
 
+def _write_pose_file() -> None:
+    """Publish the pose where the Omniverse scene can read it.
+
+    This is what makes the robot in Omniverse the *real* one. Without it the
+    Kit scene falls back to its built-in demo lap, which is a scripted
+    rectangle with no collision model — so the robot glides through the sofa,
+    the cabinet and the bin, and the whole scene stops being a twin of
+    anything. Every collision behaviour built into the simulator is invisible
+    until the two are connected.
+
+    A plain file rather than MQTT because Kit's Python is not this project's
+    and cannot be assumed to have paho installed. `urllib` and `json` are all
+    the scene needs, and both are standard library.
+
+    Written atomically. The follower polls this path, and a half-written file
+    is a parse error several times a second.
+    """
+    if not app.state.write_pose_file or pipeline.pose is None:
+        return
+
+    try:
+        path = app.state.pose_file_path
+        temp_path = f"{path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(pipeline.pose.model_dump_json())
+        os.replace(temp_path, path)
+    except Exception:
+        # Losing the twin feed must never take the map down with it.
+        logger.debug("Could not write the pose file", exc_info=True)
+
+
 def _publish_derived() -> None:
     """Publish the pose and room estimate for anything downstream.
 
@@ -538,6 +583,8 @@ def _publish_derived() -> None:
     more resolution than a dashboard can show, and the room outline changes
     far more slowly still.
     """
+    _write_pose_file()
+
     publisher = getattr(app.state, "mqtt_publisher", None)
     if publisher is None:
         return

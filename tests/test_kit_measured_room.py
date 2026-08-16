@@ -557,6 +557,45 @@ def test_the_demo_lap_stays_inside_the_room(kit):
         assert 0.0 <= y <= module.ROOM_H, f"demo lap left the room at y={y:.2f}"
 
 
+def test_the_demo_lap_does_not_drive_through_the_furniture(kit):
+    """The preview lap has no collision model, so its waypoints have to avoid
+    the furniture by construction.
+
+    The original rectangle, inset 0.6 m from the walls, drove through the bin,
+    the cabinet and the sofa. A robot gliding through a sofa reads as "the
+    collision detection is broken" — when in fact this path was never subject
+    to it. Checking by eye is how it was missed.
+    """
+    module, stage = kit
+
+    # Every footprint from build_furniture, padded by the chassis radius.
+    # The chairs matter as much as the table: they stick out 0.2 m further on
+    # each side, and a path threaded between table and wall still catches them.
+    margin = 0.10
+    blocked = [
+        ("bin", 5.39, 0.44, 5.71, 0.76),
+        ("cabinet", 5.375, 1.85, 5.825, 3.35),
+        ("sofa", 0.10, 3.275, 2.10, 4.125),
+        ("table", 1.90, 1.875, 3.30, 2.725),
+        ("chair west", 1.39, 2.09, 1.81, 2.51),
+        ("chair east", 3.39, 2.09, 3.81, 2.51),
+        ("chair south", 2.39, 1.34, 2.81, 1.76),
+        ("chair north", 2.39, 2.84, 2.81, 3.26),
+    ]
+
+    demo = module.DemoPose()
+    for _ in range(30000):
+        pose = demo.read()
+        x = pose["x_m"] + module.ROBOT_START_X_M
+        y = pose["y_m"] + module.ROBOT_START_Y_M
+        for name, x0, y0, x1, y1 in blocked:
+            inside = (
+                x0 - margin < x < x1 + margin
+                and y0 - margin < y < y1 + margin
+            )
+            assert not inside, f"demo lap drives through the {name} at ({x:.2f}, {y:.2f})"
+
+
 def test_a_stale_pose_file_is_ignored(kit):
     """A file left over from a previous session pins the robot wherever that
     run stopped. That reads as the scene being broken rather than as nothing
