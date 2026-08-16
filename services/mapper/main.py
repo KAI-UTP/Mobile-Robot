@@ -119,6 +119,12 @@ app.state.sim_world = None
 # default room instead of the one that was arranged.
 app.state.scene_geometry = []
 
+# How far the robot drove on the perimeter circuit itself. Compared against the
+# perimeter of the outline that lap produced, it catches a lap that closed
+# without going round the room — see LAP_COVERAGE_LIMIT. None until a lap runs,
+# and it stays None for contact-only mapping, which has no perimeter phase.
+app.state.lap_distance_m = None
+
 # What sensors this robot has, which decides how it maps a room rather than
 # merely describing it. `simulated` is the demo default because the simulator
 # genuinely does produce range readings; `actual` is the robot that exists and
@@ -377,6 +383,14 @@ def save_current_scan(name: str | None = None, replace: str | None = None) -> di
         # robot has seen but not enclosed. Everything above it measures
         # internal consistency, which half a room can satisfy perfectly.
         floor_outside_pct=pipeline.floor_outside_outline_pct(),
+        # Did the robot actually drive round the boundary it is reporting?
+        # A lap that wove among furniture and curled back to its start closes
+        # having driven half of it, and looks perfect by every other measure.
+        lap_coverage=(
+            app.state.lap_distance_m / room.perimeter_m
+            if app.state.lap_distance_m and room.perimeter_m > 0
+            else None
+        ),
     )
 
     previous = store.load(replace) if replace else None
@@ -1119,7 +1133,15 @@ def start_sim_source(
             # speed > 1 fast-forwards the demo; the physics step is unchanged.
             time.sleep(dt_s / max(speed, 0.01))
 
-        logger.info("Perimeter complete after %.1f m", follower.distance_travelled_m)
+        # How far the robot drove ON the circuit, as opposed to hunting for a
+        # wall first. Compared against the perimeter of the outline it just
+        # produced, this is what catches a lap that closed without going round
+        # the room. See LAP_COVERAGE_LIMIT.
+        app.state.lap_distance_m = follower.lap_distance_m
+        logger.info(
+            "Perimeter complete after %.1f m (%.1f m on the circuit itself)",
+            follower.distance_travelled_m, follower.lap_distance_m,
+        )
         report("Outline")
         save("the perimeter lap")
 

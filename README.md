@@ -803,10 +803,21 @@ Stated plainly, because a research project should be honest about them:
   (`min_loop_winding_deg`) fixed a 3.18 m hook that was closing the boundary at
   6.9 % coverage, and improved this case from 10.19 m², but did not solve it.
 
-  The scan grade does **not** currently catch this: an early-closing lap leaves
-  the outline and the driven path consistent with each other, so the
-  path-outside check reads 0.3 %. See
-  `MappingPipeline.floor_outside_outline_pct`.
+  The scan grade **does** catch it, so the number is never presented as
+  trustworthy. A perimeter lap goes round the room, so the distance driven is
+  compared with the perimeter of the outline it produced:
+
+  | | driven | reported perimeter | ratio | grade |
+  |---|---|---|---|---|
+  | empty room | 18.7 m | 20.9 m | **0.90** | GOOD |
+  | furnished | 10.1 m | 21.9 m | **0.46** | POOR |
+
+  Both verified on the live stack. Contact-only mapping has no perimeter phase,
+  so it is not judged on a lap it never drove.
+
+  Contact-only on a furnished room used to report **0.00 m²** — the flood fill
+  seeded on a stranded single free cell. It now returns 13.57 m² with
+  `closed=False`. Still short of the truth, and honestly so.
 
 - **No loop-closure correction.** Drift accumulated over a lap is not
   redistributed when the robot returns to its start. Below ~30 m of driving

@@ -81,9 +81,40 @@ class ExploreConfig:
     # outside of a table turns consistently right. So the sign rejects the
     # robot circling the furniture and calling it the room.
     min_loop_winding_deg: float = 240.0
+
+    # There is deliberately NO upper bound on winding.
+    #
+    # An obvious-looking one was tried and removed. A simple closed curve winds
+    # exactly +-360 degrees, so refusing a lap that had wound much further
+    # looked like a clean way to reject a path that wove among furniture and
+    # curled back to its start. It failed on both counts:
+    #
+    #   * it did not catch the case it was for — the furnished lap simply found
+    #     a closure at +424 degrees instead of +495, just inside any bound
+    #     loose enough to be safe;
+    #   * it broke a case that worked — outdoors, GNSS noise makes the path
+    #     wander, the extra turning accumulates, the lap was refused, and the
+    #     outline grew to 34.8 m2 of a 27 m2 room.
+    #
+    # The evidence that does separate them is not available here: it is the
+    # distance driven against the perimeter of the outline the lap produced,
+    # 0.90 for both rooms that work and 0.50 for the furnished one. That needs
+    # the extracted room, so it lives in `assess_quality`. See
+    # LAP_COVERAGE_LIMIT in services/mapper/storage.py.
+
     # Course is taken between points this far apart. Too fine and steering
     # jitter dominates the sum; too coarse and a small room stops registering.
     winding_sample_m: float = 0.15
+
+    # A lap that never closes has to end anyway.
+    #
+    # Refusing an implausible closure means the robot keeps driving, and
+    # without a backstop the mapper's loop never returns. Deliberately far
+    # above any real perimeter — this room's is about 21 m and the lap takes
+    # 19 — because it is a backstop and not the intended finish. Reaching it
+    # leaves `loop_closed` False, so the outline is reported as never closed
+    # and graded unusable, which is the honest outcome for a lap that failed.
+    max_lap_distance_m: float = 150.0
 
     # Recovery from running into something the range sensors missed.
     #
@@ -180,6 +211,17 @@ class WallFollower:
         if self._check_loop_closed(x_m, y_m):
             self.state = ExploreState.FINISHED
             return DriveCommand(0.0, 0.0, self.state, "loop closed")
+
+        # A lap that will not close still has to end. Refusing an implausible
+        # closure means the robot keeps driving, and the mapper's loop waits
+        # for FINISHED — so without this it waits for ever. `loop_closed` stays
+        # False, which is what makes the outline report itself as never closed
+        # rather than as a measurement.
+        if self.lap_distance_m >= cfg.max_lap_distance_m:
+            self.state = ExploreState.FINISHED
+            return DriveCommand(
+                0.0, 0.0, self.state, "gave up: the lap never closed"
+            )
 
         recovery = self._recover(blocked, dt_s)
         if recovery is not None:

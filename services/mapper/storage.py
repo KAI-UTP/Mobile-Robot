@@ -61,6 +61,9 @@ class ScanQuality:
     # Observed floor lying outside the reported outline. Non-zero means the
     # boundary closed somewhere it should not have; see `assess_quality`.
     floor_outside_pct: float = 0.0
+    # Distance driven on the perimeter lap, over the perimeter of the outline
+    # that lap produced. Below ~0.7 the robot did not go round this room.
+    lap_coverage: float | None = None
     grade: str = "UNUSABLE"
     reasons: list[str] = field(default_factory=list)
 
@@ -141,12 +144,32 @@ class Scan:
 #: that prompted this had most of the floor it had seen sitting outside.
 FLOOR_OUTSIDE_LIMIT_PCT = 15.0
 
+#: How much of its reported boundary the robot must actually have driven.
+#:
+#: A perimeter lap goes round the room, so the distance driven should be close
+#: to the perimeter of the outline it produces. Measured at the moment each lap
+#: closed:
+#:
+#:     rectangular  18.7 m driven / 20.9 m perimeter = 0.90   26.63 m2  right
+#:     l-shaped     19.6 m / 21.8 m                  = 0.90   24.74 m2  right
+#:     furnished    10.5 m / 21.0 m                  = 0.50   13.18 m2  WRONG
+#:
+#: The furnished lap wove among the furniture and curled back to its start
+#: having driven half the boundary it went on to report. Under 0.7 the robot
+#: did not lap that room, whatever the outline looks like.
+#:
+#: Slack matters: the lap runs about 0.35 m inside the wall, so a real lap is
+#: always a little shorter than the perimeter it measures. 0.90 is what that
+#: costs; 0.70 leaves room for a lap that had to detour around something.
+LAP_COVERAGE_LIMIT = 0.70
+
 
 def assess_quality(
     is_closed: bool,
     coverage_pct: float,
     pose_confidence: float,
     floor_outside_pct: float = 0.0,
+    lap_coverage: float | None = None,
 ) -> ScanQuality:
     """Grade a scan, and say why.
 
@@ -162,6 +185,8 @@ def assess_quality(
       the outline may not close on the truth even if it closes on itself.
     * Floor observed OUTSIDE the outline means the outline is in the wrong
       place, however tidy it looks.
+    * A robot that drove far less than the perimeter it is reporting did not
+      go round that room.
 
     That last one exists because the first three are all measures of *internal
     consistency*, and a robot that maps half a room very tidily scores well on
@@ -170,11 +195,11 @@ def assess_quality(
     collects itself, needing no ground truth, which matters because with real
     hardware there is none.
 
-    It does not catch everything. A lap that closes EARLY produces an outline
-    that is too small and a path that never leaves it, because both were cut
-    short together: the furnished room reports 12.89 m2 of 27.0 with 0.3 % of
-    the path outside. That failure is still open and is not addressed here.
-    See `MappingPipeline.floor_outside_outline_pct`.
+    The last two are separate failures and need separate evidence. A lap that
+    closes EARLY leaves an outline that is too small AND a path that never
+    leaves it, because both were cut short together — the furnished room reads
+    0.3 % of its path outside, and looks perfect. What gives it away is that
+    the robot drove 10.5 m and reported a boundary 21.0 m round.
     """
     reasons: list[str] = []
 
@@ -196,10 +221,17 @@ def assess_quality(
             f"{floor_outside_pct:.0f}% of the floor the robot saw lies OUTSIDE "
             "this outline — the boundary closed early, so the area is too small"
         )
+    lap_short = lap_coverage is not None and lap_coverage < LAP_COVERAGE_LIMIT
+    if lap_short:
+        reasons.append(
+            f"the robot drove only {lap_coverage * 100:.0f}% of the boundary it "
+            "is reporting — it did not go round this room, so the area is too "
+            "small"
+        )
 
     if not is_closed:
         grade = "UNUSABLE"
-    elif floor_outside_pct >= FLOOR_OUTSIDE_LIMIT_PCT:
+    elif floor_outside_pct >= FLOOR_OUTSIDE_LIMIT_PCT or lap_short:
         # However tidy the outline is, it is not the room.
         grade = "POOR"
     elif coverage_pct >= 85.0 and pose_confidence >= 0.6:
@@ -214,6 +246,7 @@ def assess_quality(
         coverage_pct=coverage_pct,
         pose_confidence=pose_confidence,
         floor_outside_pct=floor_outside_pct,
+        lap_coverage=lap_coverage,
         grade=grade,
         reasons=reasons,
     )
