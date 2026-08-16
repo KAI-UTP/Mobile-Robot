@@ -210,7 +210,21 @@ def _load_kit_module(stage: FakeStage) -> types.ModuleType:
 @pytest.fixture
 def kit():
     stage = FakeStage()
-    return _load_kit_module(stage), stage
+    module = _load_kit_module(stage)
+
+    # No test reaches the network.
+    #
+    # `room_has_furniture` asks a running mapper what is in the room, which is
+    # the right thing for the scene and the wrong thing for a test: whether
+    # this machine happens to have a container up, and which room it happens to
+    # be simulating, then decides what the scene contains. It did — with the
+    # mapper up and simulating the empty room, the sofa was never built and
+    # `test_the_sofa_is_solid` failed on a change that had nothing to do with
+    # it. Tests that care about the empty room set this themselves, and the
+    # real function is kept reachable so it can be tested directly.
+    module.real_room_has_furniture = module.room_has_furniture
+    module.room_has_furniture = lambda: True
+    return module, stage
 
 
 # ── A room to draw ───────────────────────────────────────────────────────────
@@ -790,3 +804,77 @@ def test_it_only_needs_the_standard_library(kit):
     # urllib and json are what the measured half is fetched with.
     assert "urllib.request" in source
     assert json is not None and math is not None and sys is not None
+
+
+# ── Asking the mapper what is in the room ────────────────────────────────────
+#
+# The scene used to draw a table, four chairs and a sofa unconditionally, so a
+# room the robot knew to be empty was rendered furnished, the robot drove
+# straight through it all, and the 2D map came back a bare rectangle. Three
+# views, three different rooms. This is the fix, so it is worth testing.
+
+
+def _stub_fetch(payload=None, fail=False):
+    """Answer `room_has_furniture`'s HTTP call without a network."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_urlopen(_url, timeout=None):
+        if fail:
+            raise OSError("no mapper here")
+
+        class Reply:
+            @staticmethod
+            def read():
+                return json.dumps(payload).encode("utf-8")
+
+        yield Reply()
+
+    return fake_urlopen
+
+
+def test_a_furnished_room_is_drawn_furnished(kit, monkeypatch):
+    module, _ = kit
+    payload = {"name": "Furnished room", "boxes": [
+        {"kind": "wall"}, {"kind": "furniture"}, {"kind": "furniture"},
+    ]}
+    monkeypatch.setattr(
+        "urllib.request.urlopen", _stub_fetch(payload)
+    )
+    assert module.real_room_has_furniture() is True
+
+
+def test_an_empty_room_is_drawn_empty(kit, monkeypatch):
+    """The bug this exists to prevent: furniture on screen that the robot
+    cannot touch, because the room it is driving in does not contain it."""
+    module, _ = kit
+    payload = {"name": "Empty rectangular room", "boxes": [
+        {"kind": "wall"}, {"kind": "wall"},
+    ]}
+    monkeypatch.setattr(
+        "urllib.request.urlopen", _stub_fetch(payload)
+    )
+    assert module.real_room_has_furniture() is False
+
+
+def test_no_mapper_falls_back_to_the_demo_furniture(kit, monkeypatch):
+    """The scene has to be worth looking at on its own — someone opening it
+    without the stack running should still see a room."""
+    module, _ = kit
+    monkeypatch.setattr(
+        "urllib.request.urlopen", _stub_fetch(fail=True)
+    )
+    assert module.real_room_has_furniture() is True
+
+
+def test_an_empty_room_builds_no_furniture_prims(kit, monkeypatch):
+    """End to end: the answer actually changes what lands on the stage."""
+    module, stage = kit
+    module.room_has_furniture = lambda: False
+    module.build_room()
+
+    furniture = [
+        path for path in stage.prims
+        if any(k in path for k in ("Sofa", "Table", "Chair"))
+    ]
+    assert not furniture, f"furniture drawn in an empty room: {furniture}"

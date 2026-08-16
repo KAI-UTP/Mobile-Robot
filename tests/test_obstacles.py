@@ -136,6 +136,64 @@ def test_walls_are_not_reported_as_obstacles():
         assert 0.2 < obstacle.centre_y_m < 3.8
 
 
+def test_the_boundary_obstacles_are_judged_against_can_be_supplied():
+    """Which cells are furniture depends on where the room's edge is, and after
+    the interior sweep this grid no longer knows.
+
+    The sweep runs on dead reckoning and the outline it traces drifts outwards:
+    measured on the empty 6.0 x 4.5 m room, the freshly traced boundary had
+    ballooned to 7.03 x 6.65 m by the end of the sweep while the frozen one
+    still read 5.95 x 4.48 m. Judged against the ballooned version the real
+    wall falls well inside the "room", so its own cells came back as a piece of
+    furniture — 0.153 m2 of it, in a room with nothing in it.
+
+    So the caller has to be able to say which boundary to trust.
+    """
+    grid = _map_room(Room(5.0, 4.0, [(2.0, 1.5, 3.0, 2.5)]))
+    extractor = RoomExtractor()
+
+    seen = {}
+    original = extractor.find_obstacles
+
+    def spy(grid_, interior, min_area_m2=0.02, room_polygon=None):
+        seen["polygon"] = room_polygon
+        return original(grid_, interior, min_area_m2, room_polygon)
+
+    extractor.find_obstacles = spy
+
+    trusted = [(0.0, 0.0), (0.0, 4.0), (5.0, 4.0), (5.0, 0.0)]
+    extractor.extract(
+        grid, _pose(0.6, 0.6), "TEST01", "2026-08-16T00:00:00Z",
+        boundary_polygon=trusted,
+    )
+
+    assert seen["polygon"] == trusted, (
+        "extract traced its own boundary instead of using the trusted one"
+    )
+
+
+def test_a_wall_outside_the_trusted_boundary_is_not_furniture():
+    """The rule that makes the supplied boundary do anything.
+
+    An island reaching past the room's edge is the wall, however well enclosed
+    by free floor it looks — and after the sweep has painted free space through
+    a wall, it looks very well enclosed indeed.
+    """
+    grid = _map_room(Room(5.0, 4.0, [(2.0, 1.5, 3.0, 2.5)]))
+    extractor = RoomExtractor()
+    interior = extractor.flood_fill_interior(grid, *grid.world_to_cell(0.6, 0.6))
+    interior = extractor.open_mask(interior, grid.resolution_m)
+
+    # A boundary that stops short of the table: it is now outside the room, so
+    # it is wall as far as this rule is concerned.
+    clipped = [(0.0, 0.0), (0.0, 4.0), (1.8, 4.0), (1.8, 0.0)]
+    assert extractor.find_obstacles(grid, interior, room_polygon=clipped) == []
+
+    # The honest boundary keeps it.
+    full = [(0.0, 0.0), (0.0, 4.0), (5.0, 4.0), (5.0, 0.0)]
+    assert extractor.find_obstacles(grid, interior, room_polygon=full)
+
+
 def test_specks_of_noise_are_not_furniture():
     """Two stray cells from one noisy reading are not a table, and reporting
     them as such would bury the real obstacles."""

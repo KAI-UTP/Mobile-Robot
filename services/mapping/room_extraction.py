@@ -503,8 +503,27 @@ class RoomExtractor:
         robot_id: str,
         timestamp: str,
         square_up: bool = True,
+        boundary_polygon: list[tuple[float, float]] | None = None,
     ) -> RoomOutline:
-        """Run the full extraction and return the measured room."""
+        """Run the full extraction and return the measured room.
+
+        `boundary_polygon` supplies a boundary that is trusted more than the
+        one this grid would trace now — the outline the perimeter lap measured,
+        once the caller has frozen it. It decides which occupied cells count as
+        furniture and which are wall, and nothing else.
+
+        It matters because the two are not the same room after a while. The
+        interior sweep runs on dead reckoning, and the outline it traces drifts
+        outwards: measured on the empty 6.0 x 4.5 m room, the freshly traced
+        boundary had ballooned to 7.03 x 6.65 m by the end of the sweep while
+        the frozen one still read 5.95 x 4.48 m. Test "is this inside the
+        room?" against the ballooned version and the real wall falls well
+        inside it, so the wall's own cells come back as a piece of furniture —
+        0.153 m2 of it, reported in a room with nothing in it.
+
+        Freezing the outline for reporting but not for this test left the twin
+        drawing a box that was not there.
+        """
         seed_col, seed_row = grid.world_to_cell(pose.x_m, pose.y_m)
         interior = self.flood_fill_interior(grid, seed_col, seed_row)
 
@@ -572,7 +591,9 @@ class RoomExtractor:
         observed_area = observed_cells * cell_area
         coverage = min(100.0, (observed_area / area * 100.0) if area > 0 else 0.0)
 
-        obstacles = self.find_obstacles(grid, observed_free, room_polygon=simplified)
+        obstacles = self.find_obstacles(
+            grid, observed_free, room_polygon=boundary_polygon or simplified
+        )
         blocked = sum(o["area_m2"] for o in obstacles)
 
         return RoomOutline(
@@ -645,6 +666,36 @@ class RoomExtractor:
             if _point_in_polygon(x, y, inset):
                 keep[row, col] = True
         return keep
+
+    def _outside_room(
+        self,
+        grid: OccupancyGrid,
+        candidates: np.ndarray,
+        room_polygon: list[tuple[float, float]] | None,
+    ) -> np.ndarray | None:
+        """Which candidate cells lie beyond the room's own boundary.
+
+        A wall is not furniture, and no real object straddles one. The polygon
+        is the wall's inner face as the robot measured it, so anything reaching
+        past it is the wall itself being mistaken for a thing standing in the
+        room.
+
+        Expanded by a cell rather than tested against the polygon exactly. A
+        cabinet pushed flat against a wall genuinely does reach the boundary,
+        and a cell of tolerance keeps it while still rejecting a patch that
+        sits 10 cm inside masonry.
+        """
+        if not room_polygon or len(room_polygon) < 3:
+            return None
+
+        outer = _shrink_polygon(room_polygon, -grid.resolution_m)
+
+        outside = np.zeros_like(candidates, dtype=bool)
+        for row, col in np.argwhere(candidates):
+            x, y = grid.cell_to_world(int(col), int(row))
+            if not _point_in_polygon(x, y, outer):
+                outside[row, col] = True
+        return outside
 
     def find_obstacles(
         self,
@@ -729,6 +780,19 @@ class RoomExtractor:
         if not candidates.any():
             return []
 
+        # Cells beyond the measured boundary. An island containing any of them
+        # is wall, not furniture — see `_outside_room`.
+        #
+        # The array-edge test below is not enough on its own. It catches a wall
+        # only when the wall runs off the edge of the grid, and the grid is
+        # sized to the room with room to spare, so it never fires. Measured on
+        # the empty 6.0 x 4.5 m room: the interior sweep drives to the outline,
+        # its 0.11 m footprint paints free floor through the wall, and the
+        # occupied cells left stranded either side became an enclosed island —
+        # 0.153 m2 of "furniture" reported at x 5.73..6.13, straddling a wall
+        # at x = 6.0. An empty room is supposed to report nothing.
+        outside_room = self._outside_room(grid, candidates, room_polygon)
+
         cell_area = grid.resolution_m**2
         obstacles: list[dict] = []
         visited = np.zeros_like(candidates, dtype=bool)
@@ -740,7 +804,9 @@ class RoomExtractor:
             queue = deque([(int(start_col), int(start_row))])
             visited[start_row, start_col] = True
             cells: list[tuple[int, int]] = []
-            touches_edge = False
+            # Reaches past the room: off the edge of the grid, or beyond the
+            # measured outline. Either way it is wall, not furniture.
+            reaches_outside = False
             # Require evidence that something is actually there. A pocket the
             # robot merely never looked into is unexplored floor, not a table,
             # and calling it an obstacle would invent furniture from a gap in
@@ -758,7 +824,10 @@ class RoomExtractor:
                     or col >= candidates.shape[1] - 1
                     or row >= candidates.shape[0] - 1
                 ):
-                    touches_edge = True
+                    reaches_outside = True
+
+                if outside_room is not None and outside_room[row, col]:
+                    reaches_outside = True
 
                 for d_col, d_row in ((1, 0), (-1, 0), (0, 1), (0, -1),
                                      (1, 1), (1, -1), (-1, 1), (-1, -1)):
@@ -771,7 +840,7 @@ class RoomExtractor:
                     queue.append((n_col, n_row))
 
             area = len(cells) * cell_area
-            if area < min_area_m2 or touches_edge or not has_occupied_evidence:
+            if area < min_area_m2 or reaches_outside or not has_occupied_evidence:
                 continue
 
             xs = [grid.cell_to_world(c, r)[0] for c, r in cells]

@@ -257,6 +257,65 @@ def test_freezing_keeps_the_outline_but_still_finds_obstacles():
     assert pipeline.room.area_m2 == pytest.approx(before)
 
 
+def test_the_frozen_outline_also_decides_what_counts_as_furniture():
+    """Freezing the boundary for reporting but not for the obstacle search is
+    how an empty room came to contain a table.
+
+    Whether an occupied cell is furniture or wall is decided by where the
+    room's edge is. The sweep's freshly traced edge has drifted outwards by
+    then — 7.03 x 6.65 m against the frozen 5.95 x 4.48 m on the empty room —
+    so the real wall sits well inside the supposed room and its cells qualify
+    as something standing on the floor. 0.153 m2 of furniture was reported, and
+    drawn, in a room with nothing in it.
+
+    One frozen boundary, used for both answers.
+    """
+    pipeline = MappingPipeline(robot_id="TEST01")
+    for seq in range(1, 40):
+        pipeline.process(_packet(seq))
+    pipeline.refresh_room()
+
+    if pipeline.room is None:
+        pytest.skip("no room extracted from this synthetic scan")
+
+    pipeline.freeze_outline()
+    frozen = [(p.x_m, p.y_m) for p in pipeline.room.polygon]
+
+    seen = {}
+    original = pipeline.extractor.extract
+
+    def spy(*args, **kwargs):
+        seen["boundary"] = kwargs.get("boundary_polygon")
+        return original(*args, **kwargs)
+
+    pipeline.extractor.extract = spy
+    pipeline.refresh_room()
+
+    assert seen["boundary"] == frozen, (
+        "obstacles were judged against the drifted outline, not the frozen one"
+    )
+
+
+def test_an_unfrozen_pipeline_traces_its_own_boundary():
+    """Before the freeze there is nothing better to judge against, and forcing
+    a boundary the robot has not measured yet would be worse than none."""
+    pipeline = MappingPipeline(robot_id="TEST01")
+    for seq in range(1, 40):
+        pipeline.process(_packet(seq))
+
+    seen = {}
+    original = pipeline.extractor.extract
+
+    def spy(*args, **kwargs):
+        seen["boundary"] = kwargs.get("boundary_polygon")
+        return original(*args, **kwargs)
+
+    pipeline.extractor.extract = spy
+    pipeline.refresh_room()
+
+    assert seen["boundary"] is None
+
+
 def test_an_unfrozen_pipeline_still_updates_the_outline():
     """Freezing must be opt-in: a scan still in its first lap has to keep
     revising the boundary or it would never find it at all."""

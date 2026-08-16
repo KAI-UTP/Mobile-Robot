@@ -189,12 +189,22 @@ class MappingPipeline:
     def _refresh_room_locked(self) -> None:
         if self.pose is None:
             return
+        # Once the boundary is frozen it is also the boundary the obstacle
+        # search should judge against. The sweep's freshly traced outline has
+        # drifted outwards by then — 7.03 x 6.65 m against the frozen
+        # 5.95 x 4.48 m on the empty room — and a wall that far inside the
+        # supposed room reads as furniture. See `extract`.
+        trusted = None
+        if self._frozen_outline is not None:
+            trusted = [(p.x_m, p.y_m) for p in self._frozen_outline.polygon]
+
         try:
             room = self.extractor.extract(
                 self.grid,
                 self.pose,
                 self.robot_id,
                 datetime.now(UTC).isoformat(),
+                boundary_polygon=trusted,
             )
         except Exception:
             # A malformed grid must not take the whole service down; the next
