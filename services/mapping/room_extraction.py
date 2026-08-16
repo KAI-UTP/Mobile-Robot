@@ -142,7 +142,41 @@ class RoomExtractor:
         # but the floor actually continues to the wall face one cell beyond.
         # Without this the reported room is systematically one cell small on
         # every side — about 6 % of a 3 m room.
+        #
+        # One cell is right for a range-sensor map, where a ray reaches the
+        # wall itself. It is NOT right for a map built by driving: there the
+        # outermost free cell is where the robot's CENTRE reached, and the
+        # floor continues for a further chassis radius that the robot could
+        # never stand on. Measured on a contact-only trace of a 6.0 x 4.5 room,
+        # that inset alone accounted for the whole shortfall — 23.02 m2 against
+        # 27.0, with a bounding box of 5.78 x 4.38 which is exactly the room
+        # less one robot diameter. `robot_radius_m` corrects it; see
+        # `for_contact_mapping`.
         self.boundary_dilation_cells = boundary_dilation_cells
+
+    @classmethod
+    def for_contact_mapping(
+        cls, resolution_m: float = 0.05, robot_radius_m: float = 0.11, **kwargs
+    ) -> RoomExtractor:
+        """An extractor for a map built by driving rather than by ranging.
+
+        Two differences, both following from how the evidence was gathered.
+
+        The floor continues a chassis radius beyond the outermost cell the
+        robot occupied, not the single cell a range reading justifies — the
+        robot's centre cannot get closer to a wall than its own radius.
+
+        And the boundary is simplified far more aggressively. A range scan
+        supplies thousands of readings and can genuinely resolve an 8 cm
+        feature; a contact trace supplies a few dozen touches. Keeping 8 cm
+        detail there produced a 28-corner outline for a rectangular room —
+        over-fitting the gaps between passes and reading 10 % low, because the
+        polygon wound into every unswept pocket instead of around the room.
+        """
+        cells = max(1, int(round(robot_radius_m / resolution_m)))
+        kwargs.setdefault("simplify_epsilon_m", 0.25)
+        kwargs.setdefault("opening_radius_m", 0.10)
+        return cls(boundary_dilation_cells=cells, **kwargs)
 
     # ── Step 1: reachable interior ────────────────────────────────────────
 
