@@ -226,6 +226,57 @@ def test_a_reset_forgets_the_contacts():
 
 
 
+# ── Freezing the outline ─────────────────────────────────────────────────────
+
+
+def test_freezing_keeps_the_outline_but_still_finds_obstacles():
+    """The perimeter lap and the interior sweep are good at different things,
+    and the sweep is actively bad at one of them.
+
+    The lap measures 26.63 m2 against a true 27.0. The sweep then drives 41 m
+    across the middle, accumulating dead reckoning error the whole way, and
+    drags the outline out to about 30 m2. Nothing about crossing the middle of
+    a room tells you where its walls are.
+    """
+    pipeline = MappingPipeline(robot_id="TEST01")
+    for seq in range(1, 40):
+        pipeline.process(_packet(seq))
+    pipeline.refresh_room()
+
+    if pipeline.room is None:
+        pytest.skip("no room extracted from this synthetic scan")
+
+    pipeline.freeze_outline()
+    before = pipeline.room.area_m2
+
+    # Whatever happens next, the boundary does not move.
+    for seq in range(40, 90):
+        pipeline.process(_packet(seq, bumper=True))
+    pipeline.refresh_room()
+
+    assert pipeline.room.area_m2 == pytest.approx(before)
+
+
+def test_an_unfrozen_pipeline_still_updates_the_outline():
+    """Freezing must be opt-in: a scan still in its first lap has to keep
+    revising the boundary or it would never find it at all."""
+    pipeline = MappingPipeline(robot_id="TEST01")
+    assert pipeline._frozen_outline is None
+
+
+def test_a_reset_unfreezes_the_outline():
+    """Otherwise 'scan again' measures a fresh room and reports the previous
+    one's boundary."""
+    pipeline = MappingPipeline(robot_id="TEST01")
+    for seq in range(1, 40):
+        pipeline.process(_packet(seq))
+    pipeline.refresh_room()
+    pipeline.freeze_outline()
+
+    pipeline.reset(clear_map=True)
+    assert pipeline._frozen_outline is None
+
+
 # ── It becomes a red area on the map ─────────────────────────────────────────
 
 

@@ -908,6 +908,11 @@ def start_sim_source(
         report("Outline")
         save("the perimeter lap")
 
+        # The boundary is as good as it will get. Crossing the middle of a room
+        # tells you nothing about where its walls are, and the sweep's dead
+        # reckoning would only drag the outline outwards from here.
+        pipeline.freeze_outline()
+
         if not sweep:
             return
 

@@ -61,6 +61,10 @@ class MappingPipeline:
         self.contacts = 0
         self._bumper_was_active = False
 
+        # Set once the boundary is trusted and should stop being revised.
+        # See `freeze_outline`.
+        self._frozen_outline: RoomOutline | None = None
+
         # The pipeline is driven from a network callback and read by the web
         # server, so every mutation is guarded.
         # Re-entrant because `record_contact` is called both from inside
@@ -127,11 +131,36 @@ class MappingPipeline:
             self.contacts, pose.x_m, pose.y_m, reason,
         )
 
+    def freeze_outline(self) -> None:
+        """Keep the outline measured so far, and stop revising it.
+
+        The perimeter lap and the interior sweep are good at different things,
+        and the sweep is actively bad at one of them. The lap observes the
+        boundary from close range and at good incidence angles: measured, it
+        returns 26.63 m2 against a true 27.0. The sweep then drives 41 m across
+        the middle of the room, accumulating dead-reckoning error the whole
+        way, and drags the same outline out to about 30 m2 with a bounding box
+        of 7.0 x 6.7 for a 6.0 x 4.5 room.
+
+        Nothing about crossing the middle of a room tells you where its walls
+        are, so there is no reason to let it try. After this call the boundary
+        is fixed and only the obstacle findings are updated — which is the one
+        thing the sweep genuinely contributes.
+        """
+        with self._lock:
+            if self.room is not None:
+                self._frozen_outline = self.room
+                logger.info(
+                    "Outline frozen at %.2f m2; the sweep will only add "
+                    "obstacles from here",
+                    self.room.area_m2,
+                )
+
     def _refresh_room_locked(self) -> None:
         if self.pose is None:
             return
         try:
-            self.room = self.extractor.extract(
+            room = self.extractor.extract(
                 self.grid,
                 self.pose,
                 self.robot_id,
@@ -141,6 +170,21 @@ class MappingPipeline:
             # A malformed grid must not take the whole service down; the next
             # refresh will try again with more data.
             logger.exception("Room extraction failed")
+            return
+
+        if self._frozen_outline is not None:
+            # Keep the boundary the perimeter lap measured, and take only the
+            # obstacles from the fresh extraction. Coverage still moves,
+            # because the sweep genuinely does observe more of the floor.
+            frozen = self._frozen_outline
+            room.polygon = frozen.polygon
+            room.area_m2 = frozen.area_m2
+            room.perimeter_m = frozen.perimeter_m
+            room.bounding_width_m = frozen.bounding_width_m
+            room.bounding_height_m = frozen.bounding_height_m
+            room.is_closed = frozen.is_closed
+
+        self.room = room
 
     def refresh_room(self) -> RoomOutline | None:
         with self._lock:
@@ -159,6 +203,7 @@ class MappingPipeline:
             self.packets_processed = 0
             self.contacts = 0
             self._bumper_was_active = False
+            self._frozen_outline = None
             logger.info("Pipeline reset (clear_map=%s)", clear_map)
 
     # ── Output ────────────────────────────────────────────────────────────
