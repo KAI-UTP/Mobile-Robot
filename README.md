@@ -38,17 +38,38 @@ Universiti Teknologi PETRONAS · Research Project
 
 ## The whole twin, one command
 
-```bash
-docker compose up --build -d
 ```
+START-TWIN.bat
+```
+
+Brings up the stack, launches Omniverse with the scene, and opens both browser
+windows. `STOP-TWIN.bat` closes everything again, Omniverse included — it holds
+the GPU at full tilt while a scene is open. Or `docker compose up --build -d`
+for the containers alone.
+
+### Three windows, three jobs
 
 | | |
 |---|---|
-| <http://localhost:8080/twin> | **the digital twin — 3D room beside the robot's map** |
+| **Omniverse** | **the physical world.** Not a picture of it — drag a table across the viewport and the robot bumps into it where you put it |
+| <http://localhost:8080> | **the robot's own 2D map**, built from what it has driven over and run into |
+| <http://localhost:3001> | **the data** — Grafana, admin / admin |
+
+Each does the thing it is best at. An RTX renderer beats a browser canvas at
+showing a room; a flat plan beats an extruded outline seen in perspective at
+showing a floor plan; a time-series database beats both at showing how the
+estimate converged. There used to be a `/twin` page drawing 3D in the browser
+beside the 2D map, and it lost on both counts.
+
+The join between them is the point. Rearranging the 3D scene rearranges the
+room the robot drives in, so a contact appears on the 2D map where you moved
+the furniture to, and the contact count moves in Grafana.
+
+| also | |
+|---|---|
 | <http://localhost:8080/scans> | saved scans — the product loop |
-| <http://localhost:8080> | live map |
 | <http://localhost:8080/compare> | the real room beside the room the robot drew |
-| <http://localhost:3001> | Grafana dashboards (admin / admin) |
+| <http://localhost:8080/api/hardware> | what sensors are fitted, and what that lets the robot do |
 | <http://localhost:8086> | InfluxDB (admin / roommapper123) |
 
 A scan **saves itself** the moment the robot completes a lap, so finishing a
@@ -668,6 +689,42 @@ so it cannot be quietly downgraded later.
 
 ---
 
+## Adding a sensor
+
+What the robot has is described in one place —
+[`shared/robotmap_common/hardware.py`](shared/robotmap_common/hardware.py) —
+and the mapping strategy is *derived* from it rather than configured:
+
+```
+no RANGE fitted   ->  CONTACT_ONLY     find the room by driving into it
+RANGE fitted      ->  WALL_FOLLOWING   hold a measured distance to a wall
+```
+
+Set `fitted=True` on a device and the stack changes behaviour without another
+line being edited. Fitting a lidar switches the robot from 435 m of bouncing at
+7.9 % error to 23 m of wall-following at 1.4 %.
+
+| | provides | fitted | why it matters |
+|---|---|---|---|
+| Feetech STS3215 bus | odometry, **contact** | yes | contact without a bumper: a wheel at 3 % of commanded speed and 90 % load has hit something |
+| GNSS | position | yes | anchors the map outdoors; useless indoors, which is the case that matters |
+| BLE beacons | position | **no** | wired up and switched off — it made the pose *worse*, 0.51 m → 1.42 m |
+| 2D lidar | range | no | the single biggest upgrade available |
+| Ultrasonic ring | range | no | the cheap route to range; ±15° cone is blind to a low bin |
+| mmWave radar | range | no | good obstacle backstop, poor sole mapper |
+| IMU | heading | no | helps most during turns, where wheel odometry is weakest |
+| Arduino bridge | range, contact | no | not a sensor — a way to attach ones needing hard real-time pins |
+| FPGA encoder front end | odometry | no | only if the bus turns out to drop counts; measure that first |
+
+Every `accuracy` field is measured on this project, not quoted from a
+datasheet. `--hardware actual` runs the robot that exists, and stops the
+simulator handing it range readings it will not have.
+
+<http://localhost:8080/api/hardware> reports the lot, so "why is it bouncing
+off the walls instead of following them?" has an answer the dashboard can show.
+
+---
+
 ## Tests
 
 ```bash
@@ -728,6 +785,28 @@ curl http://localhost:8080/api/room
 ## Known limits
 
 Stated plainly, because a research project should be honest about them:
+
+- **A heavily furnished room is under-measured, badly.** This is the biggest
+  one. Measured on a 27 m² room with a table, four chairs, a sofa, a cabinet
+  and a bin:
+
+  | strategy | result |
+  |---|---|
+  | wall-following (needs a lidar) | **12.89 m²** of 27.0 |
+  | contact-only (the actual hardware) | **0.00 m²** — extraction fails outright |
+
+  The wall-follower loses the wall when furniture blocks it and follows the
+  furniture instead; the contact explorer covers the floor but leaves free
+  space too fragmented for the extractor to close a boundary. An empty room
+  measures to 1.4 %, so the demo is sound — but "map any room" is not true yet.
+  Requiring the lap to have wound a full turn before closing
+  (`min_loop_winding_deg`) fixed a 3.18 m hook that was closing the boundary at
+  6.9 % coverage, and improved this case from 10.19 m², but did not solve it.
+
+  The scan grade does **not** currently catch this: an early-closing lap leaves
+  the outline and the driven path consistent with each other, so the
+  path-outside check reads 0.3 %. See
+  `MappingPipeline.floor_outside_outline_pct`.
 
 - **No loop-closure correction.** Drift accumulated over a lap is not
   redistributed when the robot returns to its start. Below ~30 m of driving
