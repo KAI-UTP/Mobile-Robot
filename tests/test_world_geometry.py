@@ -250,3 +250,47 @@ def test_the_room_still_has_floor_to_drive_on(kit):
     # direction: if even the overestimate leaves most of the floor clear, the
     # room is drivable.
     assert covered < 0.5 * (6.0 * 4.5), f"{covered:.1f} m2 of a 27 m2 room is furniture"
+
+
+def test_the_layout_is_repeated_periodically(kit, monkeypatch):
+    """The mapper holds the room in memory, so restarting its container throws
+    the furniture away. A publisher that only speaks when something moves never
+    mentions it again: the room silently empties and the robot drives through
+    where the table is on screen — the exact failure this exists to prevent.
+    """
+    module, stage = kit
+    module.build_room()
+
+    posts = []
+    monkeypatch.setattr(
+        module.GeometryPublisher, "_post",
+        lambda self, boxes: posts.append(boxes) or True,
+    )
+
+    publisher = module.GeometryPublisher(stage, interval_s=0.0)
+    publisher.poll(0.0)
+    assert len(posts) == 1
+
+    # Quiet for a while, then the heartbeat comes round.
+    publisher.poll(1.0)
+    assert len(posts) == 1
+    publisher.poll(module.GeometryPublisher.HEARTBEAT_S + 1.0)
+    assert len(posts) == 2
+
+
+def test_a_failed_push_is_retried(kit, monkeypatch):
+    """Otherwise the scene believes a layout the mapper never received."""
+    module, stage = kit
+    module.build_room()
+
+    attempts = []
+    monkeypatch.setattr(
+        module.GeometryPublisher, "_post",
+        lambda self, boxes: attempts.append(boxes) and False,
+    )
+
+    publisher = module.GeometryPublisher(stage, interval_s=0.0)
+    publisher.poll(0.0)
+    publisher.poll(1.0)
+
+    assert len(attempts) == 2, "gave up after one failure"

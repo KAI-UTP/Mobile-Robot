@@ -529,12 +529,22 @@ class GeometryPublisher:
     second. Dragging a prim changes the signature; nothing else does.
     """
 
+    #: Re-send the layout this often even when nothing has moved.
+    #
+    #: Change-detection alone is not enough: the mapper holds the room in
+    #: memory, so restarting its container throws the furniture away, and a
+    #: publisher that only speaks when something moves never mentions it again.
+    #: The room silently empties and the robot drives through where the table
+    #: is on screen — the exact failure this whole mechanism exists to prevent.
+    HEARTBEAT_S = 20.0
+
     def __init__(self, stage, url=None, interval_s=0.5):
         self.stage = stage
         self.url = url or MAPPER_URL
         self.interval_s = interval_s
         self._signature = None
         self._next_check = 0.0
+        self._next_heartbeat = 0.0
         self._complained = False
 
     def poll(self, now):
@@ -544,11 +554,20 @@ class GeometryPublisher:
 
         boxes = furniture_footprints(self.stage)
         signature = tuple(tuple(round(v, 3) for v in b) for b in boxes)
-        if signature == self._signature:
-            return False
-        self._signature = signature
 
-        return self._post(boxes)
+        due = now >= self._next_heartbeat
+        if signature == self._signature and not due:
+            return False
+
+        self._signature = signature
+        self._next_heartbeat = now + self.HEARTBEAT_S
+
+        sent = self._post(boxes)
+        if not sent:
+            # Say it again next time rather than believing a layout the mapper
+            # never received.
+            self._signature = None
+        return sent
 
     def _post(self, boxes):
         import urllib.request
