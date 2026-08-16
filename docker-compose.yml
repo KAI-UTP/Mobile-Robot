@@ -105,6 +105,8 @@ services:
       REFERENCE_ROOM: "${REFERENCE_ROOM:-rectangular}"
       SCAN_DIR: /data/scans
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # Written where the HOST can read it — see the volume below.
+      POSE_FILE_PATH: /data/run/roommapper_${ROBOT_ID:-MR3W01}_pose.json
     volumes:
       # Saved scans live on the HOST, not in the container. Without this a
       # `docker compose up --build` silently destroys every measurement the
@@ -112,6 +114,15 @@ services:
       # A bind mount rather than a named volume so the files are visible,
       # copyable and backed up like any other document.
       - ./scans:/data/scans
+      # The live pose, for the Omniverse scene.
+      #
+      # It defaults to the system temp directory, which inside a container is
+      # the CONTAINER's temp directory — invisible to anything on the host.
+      # The measured room reaches Omniverse over HTTP and crosses that boundary
+      # fine; the pose went to a file and did not, so the 3D scene silently
+      # fell back to its scripted demo lap and showed a robot that was not the
+      # real one. Exactly the failure the twin exists to avoid.
+      - ./run:/data/run
     # Simulator by default so the stack is demonstrable with no hardware.
     # Override with: SOURCE=mqtt docker compose up
     command: >
