@@ -218,6 +218,42 @@ class RoomExtractor:
                 free = free.copy()
                 free[seed_row, seed_col] = True
 
+        mask = self._fill_from(free, grid, seed_col, seed_row)
+
+        # A seed can be free and still lead nowhere.
+        #
+        # `_nearest_free` takes the CLOSEST free cell, and the closest one can
+        # be a single-cell speck stranded between two contact patches. Filling
+        # from it returns one cell and the whole room comes back empty, which
+        # is not obviously a seeding problem when you are looking at it — the
+        # seed is free, the free space is well connected, and the answer is
+        # still 0.00 m2.
+        #
+        # Measured on a furnished room mapped by contact alone: 5892 free
+        # cells, largest connected region 5874 of them, and the fill returned
+        # ONE, for 0.00 m2 of a 27 m2 room after the robot had driven 142 m.
+        #
+        # So when the fill is degenerate against the floor actually observed,
+        # take the largest connected region instead. The room is the biggest
+        # piece of connected floor the robot has been on; a speck is not a room.
+        total_free = int(free.sum())
+        if total_free and int(mask.sum()) < 0.10 * total_free:
+            largest = self._largest_free_region(free, grid)
+            if int(largest.sum()) > int(mask.sum()):
+                logger.info(
+                    "Flood-fill seed led to %d cell(s) of %d free; using the "
+                    "largest connected region (%d cells) instead",
+                    int(mask.sum()), total_free, int(largest.sum()),
+                )
+                return largest
+
+        return mask
+
+    def _fill_from(
+        self, free: np.ndarray, grid: OccupancyGrid, seed_col: int, seed_row: int
+    ) -> np.ndarray:
+        """Four-connected flood fill of `free`, starting at one cell."""
+        mask = np.zeros_like(free, dtype=bool)
         queue = deque([(seed_col, seed_row)])
         mask[seed_row, seed_col] = True
 
@@ -233,6 +269,27 @@ class RoomExtractor:
                 queue.append((n_col, n_row))
 
         return mask
+
+    def _largest_free_region(
+        self, free: np.ndarray, grid: OccupancyGrid
+    ) -> np.ndarray:
+        """The biggest connected patch of free floor on the map.
+
+        Only reached when seeding has clearly failed, so the cost of walking
+        every free cell once is paid on the rare path rather than every frame.
+        """
+        seen = np.zeros_like(free, dtype=bool)
+        best = np.zeros_like(free, dtype=bool)
+
+        for row, col in np.argwhere(free):
+            if seen[row, col]:
+                continue
+            region = self._fill_from(free, grid, int(col), int(row))
+            seen |= region
+            if int(region.sum()) > int(best.sum()):
+                best = region
+
+        return best
 
     @staticmethod
     def _nearest_free(
