@@ -254,10 +254,22 @@ class VirtualRobot:
         self.sequence = 0
         self.battery_soc = 100.0
 
-        # True while the robot is in contact with something. Set by the drive
-        # step, cleared once it has backed away.
-        self.bumper_active = False
+        # Ground truth of whether the chassis is pressed against something.
+        # NOT telemetry — the robot has no bumper switch, so nothing on board
+        # can read this. It exists to drive the servo feedback below and to
+        # score how well collision inference actually works.
+        self.in_contact = False
         self.collision_count = 0
+
+        # An optional contact switch, for a build that has one. Left False
+        # throughout: this robot does not.
+        self.bumper_active = False
+
+        # What the servo bus reports back — the only evidence of a collision
+        # the real robot has. A blocked wheel delivers far less speed than it
+        # was asked for, and needs far more load to try.
+        self.measured_wheel_speeds: list[float] = []
+        self.wheel_loads: list[float] = []
 
         self._gyro_accumulated_bias = 0.0
         self._imu_heading = 0.0
@@ -293,20 +305,27 @@ class VirtualRobot:
 
         heading_rad = math.radians(self.true_heading)
         if abs(d_theta) < 1e-9:
-            self.true_x += d_center * math.cos(heading_rad)
-            self.true_y += d_center * math.sin(heading_rad)
+            next_x = self.true_x + d_center * math.cos(heading_rad)
+            next_y = self.true_y + d_center * math.sin(heading_rad)
         else:
             radius = d_center / d_theta
-            self.true_x += radius * (
+            next_x = self.true_x + radius * (
                 math.sin(heading_rad + d_theta) - math.sin(heading_rad)
             )
-            self.true_y -= radius * (
+            next_y = self.true_y - radius * (
                 math.cos(heading_rad + d_theta) - math.cos(heading_rad)
             )
-        self.true_heading = normalize_deg(self.true_heading + math.degrees(d_theta))
 
-        # Encoders count the wheel turning, and cannot observe slip. The left
-        # wheel's diameter error means its ticks systematically misreport.
+        # Resolved against the furniture, exactly as the holonomic path is.
+        # Without this the robot drives through the table for the whole
+        # perimeter lap.
+        blocked = self._apply_motion(next_x, next_y, math.degrees(d_theta))
+        self._report_servos((v_left, v_right), blocked)
+
+        # Encoders count the wheel turning, and cannot observe slip — nor
+        # whether the chassis moved at all. Driving into a table looks like
+        # progress to odometry, which is precisely why a collision has to be
+        # inferred from the servos rather than from the pose.
         m_per_tick = self.geometry.metres_per_tick
         self.left_ticks += round(
             d_left_actual / (m_per_tick * self.noise.left_wheel_scale)
@@ -320,6 +339,74 @@ class VirtualRobot:
         )
 
         self.battery_soc = max(0.0, self.battery_soc - 0.002 * dt_s)
+
+    def _apply_motion(
+        self, next_x: float, next_y: float, delta_heading_deg: float
+    ) -> bool:
+        """Commit a move unless something solid is in the way.
+
+        Shared by both drive modes. It used to live only in the holonomic path,
+        so the differential one — which drives the entire perimeter lap — had
+        no contact model at all and the robot went straight through the table,
+        the sofa and the cabinet. That is what a viewer sees as the robot
+        crossing furniture in the 3D scene.
+
+        Returns True when the move was refused.
+        """
+        # The chassis radius is the wheel offset: the wheels sit at the rim, so
+        # that is the distance from centre to the outermost part of the robot.
+        radius = self.holonomic_geometry.wheel_offset_m
+        clearance_now = self.world.nearest_wall_distance(self.true_x, self.true_y)
+        clearance_next = self.world.nearest_wall_distance(next_x, next_y)
+
+        # A move is refused only if it would press *further* into something.
+        # Testing the destination alone is not enough: once the robot is inside
+        # the contact radius every destination fails that test, including the
+        # one that backs it out, and it stays wedged for the rest of the run.
+        # Real contact constrains the direction of motion, not all of it.
+        touching = clearance_next < radius
+        blocked = touching and clearance_next <= clearance_now
+
+        if not blocked:
+            self.true_x, self.true_y = next_x, next_y
+
+        if touching and not self.in_contact:
+            self.collision_count += 1
+        self.in_contact = touching
+        # There is no bumper switch on this robot. The flag is kept so a build
+        # that does have one can set it, but nothing in the simulator raises
+        # it: contact has to be inferred from the servos, which is what the
+        # measured speed and load below are for.
+        self.bumper_active = False
+
+        # Rotation always resolves. A robot pressed against a wall can still
+        # turn on the spot, and forbidding it would leave the recovery
+        # manoeuvre with nothing that works.
+        self.true_heading = normalize_deg(self.true_heading + delta_heading_deg)
+        return blocked
+
+    def _report_servos(self, commanded_rim_speeds, blocked: bool) -> None:
+        """What the servo bus would report back this cycle.
+
+        This is the only evidence of a collision the real robot has. With no
+        bumper, a crash is visible as the wheels being asked for speed they are
+        not delivering, and as the load needed to try.
+
+        A blocked omni wheel is modelled as mostly stalled rather than fully
+        stopped: the free rollers on the passive axis keep creeping, and the
+        driven wheel scrubs. Reporting a clean zero would make detection look
+        easier than it is.
+        """
+        self.measured_wheel_speeds = [
+            speed * (self.rng.uniform(0.02, 0.12) if blocked else
+                     1.0 + self.rng.gauss(0.0, 0.02))
+            for speed in commanded_rim_speeds
+        ]
+        self.wheel_loads = [
+            min(1.0, (0.85 + self.rng.gauss(0.0, 0.08)) if blocked
+                else 0.15 + abs(speed) * 0.5 + self.rng.gauss(0.0, 0.03))
+            for speed in commanded_rim_speeds
+        ]
 
     def drive_holonomic(
         self, vx_mps: float, vy_mps: float, omega_dps: float, dt_s: float
@@ -357,36 +444,13 @@ class VirtualRobot:
         # Contact test at the destination. Checked before committing, so the
         # robot stops against the obstacle instead of ending up inside it and
         # then reporting nonsense ranges from within a wall.
-        # The chassis radius is the wheel offset: the wheels sit at the rim, so
-        # that is the distance from centre to the outermost part of the robot.
-        radius = self.holonomic_geometry.wheel_offset_m
-        clearance_now = self.world.nearest_wall_distance(self.true_x, self.true_y)
-        clearance_next = self.world.nearest_wall_distance(next_x, next_y)
-
-        # A move is refused only if it would press *further* into something.
-        # Testing the destination alone is not enough: once the robot is inside
-        # the contact radius every destination fails that test, including the
-        # one that backs it out, and it stays wedged for the rest of the run.
-        # Real contact constrains the direction of motion, not all of it.
-        touching = clearance_next < radius
-        blocked = touching and clearance_next <= clearance_now
-
-        if not blocked:
-            self.true_x, self.true_y = next_x, next_y
-
-        if touching and not self.bumper_active:
-            self.collision_count += 1
-        self.bumper_active = touching
-
-        # Rotation always resolves. A robot pressed against a wall can still
-        # turn on the spot, and forbidding it would leave the recovery
-        # manoeuvre with nothing that works.
-        self.true_heading = normalize_deg(self.true_heading + delta.delta_heading_deg)
+        blocked = self._apply_motion(next_x, next_y, delta.delta_heading_deg)
 
         # Servo encoders count the wheel turning whether or not the chassis
         # moved. Driving into a wall therefore looks like progress to odometry
         # alone — which is the whole reason the map is built from ranges.
         speeds = inverse_kinematics(actual, self.holonomic_geometry)
+        self._report_servos(speeds.values, blocked)
         counts = self.holonomic_geometry.ticks_per_revolution
         circumference = self.holonomic_geometry.wheel_circumference_m
         if self.wheel_ticks is None:

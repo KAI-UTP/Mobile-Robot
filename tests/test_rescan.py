@@ -169,14 +169,19 @@ def test_a_refused_restart_says_why():
     assert result["detail"]
 
 
-def test_a_busy_restart_does_not_touch_the_map():
+def test_a_busy_restart_does_not_wipe_the_map():
     """Refusing must be inert. Clearing the map and then declining to start a
-    new scan would leave the user with nothing at all."""
+    new scan would leave the user with nothing at all.
+
+    Measured by how much has been explored, not by comparing the grid byte for
+    byte: the simulator is still running and legitimately adds cells between
+    the two reads, so an exact match fails for the wrong reason.
+    """
     m.app.state.sim_settings = _settings()
     m.rescan()
     time.sleep(1.2)
-    m.pipeline.refresh_room()
-    before = m.pipeline.grid_bytes()
+    before = m.pipeline.grid.explored_cells()
+    assert before > 0, "nothing was mapped, so the test proves nothing"
 
     m._scan_lock.acquire()
     try:
@@ -184,7 +189,7 @@ def test_a_busy_restart_does_not_touch_the_map():
     finally:
         m._scan_lock.release()
 
-    assert m.pipeline.grid_bytes() == before
+    assert m.pipeline.grid.explored_cells() >= before
 
 
 # ── Stopping a run part-way ──────────────────────────────────────────────────

@@ -63,7 +63,10 @@ class MappingPipeline:
 
         # The pipeline is driven from a network callback and read by the web
         # server, so every mutation is guarded.
-        self._lock = threading.Lock()
+        # Re-entrant because `record_contact` is called both from inside
+        # `process`, which already holds it, and from the control loop, which
+        # does not. A plain Lock deadlocks the mapper on the first collision.
+        self._lock = threading.RLock()
 
     # ── Ingestion ─────────────────────────────────────────────────────────
 
@@ -87,13 +90,7 @@ class MappingPipeline:
             # the robot is against the object, and re-marking every packet
             # would smear one touch into a wall as the robot backs away.
             if packet.bumper_active and not self._bumper_was_active:
-                self.grid.mark_contact(pose)
-                self.contacts += 1
-                logger.info(
-                    "Contact %d recorded at (%.2f, %.2f) — drawn as blocked "
-                    "floor; scan continues",
-                    self.contacts, pose.x_m, pose.y_m,
-                )
+                self.record_contact(pose, "bumper switch")
             self._bumper_was_active = packet.bumper_active
 
             # Record the trail sparsely — one point per 5 cm of travel keeps
@@ -111,6 +108,24 @@ class MappingPipeline:
                 self._refresh_room_locked()
 
             return pose
+
+    def record_contact(self, pose: PoseEstimate, reason: str = "contact") -> None:
+        """Draw something the robot could not get through, and carry on.
+
+        Called both by the optional bumper path above and by the controller's
+        collision detector, which infers contact from the servo bus because
+        this robot has no contact switch. Either way the map gains a blocked
+        patch and mapping continues — an obstacle is information, not a
+        failure, and stopping the scan would throw away the rest of the room.
+        """
+        with self._lock:
+            self.grid.mark_contact(pose)
+            self.contacts += 1
+        logger.info(
+            "Contact %d at (%.2f, %.2f): %s — drawn as blocked floor, "
+            "scan continues",
+            self.contacts, pose.x_m, pose.y_m, reason,
+        )
 
     def _refresh_room_locked(self) -> None:
         if self.pose is None:

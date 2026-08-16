@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -175,6 +176,23 @@ async def get_coverage() -> JSONResponse:
     payload = planner.summary()
     payload["active"] = not planner.is_finished
     payload["row_index"] = planner.row_index
+
+    # How contact was detected, which is not a detail: with no bumper switch
+    # every collision here is an inference, and the two detectors fail in
+    # different ways. Reporting the split is what makes a red patch on the map
+    # auditable rather than something the robot merely asserts.
+    detector = getattr(app.state, "collisions", None)
+    if detector is not None:
+        payload["collision_detection"] = detector.summary()
+        payload["collision_events"] = [
+            {
+                "x_m": round(e.x_m, 3),
+                "y_m": round(e.y_m, 3),
+                "reason": e.reason,
+                "detector": e.detector,
+            }
+            for e in detector.events[-20:]
+        ]
     payload["contacts"] = [
         {
             "x_m": round(o.x_m, 3),
@@ -663,6 +681,9 @@ def start_sim_source(
     The outline is measured and saved after phase 1 regardless, so a sweep
     that is interrupted still leaves a usable room measurement behind.
     """
+    from robotmap_common.collision import CollisionDetector
+    from robotmap_common.holonomic import BodyTwist, inverse_kinematics
+
     from autonomy.coverage import CoveragePlanner, CoverageState
     from autonomy.explorer import ExploreState, WallFollower
     from simulator.virtual_robot import VirtualRobot, VirtualWorld
@@ -682,6 +703,46 @@ def start_sim_source(
     robot.true_x, robot.true_y = app.state.robot_start
     follower = WallFollower()
     dt_s = 0.1
+
+    # No bumper switch on this robot, so a collision is inferred from the servo
+    # bus: wheels not delivering the speed they were asked for, or the robot
+    # not covering the ground it was commanded over. See collision.py.
+    detector = CollisionDetector()
+    app.state.collisions = detector
+
+    def check_contact(twist: BodyTwist) -> bool:
+        """Fold one control cycle into the detector and draw any collision.
+
+        Returns True when a NEW collision was recorded.
+        """
+        commanded = inverse_kinematics(twist, robot.holonomic_geometry).values
+        event = detector.update(
+            commanded_speed_mps=math.hypot(twist.vx_mps, twist.vy_mps),
+            commanded_wheel_speeds=commanded,
+            measured_wheel_speeds=robot.measured_wheel_speeds,
+            wheel_loads=robot.wheel_loads,
+            x_m=pipeline.pose.x_m,
+            y_m=pipeline.pose.y_m,
+            heading_deg=pipeline.pose.heading_deg,
+            dt_s=dt_s,
+        )
+        if event is None:
+            return False
+        pipeline.record_contact(pipeline.pose, event.reason)
+        return True
+
+    # Deliberately NO bespoke recovery here.
+    #
+    # An obvious-looking addition — reverse for a dozen cycles on every
+    # contact — was tried and made the map far worse: 122 m2 reported for a
+    # 27 m2 room, with obstacles scattered fourteen metres out. Reversing
+    # outside the control loop fights the wall-follower's own state machine,
+    # and the lap closes against a robot that has wandered.
+    #
+    # None is needed. Contact detection is edge-triggered, so leaning on an
+    # obstacle is recorded once, and the follower's front sensor turns it away
+    # under its own logic. The pilot, which drives real hardware, has proper
+    # recovery built into its control loop rather than bolted beside it.
 
     def report(stage: str) -> None:
         pipeline.refresh_room()
@@ -738,6 +799,9 @@ def start_sim_source(
                 break
 
             robot.drive(command.linear_mps, command.angular_dps, dt_s)
+            check_contact(
+                BodyTwist(vx_mps=command.linear_mps, omega_dps=command.angular_dps)
+            )
             # speed > 1 fast-forwards the demo; the physics step is unchanged.
             time.sleep(dt_s / max(speed, 0.01))
 
@@ -781,7 +845,10 @@ def start_sim_source(
                 pose.x_m,
                 pose.y_m,
                 pose.heading_deg,
-                packet.bumper_active,
+                # Inferred from the servo bus, not read from a switch: this
+                # robot has no bumper, so `packet.bumper_active` is always
+                # False and using it would leave the sweep blind to contact.
+                detector.in_contact,
                 dt_s,
             )
             if command.state == CoverageState.FINISHED:
@@ -792,6 +859,13 @@ def start_sim_source(
             # travel. This is the one manoeuvre a differential robot cannot do.
             robot.drive_holonomic(
                 command.linear_mps, command.lateral_mps, command.angular_dps, dt_s
+            )
+            check_contact(
+                BodyTwist(
+                    vx_mps=command.linear_mps,
+                    vy_mps=command.lateral_mps,
+                    omega_dps=command.angular_dps,
+                )
             )
             time.sleep(dt_s / max(speed, 0.01))
 
@@ -859,6 +933,7 @@ def rescan() -> dict:
         # Clear only once the old robot has definitely stopped writing.
         pipeline.reset(clear_map=True)
         app.state.coverage = None
+        app.state.collisions = None
 
         if settings is None:
             # Hardware mode: there is no simulator to restart, so the honest
