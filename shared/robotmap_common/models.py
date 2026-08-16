@@ -147,6 +147,24 @@ class RangeReading(BaseModel):
     sensor_id: str = Field(default="front")
 
 
+class BeaconSample(BaseModel):
+    """One BLE beacon's signal strength, as heard by the robot.
+
+    Separate from `robotmap_common.rssi.BeaconReading`, which is the maths
+    layer's own type. This one crosses the wire, so it is a Pydantic model and
+    is validated like everything else in a packet.
+    """
+
+    beacon_id: str = Field(..., min_length=1, max_length=32)
+    # Received signal strength. Real beacons at room range read roughly -40 to
+    # -95 dBm; the bounds only reject nonsense.
+    rssi_dbm: float = Field(..., ge=-120.0, le=0.0)
+    # Beacons advertise several times a second. Averaging a short window before
+    # inverting to a distance cuts the shadowing noise considerably, so the
+    # count is carried to say how much averaging stands behind this number.
+    sample_count: int = Field(default=1, ge=1)
+
+
 class GpsData(BaseModel):
     """A GNSS fix as reported by the receiver.
 
@@ -244,6 +262,14 @@ class SensorPacket(BaseModel):
     # Rim speed in metres per second, and load normalised to 0..1.
     wheel_speeds_mps: list[float] | None = Field(default=None)
     wheel_loads: list[float] | None = Field(default=None)
+
+    # RSSI from fixed BLE beacons, one entry per beacon heard.
+    #
+    # Coarse — about 2.7 m of error — but *bounded*, which is the property
+    # that matters. Dead reckoning is far better over a metre and unbounded
+    # over a hundred, so these two fail in opposite directions and that is
+    # exactly what makes them worth fusing.
+    beacons: list[BeaconSample] = Field(default_factory=list)
 
     @field_validator("wheel_ticks")
     @classmethod

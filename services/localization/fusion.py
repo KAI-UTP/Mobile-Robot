@@ -42,6 +42,7 @@ from robotmap_common.models import (
     PoseSource,
     SensorPacket,
 )
+from robotmap_common.rssi import BeaconReading, trilaterate
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,48 @@ class FilterConfig:
     # the map is built from odometry and the GPS supplies georeferencing.
     gps_max_accuracy_for_correction_m: float = 1.0
 
+    # ── BLE beacons ──────────────────────────────────────────────────────
+    # OFF by default, because measuring it showed it makes the pose worse.
+    #
+    # The case for switching it on was that odometry drifts without bound
+    # while BLE is coarse but bounded. That case rested on a stale number: a
+    # 200 m run used to end 30 m from the truth, but that was the encoder bug
+    # where a stalled wheel still counted ticks. With that fixed, the same run
+    # measures:
+    #
+    #     BLE off    mean error 0.51 m, worst 1.59 m, final 0.29 m
+    #     BLE on     mean error 1.42 m, worst 2.78 m, final 1.73 m
+    #
+    # Odometry is now roughly five times better than a BLE fix in a room this
+    # size, so folding BLE in adds noise instead of removing drift.
+    #
+    # The Kalman gain was supposed to prevent exactly that by deferring to
+    # whichever source has the lower variance, and it failed for a reason
+    # worth recording. Beacons are read at 10 Hz, so a 200 m run applied 6812
+    # corrections, each shrinking the covariance. The filter ended up believing
+    # sigma = 0.18 m while genuinely 1.42 m out — confidently wrong, and no
+    # longer correctable. The flaw is treating consecutive RSSI samples as
+    # independent measurements when shadowing is strongly correlated in space:
+    # the filter thinks it has thousands of looks and really has a handful.
+    #
+    # Turning this on sensibly needs one fix every few seconds rather than
+    # every packet, and a variance inflated for that correlation. Worth doing
+    # if runs get much longer or the space much larger than a room — where
+    # unbounded drift would eventually overtake a bounded 2.71 m — and not
+    # before.
+    ble_enabled: bool = False
+    # Assumed error of a trilaterated fix, when the solver does not supply a
+    # better estimate of its own. Squared into a measurement variance.
+    ble_accuracy_m: float = 2.71
+    # Reject fixes claiming to be worse than this outright — a solution that
+    # loose says the geometry has collapsed, not that the robot has moved.
+    ble_max_accuracy_m: float = 6.0
+    # Innovation gate, in combined sigmas.
+    ble_outlier_sigma: float = 3.0
+    # Hard clamp per step. A formally valid correction should still never
+    # teleport the robot across the room in one cycle.
+    ble_max_correction_m: float = 1.0
+
 
 # ── Filter ────────────────────────────────────────────────────────────────────
 
@@ -148,6 +191,7 @@ class PoseFilter:
         geometry: RobotGeometry | None = None,
         config: FilterConfig | None = None,
         holonomic_geometry: HolonomicGeometry | None = None,
+        beacon_layout: dict | None = None,
     ) -> None:
         self.robot_id = robot_id
         self.geometry = geometry or RobotGeometry()
@@ -195,6 +239,14 @@ class PoseFilter:
         # are counted separately: a fix can be perfectly valid, and used to
         # georeference the map, without being precise enough to move the robot
         # on it.
+        # Where the beacons are, by id. Surveyed once when they are put up;
+        # without it a reading is a distance to an unknown point and worth
+        # nothing. None means no beacons are installed.
+        self.beacon_layout = beacon_layout or {}
+        self.ble_rejections = 0
+        self.ble_acceptances = 0
+        self.last_ble_reason = "no beacon data received"
+
         self.gps_rejections = 0
         self.gps_acceptances = 0
         self.gps_corrections = 0
@@ -225,6 +277,12 @@ class PoseFilter:
 
         if packet.imu is not None:
             self._correct_heading_from_imu(packet.imu)
+
+        # BLE before GPS: indoors the beacons are the only absolute reference
+        # that works at all, and GPS will almost always be rejected by its own
+        # HDOP gate a line later.
+        if packet.beacons:
+            self._correct_position_from_beacons(packet.beacons)
 
         if packet.gps is not None:
             self._correct_position_from_gps(packet.gps)
@@ -419,6 +477,91 @@ class PoseFilter:
             return False, f"HDOP {gps.hdop:.1f} too high (need <= {cfg.gps_max_hdop})"
         return True, "fix accepted"
 
+    def _correct_position_from_beacons(self, samples) -> None:
+        """Pull the pose back towards a bounded BLE fix.
+
+        This is the only correction available to a robot with no range
+        sensors, and without it the pose estimate has nothing to stop it
+        walking away: measured, it reached thirty metres of error after two
+        hundred metres of driving inside a six metre room.
+
+        The gain does the balancing. It is var_odom / (var_odom + var_ble), so
+        a fresh pose with a small variance barely moves, and a drifted one with
+        a large variance is pulled hard. There is deliberately no "only use BLE
+        after N metres" rule — the arithmetic already prefers whichever source
+        is currently better, and a hand-written threshold would only be a worse
+        version of it.
+        """
+        if not self.config.ble_enabled or not self.beacon_layout:
+            return
+
+        readings = [
+            BeaconReading(
+                beacon_id=s.beacon_id,
+                rssi_dbm=s.rssi_dbm,
+                sample_count=s.sample_count,
+            )
+            for s in samples
+        ]
+
+        fix = trilaterate(readings, self.beacon_layout)
+        self.last_ble_reason = fix.reason or "ok"
+
+        if not fix.is_usable:
+            self.ble_rejections += 1
+            self.last_ble_reason = fix.reason or "fix not usable"
+            return
+
+        accuracy = max(fix.estimated_error_m, self.config.ble_accuracy_m)
+        if accuracy > self.config.ble_max_accuracy_m:
+            self.ble_rejections += 1
+            self.last_ble_reason = (
+                f"rejected: {accuracy:.1f} m fix is too loose to correct with"
+            )
+            return
+
+        ble_var = accuracy**2
+        innovation_x = fix.x_m - self.x_m
+        innovation_y = fix.y_m - self.y_m
+        innovation_dist = math.hypot(innovation_x, innovation_y)
+
+        combined_sigma = math.sqrt(
+            max(self.covariance.var_x, self.covariance.var_y) + ble_var
+        )
+        if innovation_dist > self.config.ble_outlier_sigma * combined_sigma:
+            self.ble_rejections += 1
+            self.last_ble_reason = (
+                f"rejected outlier: {innovation_dist:.1f} m from estimate"
+            )
+            return
+
+        gain_x = self.covariance.var_x / (self.covariance.var_x + ble_var)
+        gain_y = self.covariance.var_y / (self.covariance.var_y + ble_var)
+
+        correction_x = gain_x * innovation_x
+        correction_y = gain_y * innovation_y
+
+        correction_dist = math.hypot(correction_x, correction_y)
+        limit = self.config.ble_max_correction_m
+        if correction_dist > limit:
+            scale = limit / correction_dist
+            correction_x *= scale
+            correction_y *= scale
+
+        self.x_m += correction_x
+        self.y_m += correction_y
+
+        # Shrink the covariance by the same gain. Skipping this is the classic
+        # way to build a filter that corrects for ever and never becomes
+        # confident, because it keeps believing it is as lost as it was.
+        self.covariance.var_x *= 1.0 - gain_x
+        self.covariance.var_y *= 1.0 - gain_y
+
+        self.ble_acceptances += 1
+        self.last_ble_reason = (
+            f"corrected {correction_dist:.2f} m from {fix.beacons_used} beacons"
+        )
+
     def _correct_position_from_gps(self, gps: GpsData) -> None:
         accepted, reason = self._gps_is_trustworthy(gps)
         self.last_gps_reason = reason
@@ -550,6 +693,10 @@ class PoseFilter:
             "gps_corrections": self.gps_corrections,
             "gps_rejections": self.gps_rejections,
             "last_gps_reason": self.last_gps_reason,
+            "ble_acceptances": self.ble_acceptances,
+            "ble_rejections": self.ble_rejections,
+            "last_ble_reason": self.last_ble_reason,
+            "beacons_installed": len(self.beacon_layout),
             "anchored": self.anchor_lat is not None,
             "imu_locked": self._imu_heading_offset is not None,
             "distance_travelled_m": round(self.distance_travelled_m, 2),

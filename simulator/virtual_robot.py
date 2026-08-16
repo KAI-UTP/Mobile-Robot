@@ -35,6 +35,7 @@ from robotmap_common.holonomic import (
     inverse_kinematics,
 )
 from robotmap_common.models import (
+    BeaconSample,
     DriveKind,
     EncoderData,
     GpsData,
@@ -273,6 +274,12 @@ class VirtualRobot:
         # was asked for, and needs far more load to try.
         self.measured_wheel_speeds: list[float] = []
         self.wheel_loads: list[float] = []
+
+        # Per-beacon TxPower offsets, filled by `attach_beacons`. Initialised
+        # here so that assigning `beacon_layout` directly — which is the
+        # obvious thing to try — degrades to "no offsets" instead of raising
+        # from inside `read_beacons` on the next packet.
+        self._beacon_tx_offsets: dict[str, float] = {}
 
         self._gyro_accumulated_bias = 0.0
         self._imu_heading = 0.0
@@ -686,6 +693,16 @@ class VirtualRobot:
             # nothing on this robot can simply report contact.
             wheel_speeds_mps=list(self.measured_wheel_speeds) or None,
             wheel_loads=list(self.wheel_loads) or None,
+            # Coarse but bounded, and the only absolute reference this robot
+            # has indoors. Empty unless beacons have been installed.
+            beacons=[
+                BeaconSample(
+                    beacon_id=r.beacon_id,
+                    rssi_dbm=max(-120.0, min(0.0, r.rssi_dbm)),
+                    sample_count=r.sample_count,
+                )
+                for r in self.read_beacons()
+            ],
             encoders=EncoderData(
                 left_ticks=self.left_ticks,
                 right_ticks=self.right_ticks,
