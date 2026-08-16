@@ -30,6 +30,7 @@ class ExploreState(str, Enum):
     FOLLOWING = "FOLLOWING"  # tracking the wall on the chosen side
     TURNING_CORNER = "TURNING_CORNER"  # inside corner: wall ahead
     ROUNDING_CORNER = "ROUNDING_CORNER"  # outside corner: wall fell away
+    RECOVERING = "RECOVERING"  # ran into something the sensors missed
     FINISHED = "FINISHED"
 
 
@@ -62,6 +63,19 @@ class ExploreConfig:
     min_loop_distance_m: float = 3.0
     loop_close_radius_m: float = 0.5
 
+    # Recovery from running into something the range sensors missed.
+    #
+    # Needed because real rooms have furniture against the walls — a bin, a
+    # sofa, a cabinet — and the ±30° forward cone does not see a low bin at
+    # all. Without recovery the robot simply leans on it: measured against a
+    # fully furnished room the lap never completed and the scan came back
+    # 10.16 m2 of a 27 m2 room.
+    recover_distance_m: float = 0.20
+    # Turning away afterwards matters as much as backing off. Reversing alone
+    # leaves the robot pointed at the same obstacle, and it drives into it
+    # again on the next cycle.
+    recover_turn_deg: float = 35.0
+
 
 @dataclass
 class DriveCommand:
@@ -91,6 +105,12 @@ class WallFollower:
         # ultrasonic reading does not trigger a corner manoeuvre.
         self._wall_lost_cycles = 0
 
+        # Recovery bookkeeping: metres still to reverse, then degrees still to
+        # turn away from whatever was hit.
+        self._recover_remaining_m = 0.0
+        self._recover_turn_remaining_deg = 0.0
+        self.collisions = 0
+
     # ── Sensor helpers ────────────────────────────────────────────────────
 
     @staticmethod
@@ -119,13 +139,27 @@ class WallFollower:
         x_m: float,
         y_m: float,
         dt_s: float,
+        blocked: bool = False,
     ) -> DriveCommand:
-        """Return the next velocity command."""
+        """Return the next velocity command.
+
+        `blocked` says the robot has run into something — inferred from the
+        servo bus, since this robot has no bumper. It defaults to False so
+        callers with no collision detection behave exactly as before.
+        """
         cfg = self.config
 
         if self._check_loop_closed(x_m, y_m):
             self.state = ExploreState.FINISHED
             return DriveCommand(0.0, 0.0, self.state, "loop closed")
+
+        recovery = self._recover(blocked, dt_s)
+        if recovery is not None:
+            step_distance = abs(recovery.linear_mps) * dt_s
+            self.distance_travelled_m += step_distance
+            if self.start_x is not None:
+                self.lap_distance_m += step_distance
+            return recovery
 
         front = self._front_distance(ranges)
         side = self._side_distance(ranges)
@@ -226,6 +260,51 @@ class WallFollower:
             "too far" if error > 0 else "too close",
         )
 
+    def _recover(self, blocked: bool, dt_s: float) -> DriveCommand | None:
+        """Back off and turn away from something the sensors did not see.
+
+        Returns the command to send while recovering, or None to carry on
+        following the wall.
+
+        Wall-following assumes the range sensors saw whatever is ahead. The
+        ±30° forward cone does not see a low bin at all, and a sofa pushed
+        against the wall is met head-on. Without this the robot leans on it for
+        the rest of the lap: against a fully furnished room the circuit never
+        closed and the scan reported 10.16 m2 of a 27 m2 room.
+
+        Turning away matters as much as reversing. Backing straight out leaves
+        the robot pointed at the same obstacle and it drives into it again.
+        """
+        cfg = self.config
+        away = 1.0 if cfg.follow_right_wall else -1.0
+
+        if blocked and self.state != ExploreState.RECOVERING:
+            self.collisions += 1
+            self.state = ExploreState.RECOVERING
+            self._recover_remaining_m = cfg.recover_distance_m
+            self._recover_turn_remaining_deg = cfg.recover_turn_deg
+
+        if self.state != ExploreState.RECOVERING:
+            return None
+
+        if self._recover_remaining_m > 0.0:
+            self._recover_remaining_m -= cfg.cruise_speed_mps * dt_s
+            return DriveCommand(
+                -cfg.cruise_speed_mps * 0.7, 0.0, self.state, "backing off"
+            )
+
+        if self._recover_turn_remaining_deg > 0.0:
+            self._recover_turn_remaining_deg -= cfg.turn_speed_dps * dt_s
+            return DriveCommand(
+                0.0, away * cfg.turn_speed_dps, self.state, "turning away"
+            )
+
+        # Re-acquire the wall rather than resuming mid-manoeuvre: the robot is
+        # no longer where the follower thought it was.
+        self.state = ExploreState.SEEKING_WALL
+        self._wall_lost_cycles = 0
+        return None
+
     def _check_loop_closed(self, x_m: float, y_m: float) -> bool:
         if self.loop_closed:
             return True
@@ -249,3 +328,6 @@ class WallFollower:
         self.start_x = self.start_y = None
         self.loop_closed = False
         self._wall_lost_cycles = 0
+        self._recover_remaining_m = 0.0
+        self._recover_turn_remaining_deg = 0.0
+        self.collisions = 0

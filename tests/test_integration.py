@@ -87,7 +87,18 @@ def run_pipeline(
         grid.integrate_scan(pose, packet.ranges)
         grid.mark_robot_footprint(pose)
 
-        command = follower.step(packet.ranges, pose.x_m, pose.y_m, DT_S)
+        # Contact fed straight from ground truth here. The real system infers
+        # it from the servo bus, because the robot has no bumper, and that
+        # inference is covered by tests/test_collision_detection.py — this
+        # harness is measuring the MAP, so it takes the shortest honest route
+        # to a contact signal.
+        #
+        # It cannot simply be omitted: without recovery, wall-following leans
+        # on a bin or a sofa for the rest of the lap and the circuit never
+        # closes.
+        command = follower.step(
+            packet.ranges, pose.x_m, pose.y_m, DT_S, blocked=robot.in_contact
+        )
         if command.state == ExploreState.FINISHED:
             result.loop_closed = True
             result.steps = step

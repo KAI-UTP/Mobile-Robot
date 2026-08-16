@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
+from robotmap_common.room_layout import FURNISHED_ROOM, by_name
+
 
 @dataclass
 class Box:
@@ -129,34 +131,75 @@ def _walls(width: float, height: float, wall_height: float, door_x: float | None
     return boxes
 
 
+# How each footprint is dressed for display: (z centre, height, colour, label).
+# The layout says where the furniture is; this says what it looks like.
+_STYLE = {
+    "table": (0.74, 0.06, TABLE, "Table"),
+    "chair_west": (0.45, 0.05, CHAIR, "Chair"),
+    "chair_east": (0.45, 0.05, CHAIR, "Chair"),
+    "chair_south": (0.45, 0.05, CHAIR, "Chair"),
+    "chair_north": (0.45, 0.05, CHAIR, "Chair"),
+    "sofa": (0.22, 0.44, SOFA, "Sofa"),
+    "cabinet": (0.55, 1.10, CABINET, "Cabinet"),
+    "bin": (0.18, 0.36, CHAIR, "Bin"),
+}
+
+
 def _furniture(width: float, height: float) -> list[Box]:
     """A deliberately awkward layout.
 
     The table sits in open floor so the robot has to go round it, and the sofa
     cuts a corner — which is where wall-following most often loses the wall.
     An empty room would flatter the mapping.
+
+    Positions come from `robotmap_common.room_layout`, the single description
+    of what is in this room, so the browser twin, the Omniverse scene and the
+    robot's own world cannot disagree about it. They previously did: this
+    function clamped the table to `min(2.3, height / 2)`, which in a 4.5 m room
+    put it 5 cm from where both 3D scenes drew it.
     """
-    table_x, table_y = min(2.6, width / 2), min(2.3, height / 2)
     boxes = [
-        Box("rug", table_x, table_y, 0.006, 2.4, 1.6, 0.012, RUG, "Rug", "rug"),
-        Box("table", table_x, table_y, 0.74, 1.4, 0.85, 0.06, TABLE, "Table", "furniture"),
+        # Display only — 12 mm thick, and the robot drives straight over it, so
+        # it is not in the layout and must not count as blocked floor.
+        Box("rug", 2.6, 2.3, 0.006, 2.4, 1.6, 0.012, RUG, "Rug", "rug"),
     ]
 
-    for index, (dx, dy) in enumerate(((-1.0, 0.0), (1.0, 0.0), (0.0, -0.75), (0.0, 0.75))):
+    for item in FURNISHED_ROOM:
+        z_m, height_m, colour, label = _STYLE[item.name]
         boxes.append(
-            Box(f"chair_{index}", table_x + dx, table_y + dy, 0.45,
-                0.42, 0.42, 0.05, CHAIR, "Chair", "furniture")
-        )
-        boxes.append(
-            Box(f"chair_{index}_back", table_x + dx * 1.1, table_y + dy * 1.1, 0.68,
-                0.42 if abs(dy) > 0 else 0.06, 0.06 if abs(dy) > 0 else 0.42,
-                0.45, CHAIR, "Chair", "furniture")
+            Box(
+                item.name,
+                item.centre_x_m, item.centre_y_m, z_m,
+                item.width_m, item.depth_m, height_m,
+                colour, label, "furniture",
+            )
         )
 
-    boxes.append(Box("sofa", 1.1, height - 0.8, 0.22, 2.0, 0.85, 0.44, SOFA, "Sofa", "furniture"))
-    boxes.append(Box("sofa_back", 1.1, height - 0.45, 0.58, 2.0, 0.18, 0.72, SOFA, "Sofa", "furniture"))
-    boxes.append(Box("cabinet", width - 0.4, 2.6, 0.55, 0.45, 1.5, 1.10, CABINET, "Cabinet", "furniture"))
-    boxes.append(Box("bin", width - 0.45, 0.6, 0.18, 0.32, 0.32, 0.36, CHAIR, "Bin", "furniture"))
+    # Backs and cushions: they sit above the footprints already listed, so they
+    # add nothing to the floor area and exist purely so the room reads as a
+    # room rather than a set of slabs.
+    for item in FURNISHED_ROOM:
+        if not item.name.startswith("chair_"):
+            continue
+        along_x = item.name in ("chair_south", "chair_north")
+        offset = 0.24 if item.name in ("chair_east", "chair_north") else -0.24
+        boxes.append(
+            Box(
+                f"{item.name}_back",
+                item.centre_x_m + (0.0 if along_x else offset),
+                item.centre_y_m + (offset if along_x else 0.0),
+                0.68,
+                0.42 if along_x else 0.06,
+                0.06 if along_x else 0.42,
+                0.45, CHAIR, "Chair", "furniture",
+            )
+        )
+
+    sofa = by_name("sofa")
+    boxes.append(
+        Box("sofa_back", sofa.centre_x_m, sofa.max_y_m - 0.09, 0.58,
+            sofa.width_m, 0.18, 0.72, SOFA, "Sofa", "furniture")
+    )
 
     return boxes
 

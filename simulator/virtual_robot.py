@@ -44,6 +44,7 @@ from robotmap_common.models import (
     RangeReading,
     SensorPacket,
 )
+from robotmap_common.room_layout import furnished_room_edges
 
 # Anchor the virtual world at Universiti Teknologi PETRONAS.
 DEFAULT_LAT, DEFAULT_LON = 4.3852, 100.9739
@@ -90,16 +91,17 @@ class VirtualWorld:
 
     @classmethod
     def room_with_furniture(cls, width_m: float = 6.0, height_m: float = 4.5) -> VirtualWorld:
+        """The demo room, furnished exactly as the renderers draw it.
+
+        The furniture comes from `robotmap_common.room_layout`, which is the
+        single description of what is in this room. It used to be a hand-written
+        table and cabinet here, and it had drifted: both renderers were drawing
+        a sofa, four chairs and a bin that the robot had never heard of. The
+        robot drove through the sofa and looked broken, when in fact it was
+        obeying a world that had no sofa in it.
+        """
         world = cls.rectangular_room(width_m, height_m)
-        # A table in the middle and a cabinet against one wall.
-        for x1, y1, x2, y2 in (
-            (2.0, 1.5, 3.2, 1.5),
-            (3.2, 1.5, 3.2, 2.6),
-            (3.2, 2.6, 2.0, 2.6),
-            (2.0, 2.6, 2.0, 1.5),
-            (4.8, 3.4, 5.6, 3.4),
-            (5.6, 3.4, 5.6, 4.2),
-        ):
+        for x1, y1, x2, y2 in furnished_room_edges():
             world.walls.append(Wall(x1, y1, x2, y2))
         return world
 
@@ -320,17 +322,31 @@ class VirtualRobot:
         # Without this the robot drives through the table for the whole
         # perimeter lap.
         blocked = self._apply_motion(next_x, next_y, math.degrees(d_theta))
-        self._report_servos((v_left, v_right), blocked)
+        delivery = self._delivery_factor(blocked)
+        self._report_servos((v_left, v_right), blocked, delivery)
 
-        # Encoders count the wheel turning, and cannot observe slip — nor
-        # whether the chassis moved at all. Driving into a table looks like
-        # progress to odometry, which is precisely why a collision has to be
-        # inferred from the servos rather than from the pose.
+        # Encoders read the SHAFT, so a stalled shaft does not advance them.
+        #
+        # This is the difference between the two ways a wheel fails to move the
+        # robot, and they are not interchangeable:
+        #
+        #   jammed against a table  the shaft stops, ticks stop, and odometry
+        #                           correctly reports no motion
+        #   spinning on a smooth    the shaft turns, ticks advance, and
+        #   floor                   odometry is confidently wrong
+        #
+        # Counting the commanded distance regardless modelled neither. Against
+        # a room with chairs and a bin in it, the phantom travel accumulated
+        # over a lap of collisions and the pose ran to thirty metres outside a
+        # six metre room — reporting 187 m2 of floor.
+        #
+        # Encoders still cannot observe slip. That is the second row above,
+        # and it is what the no-progress detector in collision.py exists for.
         m_per_tick = self.geometry.metres_per_tick
         self.left_ticks += round(
-            d_left_actual / (m_per_tick * self.noise.left_wheel_scale)
+            d_left_actual * delivery / (m_per_tick * self.noise.left_wheel_scale)
         )
-        self.right_ticks += round(d_right_actual / m_per_tick)
+        self.right_ticks += round(d_right_actual * delivery / m_per_tick)
 
         # IMU integrates true rotation plus a slowly accumulating bias.
         self._gyro_accumulated_bias += self.noise.gyro_bias_dps * dt_s
@@ -385,21 +401,30 @@ class VirtualRobot:
         self.true_heading = normalize_deg(self.true_heading + delta_heading_deg)
         return blocked
 
-    def _report_servos(self, commanded_rim_speeds, blocked: bool) -> None:
+    def _delivery_factor(self, blocked: bool) -> float:
+        """Fraction of the commanded wheel motion the shaft actually turns.
+
+        A blocked omni wheel is modelled as mostly stalled rather than fully
+        stopped: the free rollers on the passive axis keep creeping and the
+        driven wheel scrubs. Reporting a clean zero would make detection look
+        easier than it is.
+        """
+        if blocked:
+            return self.rng.uniform(0.02, 0.12)
+        return 1.0
+
+    def _report_servos(
+        self, commanded_rim_speeds, blocked: bool, delivery: float
+    ) -> None:
         """What the servo bus would report back this cycle.
 
         This is the only evidence of a collision the real robot has. With no
         bumper, a crash is visible as the wheels being asked for speed they are
         not delivering, and as the load needed to try.
-
-        A blocked omni wheel is modelled as mostly stalled rather than fully
-        stopped: the free rollers on the passive axis keep creeping, and the
-        driven wheel scrubs. Reporting a clean zero would make detection look
-        easier than it is.
         """
+        jitter = 1.0 + self.rng.gauss(0.0, 0.02)
         self.measured_wheel_speeds = [
-            speed * (self.rng.uniform(0.02, 0.12) if blocked else
-                     1.0 + self.rng.gauss(0.0, 0.02))
+            speed * delivery * (1.0 if blocked else jitter)
             for speed in commanded_rim_speeds
         ]
         self.wheel_loads = [
@@ -446,18 +471,21 @@ class VirtualRobot:
         # then reporting nonsense ranges from within a wall.
         blocked = self._apply_motion(next_x, next_y, delta.delta_heading_deg)
 
-        # Servo encoders count the wheel turning whether or not the chassis
-        # moved. Driving into a wall therefore looks like progress to odometry
-        # alone — which is the whole reason the map is built from ranges.
+        # Servo encoders read the shaft, so a stalled wheel does not advance
+        # them — see `drive` for why the distinction between a jammed wheel and
+        # a slipping one matters, and which of the two odometry can be fooled
+        # by. Omni rollers still slip freely on the passive axis, which is the
+        # reason the map is built from ranges rather than dead reckoning.
         speeds = inverse_kinematics(actual, self.holonomic_geometry)
-        self._report_servos(speeds.values, blocked)
+        delivery = self._delivery_factor(blocked)
+        self._report_servos(speeds.values, blocked, delivery)
         counts = self.holonomic_geometry.ticks_per_revolution
         circumference = self.holonomic_geometry.wheel_circumference_m
         if self.wheel_ticks is None:
             self.wheel_ticks = [0, 0, 0]
         for index, rim_speed in enumerate(speeds.values):
             self.wheel_ticks[index] += round(
-                rim_speed * dt_s / circumference * counts
+                rim_speed * delivery * dt_s / circumference * counts
             )
 
         # Keep the two-wheel fields consistent for readers that only know the

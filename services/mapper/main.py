@@ -840,7 +840,13 @@ def start_sim_source(
             pipeline.process(packet)
 
             command = follower.step(
-                packet.ranges, pipeline.pose.x_m, pipeline.pose.y_m, dt_s
+                packet.ranges,
+                pipeline.pose.x_m,
+                pipeline.pose.y_m,
+                dt_s,
+                # Inferred from the servo bus — this robot has no bumper.
+                # Without it the lap leans on the bin and never closes.
+                blocked=detector.in_contact,
             )
             if command.state == ExploreState.FINISHED:
                 break
