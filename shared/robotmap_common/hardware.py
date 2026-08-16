@@ -36,7 +36,7 @@ up, and it is switched off because it made the pose worse (0.51 m -> 1.42 m).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 
@@ -242,6 +242,25 @@ class HardwareProfile:
         if self.has(Capability.RANGE):
             return Strategy.WALL_FOLLOWING
         return Strategy.CONTACT_ONLY
+
+    def with_fitted(self, names: list[str]) -> HardwareProfile:
+        """The same hardware, with exactly `names` fitted and the rest not.
+
+        For choosing a sensor suite at the start of a run rather than at the
+        start of a build. Which strategy the robot then uses follows from the
+        choice, so ticking a lidar and pressing Start is the whole difference
+        between mapping a room in 23 m and mapping it in 435 m.
+
+        Unknown names are ignored rather than raising: this is driven from a
+        UI, and a stale name in a browser tab should not take the mapper down.
+        """
+        wanted = {n.strip().lower() for n in names}
+        return HardwareProfile(
+            name="custom",
+            devices=tuple(
+                replace(d, fitted=d.name.lower() in wanted) for d in self.devices
+            ),
+        )
 
     def describe(self) -> dict:
         """For /api/hardware, so the dashboards can show what this is."""

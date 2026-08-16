@@ -102,6 +102,52 @@
     <a href="/scans" style="color:var(--accent);text-decoration:none">scans</a>
   </div>
 
+  <!--
+    Set up the run, then start it.
+
+    The order is the point. What the robot can sense decides HOW it maps, and
+    what is standing in the room decides how hard that is — so both are chosen
+    before the robot goes out, not configured in a file somewhere and hoped
+    for. Tick a lidar and the same room is measured in 23 m instead of 435.
+  -->
+  <div class="card" id="setupCard">
+    <h2>1 · Sensors</h2>
+    <div class="note" style="margin-top:0">
+      What is bolted to the robot. The mapping strategy follows from it.
+    </div>
+    <div id="sensorList" style="margin-top:8px"></div>
+    <div class="row" style="margin-top:8px">
+      <span>Strategy</span><b id="strategyPill" class="pill">—</b>
+    </div>
+    <div class="note" id="strategyNote">—</div>
+  </div>
+
+  <div class="card">
+    <h2>2 · The room</h2>
+    <div class="row"><span>Furniture in the room</span><b id="pieceCount">—</b></div>
+    <div class="note" style="margin-top:6px">
+      Arrange it in the Omniverse window and the robot meets it where you put
+      it. These are the shortcuts.
+    </div>
+    <button onclick="setRoom('empty')">Empty the room</button>
+    <button onclick="setRoom('table')">One table in the middle</button>
+    <button onclick="setRoom('furnished')">Table, sofa and a cabinet</button>
+  </div>
+
+  <div class="card">
+    <h2>3 · Go</h2>
+    <button id="startBtn" onclick="startScan()"
+            style="background:#238636;border-color:#238636;font-weight:600">
+      Start
+    </button>
+    <button id="stopBtn" onclick="stopScan()"
+            style="background:#8b2c2c;border-color:#8b2c2c;font-weight:600"
+            disabled>
+      Stop
+    </button>
+    <div class="note" id="runNote">Choose the sensors and the room, then press Start.</div>
+  </div>
+
   <div class="card">
     <h2>Floor area</h2>
     <div class="big"><span id="area">—</span> <span>m²</span></div>
@@ -645,6 +691,165 @@ function downloadMap() {
   a.click();
   URL.revokeObjectURL(url);
 }
+
+// ── Setting up a run ────────────────────────────────────────────────────────
+//
+// Sensors first, then the room, then Start. The order matters: what the robot
+// can sense decides how it maps, and what is in the room decides how hard that
+// is, so both are settled before it goes out rather than configured somewhere
+// and hoped for.
+
+// Rooms the shortcut buttons build, in metres, in the room's own frame.
+// Deliberately small sets — the Omniverse window is where a room gets
+// arranged properly, and these exist so the page is usable without it.
+const ROOMS = {
+  empty: [],
+  table: [
+    { min_x_m: 2.3, min_y_m: 1.7, max_x_m: 3.7, max_y_m: 2.6 },
+  ],
+  furnished: [
+    { min_x_m: 2.3, min_y_m: 1.7, max_x_m: 3.7, max_y_m: 2.6 },   // table
+    { min_x_m: 0.2, min_y_m: 3.4, max_x_m: 2.2, max_y_m: 4.3 },   // sofa
+    { min_x_m: 5.4, min_y_m: 1.8, max_x_m: 5.9, max_y_m: 3.3 },   // cabinet
+  ],
+};
+
+let scanRunning = false;
+
+async function loadSensors() {
+  const reply = await fetch('/api/hardware');
+  const hw = await reply.json();
+  const list = document.getElementById('sensorList');
+
+  list.innerHTML = hw.devices.map((d, i) => `
+    <label style="display:flex;gap:8px;align-items:flex-start;padding:3px 0;
+                  font-size:12px;cursor:pointer">
+      <input type="checkbox" data-name="${d.name.replace(/"/g, '&quot;')}"
+             ${d.fitted ? 'checked' : ''} onchange="applySensors()"
+             style="margin-top:2px;flex:none">
+      <span>
+        <b style="font-weight:600">${d.name}</b>
+        <span style="color:var(--muted)">${d.capabilities.join(', ').toLowerCase()}</span>
+        <span style="display:block;color:var(--muted);font-size:10.5px">${d.accuracy}</span>
+      </span>
+    </label>`).join('');
+
+  showStrategy(hw.strategy);
+}
+
+function showStrategy(strategy) {
+  const pill = document.getElementById('strategyPill');
+  const note = document.getElementById('strategyNote');
+  const contact = strategy === 'CONTACT_ONLY';
+
+  pill.textContent = contact ? 'contact only' : 'wall following';
+  pill.className = 'pill ' + (contact ? 'warn' : 'ok');
+  note.textContent = contact
+    ? 'Nothing fitted can measure distance, so the robot finds the room by '
+      + 'driving into it — about 435 m of bouncing, and roughly 8 % low. This '
+      + 'is the robot that exists today.'
+    : 'Something can measure distance, so the robot holds a set gap from the '
+      + 'wall and follows it round — about 23 m, and accurate to 1.4 %.';
+}
+
+async function applySensors() {
+  const fitted = [...document.querySelectorAll('#sensorList input:checked')]
+    .map(box => box.dataset.name);
+
+  const reply = await fetch('/api/hardware', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fitted }),
+  });
+  const body = await reply.json();
+
+  if (!reply.ok) {
+    // Most likely a scan is running. Put the boxes back rather than leaving
+    // them showing a suite the robot is not using.
+    document.getElementById('strategyNote').textContent = body.error || 'could not change the sensors';
+    loadSensors();
+    return;
+  }
+  showStrategy(body.strategy);
+}
+
+async function setRoom(which) {
+  const boxes = ROOMS[which] || [];
+  await fetch('/api/world/geometry', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ boxes }),
+  });
+  refreshRoomCount();
+}
+
+async function refreshRoomCount() {
+  try {
+    const reply = await fetch('/api/world/geometry');
+    const body = await reply.json();
+    document.getElementById('pieceCount').textContent =
+      body.pieces.length === 0 ? 'empty' : `${body.pieces.length} piece(s)`;
+  } catch { /* the page is still useful without this */ }
+}
+
+async function startScan() {
+  const button = document.getElementById('startBtn');
+  const note = document.getElementById('runNote');
+  button.disabled = true;
+  note.textContent = 'Sending the robot out…';
+
+  try {
+    const reply = await fetch('/api/scan/start', { method: 'POST' });
+    const body = await reply.json();
+    note.textContent = reply.ok
+      ? `Running — ${body.strategy === 'CONTACT_ONLY'
+          ? 'mapping by contact, this takes a while'
+          : 'following the walls'}.`
+      : (body.detail || 'could not start');
+  } catch (e) {
+    note.textContent = 'could not start: ' + e;
+  }
+  refreshRunState();
+}
+
+async function stopScan() {
+  const note = document.getElementById('runNote');
+  document.getElementById('stopBtn').disabled = true;
+  note.textContent = 'Stopping…';
+
+  try {
+    const reply = await fetch('/api/scan/stop', { method: 'POST' });
+    const body = await reply.json();
+    // Stop keeps the map: whoever pressed it wanted the driving to end, not
+    // the measurement, and the half-room already mapped is the point.
+    note.textContent = body.status === 'idle'
+      ? 'Nothing was running.'
+      : `Stopped. Keeping the ${body.area_m2} m² measured so far.`;
+  } catch (e) {
+    note.textContent = 'could not stop: ' + e;
+  }
+  refreshRunState();
+}
+
+async function refreshRunState() {
+  try {
+    const reply = await fetch('/api/scan/status');
+    const body = await reply.json();
+    scanRunning = body.running;
+  } catch { return; }
+
+  document.getElementById('startBtn').disabled = scanRunning;
+  document.getElementById('stopBtn').disabled = !scanRunning;
+  // Changing the sensor suite mid-run would leave half a map built one way
+  // and half the other, with no honest way to grade it.
+  document.querySelectorAll('#sensorList input')
+    .forEach(box => { box.disabled = scanRunning; });
+}
+
+loadSensors();
+refreshRoomCount();
+refreshRunState();
+setInterval(() => { refreshRunState(); refreshRoomCount(); }, 2000);
 
 resize();
 connect();

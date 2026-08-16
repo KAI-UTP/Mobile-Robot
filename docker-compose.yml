@@ -112,6 +112,16 @@ services:
       #
       #   HARDWARE=actual docker compose up -d mapper
       HARDWARE: "${HARDWARE:-simulated}"
+      # Wait for the Start button instead of sending the robot out on boot, so
+      # the sensors and the room can be set up first — which is the whole point
+      # of being able to change them.
+      #
+      #   WAIT_FOR_START=1 docker compose up -d mapper
+      #
+      # Listed here because compose passes through only what it declares: an
+      # env var set in the shell but missing from this block reaches nothing,
+      # and the setting looks configurable while silently doing nothing.
+      WAIT_FOR_START: "${WAIT_FOR_START:-}"
       # Written where the HOST can read it — see the volume below.
       POSE_FILE_PATH: /data/run/roommapper_${ROBOT_ID:-MR3W01}_pose.json
     volumes:

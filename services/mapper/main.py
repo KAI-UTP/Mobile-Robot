@@ -38,6 +38,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
+from robotmap_common.hardware import ACTUAL as ALL_HARDWARE
 from robotmap_common.hardware import Strategy
 from robotmap_common.hardware import profile as hardware_profile
 from robotmap_common.models import SensorPacket, ServiceHealth
@@ -215,15 +216,6 @@ async def set_world_geometry(request: Request) -> JSONResponse:
     payload = await request.json()
     boxes = payload.get("boxes") or []
 
-    world = getattr(app.state, "sim_world", None)
-    if world is None:
-        # Hardware mode, or no scan running. Not an error — the scene pushes
-        # geometry on a timer and should not have to know what is on the other
-        # end — but say so plainly rather than pretending it was applied.
-        return JSONResponse(
-            {"status": "ignored", "reason": "no simulator running"}, status_code=202
-        )
-
     footprints = []
     for b in boxes:
         try:
@@ -234,10 +226,25 @@ async def set_world_geometry(request: Request) -> JSONResponse:
         except (KeyError, TypeError, ValueError):
             continue
 
-    count = world.set_furniture(footprints)
-    # Remembered so a rescan starts in the room that was arranged, rather than
-    # silently reverting to the default layout mid-demo.
+    # Remembered FIRST, and always.
+    #
+    # The layout has to be settable before the robot goes out, or "arrange the
+    # room, then press Start" cannot work — and it could not: with no scan
+    # running there was no world to arrange, the request was refused, and the
+    # robot then went out into the default room. It also has to survive a
+    # rescan, which builds a fresh world and would otherwise throw the
+    # furniture away mid-demo.
     app.state.scene_geometry = footprints
+
+    world = getattr(app.state, "sim_world", None)
+    if world is None:
+        logger.info(
+            "Room layout stored: %d piece(s) — will be built when the scan starts",
+            len(footprints),
+        )
+        return JSONResponse({"status": "stored", "pieces": len(footprints)})
+
+    count = world.set_furniture(footprints)
     logger.info("Room geometry updated from the 3D scene: %d piece(s)", count)
     return JSONResponse({"status": "applied", "pieces": count})
 
@@ -246,16 +253,56 @@ async def set_world_geometry(request: Request) -> JSONResponse:
 async def get_world_geometry() -> JSONResponse:
     """What the simulator currently believes is standing in the room."""
     world = getattr(app.state, "sim_world", None)
-    if world is None:
-        return JSONResponse({"pieces": [], "source": "no simulator running"})
-
+    # Before a scan starts there is no world yet, but there may well be a
+    # layout waiting for one — that is the whole "arrange the room, then press
+    # Start" order. Reporting an empty room then would make the page show the
+    # furniture vanishing the moment it was placed.
+    pieces = (
+        world.furniture_footprints if world is not None
+        else list(app.state.scene_geometry)
+    )
     return JSONResponse({
         "pieces": [
             {"min_x_m": a, "min_y_m": b, "max_x_m": c, "max_y_m": d}
-            for a, b, c, d in world.furniture_footprints
+            for a, b, c, d in pieces
         ],
-        "source": "simulator",
+        "source": "simulator" if world is not None else "waiting for the scan to start",
     })
+
+
+@app.post("/api/hardware")
+async def set_hardware(request: Request) -> JSONResponse:
+    """Choose the sensor suite before a run.
+
+    The strategy is derived from the choice rather than selected alongside it,
+    so ticking a lidar here is the whole difference between mapping the room in
+    23 m and mapping it in 435 m. That is the point of letting anyone change it:
+    the trade-off stops being a paragraph in a README and becomes something you
+    can watch happen.
+
+    Refused while a scan is running. Changing what the robot can sense halfway
+    round a room would produce a map half-built one way and half the other, and
+    no honest way to grade it.
+    """
+    if _scan_thread is not None and _scan_thread.is_alive():
+        return JSONResponse(
+            {"error": "a scan is running — stop it before changing the sensors"},
+            status_code=409,
+        )
+
+    payload = await request.json()
+    fitted = payload.get("fitted")
+    if not isinstance(fitted, list):
+        return JSONResponse({"error": "expected {\"fitted\": [names]}"}, status_code=400)
+
+    app.state.hardware = ALL_HARDWARE.with_fitted([str(n) for n in fitted])
+    described = app.state.hardware.describe()
+    logger.info(
+        "Sensor suite set to %s — strategy %s",
+        ", ".join(d["name"] for d in described["devices"] if d["fitted"]) or "nothing",
+        described["strategy"],
+    )
+    return JSONResponse(described)
 
 
 @app.get("/api/hardware")
@@ -641,6 +688,46 @@ async def post_rescan() -> JSONResponse:
     result = await asyncio.to_thread(rescan)
     status = 409 if result["status"] in ("busy", "error") else 200
     return JSONResponse(result, status_code=status)
+
+
+@app.post("/api/scan/start")
+async def post_scan_start() -> JSONResponse:
+    """Send the robot out, with whatever sensors and room are set up now.
+
+    Same machinery as a rescan — clear the map, build a world, drive — but it
+    is the deliberate beginning of a run rather than a repeat of one. Kept as
+    its own route because "Start" and "Scan again" mean different things to
+    whoever is pressing them, and because a run that has not begun yet has no
+    previous scan to repeat.
+    """
+    result = await asyncio.to_thread(rescan)
+    status = 409 if result["status"] in ("busy", "error") else 200
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/api/scan/stop")
+async def post_scan_stop() -> JSONResponse:
+    """Stop the robot where it is, and keep what it has measured.
+
+    Deliberately NOT a reset. Someone pressing Stop wants the robot to stop
+    driving, not to lose the half-room it has already mapped — and the map so
+    far is exactly what makes stopping early worth doing, whether because it
+    has clearly gone wrong or because it has clearly finished.
+    """
+    result = await asyncio.to_thread(stop_scan)
+    return JSONResponse(result)
+
+
+@app.get("/api/scan/status")
+async def get_scan_status() -> JSONResponse:
+    """Whether the robot is out, so a browser can show the right button."""
+    running = _scan_thread is not None and _scan_thread.is_alive()
+    return JSONResponse({
+        "running": running,
+        "strategy": app.state.hardware.strategy().value,
+        "packets": pipeline.packets_processed,
+        "contacts": pipeline.contacts,
+    })
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -1288,8 +1375,55 @@ def rescan() -> dict:
             }
 
         _scan_thread = start_sim_source(stop=_scan_stop, **settings)
-        logger.info("Scan restarted (room=%s)", settings["room"])
-        return {"status": "restarted", "room": settings["room"]}
+        logger.info(
+            "Scan started (room=%s, strategy=%s)",
+            settings["room"], app.state.hardware.strategy().value,
+        )
+        return {
+            "status": "restarted",
+            "room": settings["room"],
+            "strategy": app.state.hardware.strategy().value,
+        }
+    finally:
+        _scan_lock.release()
+
+
+def stop_scan() -> dict:
+    """Halt the robot, keeping the map it has built so far.
+
+    Not a reset. Whoever presses Stop wants the driving to end, not the
+    measurement — and the half-room already mapped is the reason stopping early
+    is worth doing at all, whether the run has clearly gone wrong or clearly
+    finished.
+    """
+    global _scan_thread
+
+    if not _scan_lock.acquire(blocking=False):
+        return {"status": "busy", "detail": "a restart is already in progress"}
+
+    try:
+        if _scan_thread is None or not _scan_thread.is_alive():
+            return {"status": "idle", "detail": "no scan is running"}
+
+        _scan_stop.set()
+        _scan_thread.join(timeout=10.0)
+        still_going = _scan_thread.is_alive()
+        if not still_going:
+            _scan_thread = None
+
+        room = pipeline.room
+        logger.info(
+            "Scan stopped by request — keeping %s",
+            f"{room.area_m2:.2f} m2 measured so far" if room else "an empty map",
+        )
+        return {
+            "status": "stopping" if still_going else "stopped",
+            "area_m2": round(room.area_m2, 2) if room else 0.0,
+            "detail": (
+                "the robot did not stop within 10 s; it will halt shortly"
+                if still_going else "robot halted; the map so far is kept"
+            ),
+        }
     finally:
         _scan_lock.release()
 
@@ -1335,6 +1469,16 @@ def main() -> None:
             "driving into things. See robotmap_common.hardware."
         ),
     )
+    parser.add_argument(
+        "--wait-for-start",
+        action="store_true",
+        default=os.environ.get("WAIT_FOR_START", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Do not send the robot out on boot; wait for Start. Lets the "
+            "sensor suite and the room be set up first, which is the whole "
+            "point of being able to change them."
+        ),
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument(
@@ -1363,7 +1507,15 @@ def main() -> None:
             "sweep": not args.no_sweep,
         }
         global _scan_thread
-        _scan_thread = start_sim_source(stop=_scan_stop, **app.state.sim_settings)
+        if args.wait_for_start:
+            logger.info(
+                "Waiting for Start. Choose the sensors and arrange the room "
+                "first — both change what the robot does."
+            )
+        else:
+            _scan_thread = start_sim_source(
+                stop=_scan_stop, **app.state.sim_settings
+            )
     else:
         start_mqtt_source()
 
