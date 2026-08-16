@@ -21,7 +21,4 @@ from test_kit_measured_room import FakeStage, _load_kit_module  # noqa: E402
 def kit():
     stage = FakeStage()
     module = _load_kit_module(stage)
-    # No test reaches the network; see the note in test_kit_measured_room.py.
-    module.real_room_has_furniture = module.room_has_furniture
-    module.room_has_furniture = lambda: True
     return module, stage

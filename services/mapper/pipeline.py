@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from localization.fusion import FilterConfig, PoseFilter
 from mapping.costmap import Costmap
 from mapping.occupancy_grid import OccupancyGrid
-from mapping.room_extraction import RoomExtractor
+from mapping.room_extraction import RoomExtractor, _point_in_polygon
 from robotmap_common.geometry import RobotGeometry
 from robotmap_common.models import (
     MapSnapshot,
@@ -171,6 +171,59 @@ class MappingPipeline:
         """
         with self._lock:
             return self.grid.explored_cells()
+
+    def floor_outside_outline_pct(self) -> float:
+        """How much of the robot's own path lies OUTSIDE the outline it reports.
+
+        The one question the quality grade never asked, and the one that
+        catches a scan being confidently wrong. `is_closed`, `coverage_pct` and
+        pose confidence all measure *internal consistency*, and a robot that
+        maps half a room very tidily scores well on every one of them. Measured
+        on a furnished room: a 12.93 m2 outline of a 27 m2 room, boundary
+        closed, 94 % coverage, graded GOOD.
+
+        Judged on the driven path rather than on observed free space. Free
+        space was the obvious choice and it is far too generous: rays that
+        leave through the doorway mark floor outside the room, and the robot's
+        own footprint paints cells past the wall it is hugging. Measured on the
+        26.63 m2 scan of a 27.0 m2 room — a result accurate to 1.4 % — half the
+        free cells sat outside the outline, so the check condemned the best
+        scan the system produces.
+
+        The path has no such ambiguity. The robot cannot drive through walls,
+        so anywhere it has been is inside the room, and an outline that
+        excludes where it has been is too small. It needs no ground truth,
+        which matters because with real hardware there is none.
+
+        What this does NOT catch
+        ------------------------
+        A lap that closed early. In the furnished room the robot stopped after
+        a fraction of the room, so it never drove outside the small outline it
+        reported and this reads 0.3 % — the outline is consistent with the path
+        because the path was cut short too. Measured:
+
+            empty room      26.63 m2 of 27.0     0.0 % outside   correct
+            furnished room  12.89 m2 of 27.0     0.3 % outside   MISSED
+
+        Catching that needs evidence about floor the robot never reached, and
+        the obvious source — observed free space — is unusable here: dead
+        reckoning drift inflates it until half of it sits outside even a good
+        outline. See the note above. The under-reporting of furnished rooms is
+        a known open problem and this is not the fix for it.
+
+        Returns 0.0 when there is no outline to judge.
+        """
+        with self._lock:
+            if self.room is None or len(self.room.polygon) < 3:
+                return 0.0
+            if not self.trail:
+                return 0.0
+
+            polygon = [(p.x_m, p.y_m) for p in self.room.polygon]
+            outside = sum(
+                1 for x, y in self.trail if not _point_in_polygon(x, y, polygon)
+            )
+            return outside / len(self.trail) * 100.0
 
     def freeze_outline(self) -> None:
         """Keep the outline measured so far, and stop revising it.

@@ -58,6 +58,9 @@ class ScanQuality:
     is_closed: bool = False
     coverage_pct: float = 0.0
     pose_confidence: float = 0.0
+    # Observed floor lying outside the reported outline. Non-zero means the
+    # boundary closed somewhere it should not have; see `assess_quality`.
+    floor_outside_pct: float = 0.0
     grade: str = "UNUSABLE"
     reasons: list[str] = field(default_factory=list)
 
@@ -130,8 +133,20 @@ class Scan:
         }
 
 
+#: How much observed floor may lie outside the outline before the outline is
+#: judged to be in the wrong place. Some overshoot is normal and harmless: the
+#: robot's own footprint paints free cells a little past the wall it is hugging,
+#: and the outline is simplified. A room measured properly runs a few per cent.
+#: A boundary that closed early runs far higher — the furnished-room failure
+#: that prompted this had most of the floor it had seen sitting outside.
+FLOOR_OUTSIDE_LIMIT_PCT = 15.0
+
+
 def assess_quality(
-    is_closed: bool, coverage_pct: float, pose_confidence: float
+    is_closed: bool,
+    coverage_pct: float,
+    pose_confidence: float,
+    floor_outside_pct: float = 0.0,
 ) -> ScanQuality:
     """Grade a scan, and say why.
 
@@ -145,6 +160,21 @@ def assess_quality(
       hole-filling rather than anything a sensor saw.
     * Below 0.3 pose confidence the map is not reliably self-consistent, so
       the outline may not close on the truth even if it closes on itself.
+    * Floor observed OUTSIDE the outline means the outline is in the wrong
+      place, however tidy it looks.
+
+    That last one exists because the first three are all measures of *internal
+    consistency*, and a robot that maps half a room very tidily scores well on
+    every one of them. The robot cannot drive through walls, so a path that
+    leaves the outline proves the outline is not the wall — evidence the robot
+    collects itself, needing no ground truth, which matters because with real
+    hardware there is none.
+
+    It does not catch everything. A lap that closes EARLY produces an outline
+    that is too small and a path that never leaves it, because both were cut
+    short together: the furnished room reports 12.89 m2 of 27.0 with 0.3 % of
+    the path outside. That failure is still open and is not addressed here.
+    See `MappingPipeline.floor_outside_outline_pct`.
     """
     reasons: list[str] = []
 
@@ -161,9 +191,17 @@ def assess_quality(
         reasons.append(
             "position estimate drifted; re-scan from the starting point"
         )
+    if floor_outside_pct >= FLOOR_OUTSIDE_LIMIT_PCT:
+        reasons.append(
+            f"{floor_outside_pct:.0f}% of the floor the robot saw lies OUTSIDE "
+            "this outline — the boundary closed early, so the area is too small"
+        )
 
     if not is_closed:
         grade = "UNUSABLE"
+    elif floor_outside_pct >= FLOOR_OUTSIDE_LIMIT_PCT:
+        # However tidy the outline is, it is not the room.
+        grade = "POOR"
     elif coverage_pct >= 85.0 and pose_confidence >= 0.6:
         grade = "GOOD"
     elif coverage_pct >= 60.0 and pose_confidence >= 0.3:
@@ -175,6 +213,7 @@ def assess_quality(
         is_closed=is_closed,
         coverage_pct=coverage_pct,
         pose_confidence=pose_confidence,
+        floor_outside_pct=floor_outside_pct,
         grade=grade,
         reasons=reasons,
     )

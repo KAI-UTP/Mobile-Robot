@@ -479,19 +479,40 @@ def _prim_placement(prim):
     translate, _rotate, scale = vectors[0], vectors[1], vectors[2]
     cx, cy = float(translate[0]), float(translate[1])
 
-    radius = getattr(prim, "radius", None)
-    if radius is None:
-        try:
-            radius = prim.GetRadiusAttr().Get()
-        except Exception:
-            radius = None
+    # Read through GetAttribute rather than the typed schema getters.
+    #
+    # `GetChildren()` hands back plain `Usd.Prim` objects, which have no
+    # `GetRadiusAttr` — only the typed `UsdGeom.Cylinder` wrapper does. Calling
+    # it therefore failed for every cylinder, and each one fell through to the
+    # box branch and was measured by its scale, which a cylinder never sets.
+    # Every table and chair leg was reported as a 1.0 x 1.0 m obstacle: the
+    # live push contained a 1 m box for a 0.035 m leg, and a room furnished
+    # like that has almost no floor left to drive on.
+    radius = _attr(prim, "radius")
 
     if radius:
-        # A cylinder's scale is uniform unless someone stretched it.
-        return (cx, cy), (float(radius) * float(scale[0]),
-                          float(radius) * float(scale[1]))
+        # Cylinders are round; the footprint is the square that contains them.
+        return (cx, cy), (float(radius) * abs(float(scale[0])),
+                          float(radius) * abs(float(scale[1])))
 
-    return (cx, cy), (abs(float(scale[0])) / 2.0, abs(float(scale[1])) / 2.0)
+    # Cubes carry a unit size scaled to the extents they were drawn with.
+    size = _attr(prim, "size") or 1.0
+    return (cx, cy), (abs(float(scale[0])) * float(size) / 2.0,
+                      abs(float(scale[1])) * float(size) / 2.0)
+
+
+def _attr(prim, name):
+    """One USD attribute, or None if this prim has no such thing."""
+    try:
+        attribute = prim.GetAttribute(name)
+    except Exception:
+        return None
+    if not attribute:
+        return None
+    try:
+        return attribute.Get()
+    except Exception:
+        return None
 
 
 class GeometryPublisher:
@@ -691,32 +712,6 @@ class DemoPose:
 def _shortest_angle(target, current):
     diff = (target - current + 180.0) % 360.0 - 180.0
     return diff + 360.0 if diff <= -180.0 else diff
-
-
-def room_has_furniture() -> bool:
-    """Does the room the mapper is simulating actually contain furniture?
-
-    Asked rather than assumed, because assuming is how this scene ended up
-    showing a table, four chairs and a sofa in a room the robot knew to be
-    empty. The robot drove straight through all of it, the 2D map came back a
-    bare rectangle, and three views disagreed about the same room.
-
-    Falls back to drawing the furniture when the mapper cannot be reached, so
-    the scene is still worth looking at on its own — but says so, because a
-    silent fallback is what made the original mismatch invisible.
-    """
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(f"{MAPPER_URL}/api/world", timeout=1.5) as reply:
-            world = json.loads(reply.read().decode("utf-8"))
-    except Exception:
-        print("[room] no mapper reachable — drawing the demo furniture")
-        return True
-
-    furniture = [b for b in world.get("boxes", []) if b.get("kind") == "furniture"]
-    print(f"[room] mapper reports '{world.get('name')}' with {len(furniture)} furniture pieces")
-    return bool(furniture)
 
 
 def build_camera(stage):
@@ -1147,10 +1142,22 @@ def build_room():
     UsdGeom.Xform.Define(stage, Sdf.Path(ROOT))
 
     build_shell(stage)
-    if room_has_furniture():
-        build_furniture(stage)
-    else:
-        print("[room] the mapper's room is empty — drawing no furniture")
+
+    # The furniture is always drawn, and the simulator is then told about it.
+    #
+    # This used to ask the mapper what was in the room and draw only that,
+    # which was the right answer when the scene was a *view* of the world: a
+    # view that decorates itself is a lie, and it was one — a table, four
+    # chairs and a sofa rendered in a room the robot knew to be bare, which it
+    # drove straight through.
+    #
+    # The direction is now the other way round. This scene IS the world, so
+    # what is drawn here is what exists, and `GeometryPublisher` pushes it to
+    # the simulator on the first frame. Both views agree as before, but they
+    # agree on the room you can reach into and rearrange rather than on one
+    # hardcoded somewhere else. Drawing nothing would leave nothing to drag.
+    build_furniture(stage)
+
     build_beacons(stage)
     build_lighting(stage)
     build_all_robots(stage)

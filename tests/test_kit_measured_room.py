@@ -55,6 +55,31 @@ class FakePrim:
     def GetPrim(self): return self
     def __bool__(self): return True
 
+    def GetAttribute(self, name):
+        """USD's generic attribute access, which is all a plain `Usd.Prim` has.
+
+        Modelled deliberately: `GetChildren()` returns untyped prims, so the
+        typed getters (`GetRadiusAttr` and friends) are NOT available on them.
+        The stub used to expose `.radius` directly, which let a bug through —
+        every cylinder fell out of the radius branch and was measured by its
+        scale instead, reporting a 0.035 m table leg as a 1.0 x 1.0 m obstacle.
+        """
+        values = {
+            "radius": self.radius,
+            "height": self.height,
+            "size": self.attrs.get("CreateSizeAttr"),
+        }
+        value = values.get(name)
+        if value is None:
+            return None
+
+        class _Attr:
+            def __bool__(self): return True
+            @staticmethod
+            def Get(): return value
+
+        return _Attr()
+
     def GetPath(self):
         return types.SimpleNamespace(pathString=self.path)
 
@@ -798,16 +823,20 @@ def test_it_only_needs_the_standard_library(kit):
     assert json is not None and math is not None and sys is not None
 
 
-# ── Asking the mapper what is in the room ────────────────────────────────────
+# ── The scene is the world, so it draws the world ────────────────────────────
 #
-# The scene used to draw a table, four chairs and a sofa unconditionally, so a
-# room the robot knew to be empty was rendered furnished, the robot drove
-# straight through it all, and the 2D map came back a bare rectangle. Three
-# views, three different rooms. This is the fix, so it is worth testing.
+# This used to ask the mapper what was in the room and draw only that. That was
+# right when the scene was a *view*: a view that decorates itself is a lie, and
+# it was one — a table, four chairs and a sofa rendered in a room the robot knew
+# to be bare, which it drove straight through.
+#
+# The direction is now reversed. The scene IS the world, so what it draws is
+# what exists, and GeometryPublisher tells the simulator. Both halves still
+# agree; they now agree on the room you can reach into and rearrange.
 
 
 def _stub_fetch(payload=None, fail=False):
-    """Answer `room_has_furniture`'s HTTP call without a network."""
+    """Answer an HTTP call from the scene without a network."""
     import contextlib
 
     @contextlib.contextmanager
@@ -825,51 +854,27 @@ def _stub_fetch(payload=None, fail=False):
     return fake_urlopen
 
 
-def test_a_furnished_room_is_drawn_furnished(kit, monkeypatch):
-    module, _ = kit
-    payload = {"name": "Furnished room", "boxes": [
-        {"kind": "wall"}, {"kind": "furniture"}, {"kind": "furniture"},
-    ]}
-    monkeypatch.setattr(
-        "urllib.request.urlopen", _stub_fetch(payload)
-    )
-    assert module.real_room_has_furniture() is True
-
-
-def test_an_empty_room_is_drawn_empty(kit, monkeypatch):
-    """The bug this exists to prevent: furniture on screen that the robot
-    cannot touch, because the room it is driving in does not contain it."""
-    module, _ = kit
-    payload = {"name": "Empty rectangular room", "boxes": [
-        {"kind": "wall"}, {"kind": "wall"},
-    ]}
-    monkeypatch.setattr(
-        "urllib.request.urlopen", _stub_fetch(payload)
-    )
-    assert module.real_room_has_furniture() is False
-
-
-def test_no_mapper_falls_back_to_the_demo_furniture(kit, monkeypatch):
-    """The scene has to be worth looking at on its own — someone opening it
-    without the stack running should still see a room."""
-    module, _ = kit
-    monkeypatch.setattr(
-        "urllib.request.urlopen", _stub_fetch(fail=True)
-    )
-    assert module.real_room_has_furniture() is True
-
-
-def test_an_empty_room_builds_no_furniture_prims(kit, monkeypatch):
-    """End to end: the answer actually changes what lands on the stage."""
+def test_the_room_is_furnished_so_there_is_something_to_move(kit):
+    """Requirement: rearrange the room and see what the robot does. An empty
+    scene has nothing to rearrange."""
     module, stage = kit
-    module.room_has_furniture = lambda: False
     module.build_room()
 
-    furniture = [
-        path for path in stage.prims
-        if any(k in path for k in ("Sofa", "Table", "Chair"))
-    ]
-    assert not furniture, f"furniture drawn in an empty room: {furniture}"
+    furniture = [p for p in stage.prims if "/Furniture/" in p]
+    assert furniture, "nothing in the room to drag"
+
+
+def test_what_is_drawn_is_what_the_simulator_is_told(kit):
+    """The two halves agreeing is the whole point, and this is now the
+    mechanism: the scene draws it, then reports exactly that."""
+    module, stage = kit
+    module.build_room()
+
+    drawn = [p for p in stage.prims if "/Furniture/" in p and "Rug" not in p]
+    reported = module.furniture_footprints(stage)
+
+    assert drawn and reported
+    assert len(reported) <= len(drawn)
 
 
 # ── Where the robot's position comes from ────────────────────────────────────

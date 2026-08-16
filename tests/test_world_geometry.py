@@ -201,3 +201,52 @@ def test_moving_something_does_push(kit, monkeypatch):
 
     assert publisher.poll(2.0) is True
     assert len(posts) == 2
+
+
+def test_a_table_leg_is_not_a_metre_wide_obstacle(kit):
+    """The bug that reached the live stack: 35 pieces pushed to the simulator,
+    and every table and chair leg among them was a 1.0 x 1.0 m box.
+
+    `GetChildren()` hands back plain `Usd.Prim` objects, which have no
+    `GetRadiusAttr` — only the typed `UsdGeom.Cylinder` wrapper does. So every
+    cylinder fell out of the radius branch into the box branch and was measured
+    by its scale, which a cylinder never sets, leaving the default of 1. A room
+    furnished with metre-wide legs has almost no floor left to drive on.
+    """
+    module, stage = kit
+    module.build_room()
+
+    for min_x, min_y, max_x, max_y in module.furniture_footprints(stage):
+        width, depth = max_x - min_x, max_y - min_y
+        assert width < 2.6 and depth < 2.6, (
+            f"a {width:.2f} x {depth:.2f} m piece of furniture in a 6.0 x 4.5 m room"
+        )
+
+
+def test_the_legs_are_leg_sized(kit):
+    """A 0.035 m radius leg is 0.07 m across, not 1.0."""
+    module, stage = kit
+    module.build_room()
+
+    legs = [p for path, p in stage.prims.items() if "Leg" in path or "leg" in path]
+    assert legs, "this room has no legs to check"
+
+    boxes = module.furniture_footprints(stage)
+    smallest = min((max_x - min_x) for min_x, _, max_x, _ in boxes)
+    assert smallest < 0.2, f"smallest piece is {smallest:.2f} m — legs were mismeasured"
+
+
+def test_the_room_still_has_floor_to_drive_on(kit):
+    """The consequence worth stating in its own right: whatever the scene
+    pushes has to leave a room the robot can actually move around in."""
+    module, stage = kit
+    module.build_room()
+
+    covered = sum(
+        (max_x - min_x) * (max_y - min_y)
+        for min_x, min_y, max_x, max_y in module.furniture_footprints(stage)
+    )
+    # Overlapping footprints make this an overestimate, which is the safe
+    # direction: if even the overestimate leaves most of the floor clear, the
+    # room is drivable.
+    assert covered < 0.5 * (6.0 * 4.5), f"{covered:.1f} m2 of a 27 m2 room is furniture"

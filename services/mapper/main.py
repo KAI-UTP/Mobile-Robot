@@ -373,6 +373,10 @@ def save_current_scan(name: str | None = None, replace: str | None = None) -> di
         is_closed=room.is_closed,
         coverage_pct=room.coverage_pct,
         pose_confidence=pose.position_confidence if pose else 0.0,
+        # The check that catches a scan being confidently wrong: floor the
+        # robot has seen but not enclosed. Everything above it measures
+        # internal consistency, which half a room can satisfy perfectly.
+        floor_outside_pct=pipeline.floor_outside_outline_pct(),
     )
 
     previous = store.load(replace) if replace else None
