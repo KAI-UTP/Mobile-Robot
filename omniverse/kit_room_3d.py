@@ -37,6 +37,7 @@ import math
 import os
 import random
 import tempfile
+import time
 
 import omni.kit.app
 import omni.usd
@@ -57,6 +58,14 @@ MQTT_HOST = "localhost"
 SHOW_ODOMETRY_GHOST = True
 SHOW_RSSI_MARKER = True
 SHOW_BEACON_RANGES = False   # rings showing inferred distance; busy but instructive
+
+# Build the room the ROBOT drew, standing beside the real one — the two-screen
+# comparison, in 3D, in Omniverse rather than in a browser canvas. Read live
+# from the mapper over plain HTTP, so nothing needs installing inside Kit.
+SHOW_MEASURED = True
+MAPPER_URL = "http://localhost:8080"
+MEASURED_GAP_M = 2.0         # clear floor between the two rooms
+MEASURED_POLL_S = 2.0        # the outline changes far more slowly than the pose
 
 # Measured mean error of RSSI trilateration in this room, from
 # tests/test_rssi_accuracy.py. Used to animate the marker realistically when
@@ -84,6 +93,14 @@ COL_ODOM       = (0.25, 0.80, 0.35)
 COL_RSSI       = (0.95, 0.55, 0.15)
 COL_BEACON     = (0.85, 0.25, 0.75)
 COL_TRAIL      = (0.95, 0.60, 0.20)
+
+# The measured half. Deliberately cooler and flatter than the physical room:
+# one side is a place, the other is a measurement, and they should not be
+# mistaken for each other at a glance.
+COL_MEAS_PAD   = (0.12, 0.14, 0.18)
+COL_MEAS_WALL  = (0.25, 0.73, 0.31)   # green once the boundary closes
+COL_MEAS_OPEN  = (0.82, 0.60, 0.13)   # amber while it is still open
+COL_MEAS_BLOCK = (0.97, 0.32, 0.29)   # blocked floor: furniture in the way
 
 ROOT = "/World/RoomScan"
 
@@ -393,10 +410,186 @@ def _shortest_angle(target, current):
     return diff + 360.0 if diff <= -180.0 else diff
 
 
+# ── The room the robot drew ─────────────────────────────────────────────────
+
+
+class MeasuredRoom:
+    """The robot's own map, built beside the real room.
+
+    This is the second screen. The left room is the place; this one is what the
+    robot worked out from range readings and dead reckoning, and putting them
+    side by side in the same 3D view is the entire claim of a digital twin —
+    you can see the error rather than read it off a number.
+
+    Read over plain HTTP with `urllib`, which is in the standard library, so
+    Kit needs no packages installed. The outline changes far more slowly than
+    the pose, so it is polled every couple of seconds rather than every frame.
+
+    Placed by its own bounding box, not by its coordinates
+    -----------------------------------------------------
+    The measured polygon lives in the pose estimate's frame, whose origin is
+    wherever the robot happened to start and whose axes are however it happened
+    to be facing. Those numbers are meaningless to place a model by. What is
+    meaningful is the SHAPE, so the outline is translated to sit on its own pad
+    and the two rooms are compared as shapes. `/compare` in the web UI scores
+    that properly, with rotation and IoU; this is the version you can walk
+    around.
+    """
+
+    def __init__(self, stage, origin_x, origin_y):
+        self.stage = stage
+        self.origin_x = origin_x
+        self.origin_y = origin_y
+        self.root = f"{ROOT}/Measured"
+        self._signature = None
+        self._next_poll = 0.0
+        self.summary = "waiting for the mapper"
+
+        UsdGeom.Xform.Define(stage, Sdf.Path(self.root))
+        self._build_pad()
+
+    # ── Data ──────────────────────────────────────────────────────────────
+
+    def poll(self, now):
+        """Fetch the room if it is time. Returns True if the scene changed."""
+        if now < self._next_poll:
+            return False
+        self._next_poll = now + MEASURED_POLL_S
+
+        room = self._fetch()
+        if room is None:
+            return False
+
+        # Rebuilding every poll would delete and recreate a hundred prims two
+        # seconds apart for no reason, and the viewport flickers while it
+        # happens. Only a room that actually changed is worth redrawing.
+        signature = (
+            round(room.get("area_m2", 0.0), 3),
+            len(room.get("polygon", [])),
+            len(room.get("obstacles", [])),
+            round(room.get("blocked_area_m2", 0.0), 3),
+            bool(room.get("is_closed")),
+        )
+        if signature == self._signature:
+            return False
+        self._signature = signature
+
+        self.rebuild(room)
+        return True
+
+    def _fetch(self):
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(f"{MAPPER_URL}/api/room", timeout=1.5) as reply:
+                if reply.status != 200:
+                    return None
+                return json.loads(reply.read().decode("utf-8"))
+        except Exception:
+            # No mapper running, or no room measured yet. Neither is an error
+            # worth printing every two seconds — the left room is still worth
+            # looking at on its own.
+            return None
+
+    # ── Geometry ──────────────────────────────────────────────────────────
+
+    def _build_pad(self):
+        """A dark slab the measurement sits on, so it reads as a drawing."""
+        box(
+            self.stage,
+            f"{self.root}/Pad",
+            (self.origin_x + ROOM_W / 2, self.origin_y + ROOM_H / 2, -0.03),
+            (ROOM_W + 0.6, ROOM_H + 0.6, 0.06),
+            COL_MEAS_PAD,
+        )
+
+    def _clear(self):
+        for name in ("Outline", "Blocked"):
+            path = Sdf.Path(f"{self.root}/{name}")
+            if self.stage.GetPrimAtPath(path):
+                self.stage.RemovePrim(path)
+        UsdGeom.Xform.Define(self.stage, Sdf.Path(f"{self.root}/Outline"))
+        UsdGeom.Xform.Define(self.stage, Sdf.Path(f"{self.root}/Blocked"))
+
+    def rebuild(self, room):
+        polygon = room.get("polygon") or []
+        if len(polygon) < 3:
+            return
+
+        self._clear()
+
+        xs = [p["x_m"] for p in polygon]
+        ys = [p["y_m"] for p in polygon]
+        min_x, min_y = min(xs), min(ys)
+
+        def place(x, y):
+            """Pose frame -> this pad, centred on the pad rather than dumped in
+            a corner."""
+            width, height = max(xs) - min_x, max(ys) - min_y
+            return (
+                self.origin_x + (x - min_x) + (ROOM_W - width) / 2,
+                self.origin_y + (y - min_y) + (ROOM_H - height) / 2,
+            )
+
+        closed = bool(room.get("is_closed"))
+        colour = COL_MEAS_WALL if closed else COL_MEAS_OPEN
+
+        # The outline, extruded. Drawn as a low wall rather than a flat line so
+        # it reads as a room from the same viewing angle as the real one.
+        for index in range(len(polygon)):
+            ax, ay = place(polygon[index]["x_m"], polygon[index]["y_m"])
+            nxt = polygon[(index + 1) % len(polygon)]
+            bx, by = place(nxt["x_m"], nxt["y_m"])
+
+            length = math.hypot(bx - ax, by - ay)
+            if length < 1e-6:
+                continue
+
+            prim = box(
+                self.stage,
+                f"{self.root}/Outline/Wall_{index}",
+                ((ax + bx) / 2, (ay + by) / 2, 0.30),
+                (length, 0.06, 0.60),
+                colour,
+                opacity=0.85,
+            )
+            UsdGeom.XformCommonAPI(prim).SetRotate(
+                Gf.Vec3f(0.0, 0.0, math.degrees(math.atan2(by - ay, bx - ax)))
+            )
+
+        # Blocked floor. Low translucent slabs, not furniture-shaped models:
+        # the robot measured a footprint on the floor, not a table, and drawing
+        # a table would claim knowledge it does not have. Compare them against
+        # the real furniture in the left room by eye.
+        for index, obstacle in enumerate(room.get("obstacles") or []):
+            cx, cy = place(obstacle["centre_x_m"], obstacle["centre_y_m"])
+            width = max(0.05, obstacle["max_x_m"] - obstacle["min_x_m"])
+            depth = max(0.05, obstacle["max_y_m"] - obstacle["min_y_m"])
+            box(
+                self.stage,
+                f"{self.root}/Blocked/Area_{index}",
+                (cx, cy, 0.09),
+                (width, depth, 0.18),
+                COL_MEAS_BLOCK,
+                opacity=0.55,
+            )
+
+        area = room.get("area_m2", 0.0)
+        blocked = room.get("blocked_area_m2", 0.0)
+        self.summary = (
+            f"{area:.2f} m2 floor, {blocked:.2f} m2 blocked by "
+            f"{len(room.get('obstacles') or [])} obstacle(s), "
+            f"{max(0.0, area - blocked):.2f} m2 usable, "
+            f"{'closed' if closed else 'OPEN'}"
+        )
+        print(f"[room] measured: {self.summary}")
+
+
 class RoomScene:
-    def __init__(self, stage, source):
+    def __init__(self, stage, source, measured=None):
         self.stage = stage
         self.source = source
+        self.measured = measured
         self.subscription = None
 
         self.x = self.y = self.heading = 0.0
@@ -423,6 +616,12 @@ class RoomScene:
             api.SetRotate(Gf.Vec3f(0.0, 0.0, heading))
 
     def _on_update(self, event):
+        # Polled before the early return below, so the measured room keeps
+        # updating even when no pose is arriving — the map is still being
+        # refined by a robot this scene cannot see.
+        if self.measured is not None:
+            self.measured.poll(time.monotonic())
+
         pose = self.source.read()
         if not pose:
             return
@@ -493,10 +692,17 @@ def build_room():
     build_all_robots(stage)
 
     print()
-    print("  blue     = where the robot is")
-    print("  green    = wheel odometry     (0.07 m mean error, measured)")
-    print("  orange   = Bluetooth RSSI     (2.71 m mean error, measured)")
-    print("  magenta  = BLE beacons")
+    print("  LEFT — the room that exists")
+    print("    blue     = where the robot is")
+    print("    green    = wheel odometry     (0.07 m mean error, measured)")
+    print("    orange   = Bluetooth RSSI     (2.71 m mean error, measured)")
+    print("    magenta  = BLE beacons")
+    if SHOW_MEASURED:
+        print()
+        print("  RIGHT — the room the robot drew")
+        print("    green    = outline, boundary closed")
+        print("    amber    = outline, boundary still open")
+        print("    red      = blocked floor: furniture it cannot drive over")
     print()
     return stage
 
@@ -507,13 +713,22 @@ def run_room():
 
     stage = build_room()
 
+    measured = None
+    if SHOW_MEASURED:
+        # Placed to the right of the real room, with clear floor between, so
+        # one orbit of the viewport takes in both.
+        measured = MeasuredRoom(stage, ROOM_W + MEASURED_GAP_M, 0.0)
+        if not measured.poll(0.0):
+            print(f"[room] no room from the mapper at {MAPPER_URL} yet")
+            print("       start services/mapper/main.py --source sim")
+
     source = FilePose()
     if source.read() is None:
         print("[room] no live pose found — running the built-in demo lap")
         print("       start services/twin-control/main.py for live data")
         source = DemoPose()
 
-    _scene = RoomScene(stage, source)
+    _scene = RoomScene(stage, source, measured)
     _scene.start()
 
 
