@@ -235,6 +235,16 @@ class SensorPacket(BaseModel):
 
     bumper_active: bool = Field(default=False)
 
+    # What the servos report they are ACTUALLY doing, as opposed to what they
+    # were told to do. On a robot with no bumper and no range sensors this is
+    # the only evidence a collision ever produces: a wheel that is delivering a
+    # fraction of its commanded speed, at high load, is a wheel with something
+    # solid in front of it. See `robotmap_common.collision`.
+    #
+    # Rim speed in metres per second, and load normalised to 0..1.
+    wheel_speeds_mps: list[float] | None = Field(default=None)
+    wheel_loads: list[float] | None = Field(default=None)
+
     @field_validator("wheel_ticks")
     @classmethod
     def validate_wheel_ticks(cls, v: list[int] | None) -> list[int] | None:

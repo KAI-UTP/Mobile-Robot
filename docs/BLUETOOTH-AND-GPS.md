@@ -114,12 +114,17 @@ Two possibilities, and Shebaro's answer will settle it:
    an HC-05 tops out around 460 kbaud, so the servos may need reconfiguring to
    a slower rate first.
 
-### `services/bt-bridge` is now superseded
+### `services/bt-bridge` has been deleted
 
 That service parsed `SensorPacket` JSON arriving over a Bluetooth serial link —
 it assumed something on the robot was *generating* that JSON. With no
-microcontroller, nothing is. It is kept for the ESP32 route in
-`firmware/esp32_robot/`, and is not part of the servo-bus path.
+microcontroller, nothing is: the packets are assembled on the PC, which is
+already the far end of the link, so bridging them to the PC is a round trip to
+nowhere.
+
+It was removed rather than kept, because a README advertising a workflow that
+cannot work costs more than the code saves. `git log` has it if a tetherless
+build ever revives the idea.
 
 ---
 

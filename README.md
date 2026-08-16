@@ -437,13 +437,9 @@ pins it.
         ┌──────────────────────────────┐
         │  Robot (ESP32)               │
         │  encoders · IMU · sonar · GPS│
-        └───────┬──────────────┬───────┘
-                │ WiFi/MQTT    │ BLE / HC-05
-                │              ▼
-                │      ┌───────────────┐
-                │      │  bt-bridge    │ serial → MQTT
-                │      └───────┬───────┘
-                ▼              ▼
+        └───────┬──────────────────────┘
+                │ MQTT
+                ▼
         ┌──────────────────────────────┐
         │  Mosquitto  roommapper/…/raw │
         └───────────────┬──────────────┘
@@ -495,14 +491,13 @@ Mobile Robot/
 │   ├── pilot/                  Autonomous scan on real hardware, with limits
 │   ├── localization/fusion.py  Odometry + IMU + gated GPS → pose
 │   ├── mapping/                Log-odds grid → room polygon + area
-│   ├── mapper/                 Pipeline + live web UI
-│   └── bt-bridge/              Bluetooth serial → MQTT
+│   └── mapper/                 Pipeline + live web UI
 ├── autonomy/                   Where the robot decides to drive
-│   ├── explorer.py             Wall-following: measures the boundary
-│   └── coverage.py             Row-by-row sweep: finds what is on the floor
+│   ├── bump_explorer.py        Contact-only: what THIS robot can actually run
+│   ├── explorer.py             Wall-following: needs range sensors
+│   └── coverage.py             Row-by-row sweep: needs range sensors
 ├── simulator/                  Virtual robot and world, for hardware-free dev
-├── firmware/esp32_robot/       Superseded — kept for the microcontroller route
-├── tests/                      875 tests
+├── tests/                      1076 tests
 └── docs/
     ├── OMNIVERSE.md            Movement: Omniverse then real robot
     ├── HARDWARE.md             BOM, wiring, calibration
@@ -516,8 +511,20 @@ Mobile Robot/
 **There is no microcontroller.** Three Feetech STS3215 12 V bus servos are
 daisy-chained to a servo bus board; the board takes 12 V from an adapter and
 speaks to the PC over USB-C. Everything else — odometry, mapping, autonomy —
-runs on the PC. `firmware/esp32_robot/` is from the earlier design and is not
-used; see [docs/HARDWARE.md](docs/HARDWARE.md).
+runs on the PC. See [docs/HARDWARE.md](docs/HARDWARE.md).
+
+**There are no range sensors either**, which decides which autonomy can run:
+
+| Strategy | Needs | On this robot |
+|---|---|---|
+| `bump_explorer.py` | contact only | ✅ runs today |
+| `explorer.py` (wall-following) | side + front ranges | ❌ cannot run |
+| `coverage.py` (row-by-row sweep) | forward + side ranges | ❌ cannot run |
+
+The range-sensor path is kept deliberately, not by neglect: it is the
+measured upgrade case. Same room, same code, the only difference being one
+sensor — **1.4 % error with ranges, ~10 % without**. That number is what a
+decision to fit a sensor should rest on.
 
 **1. Find the bus and check the wiring.**
 
@@ -561,15 +568,16 @@ against the virtual robot. That is the point of keeping them in `autonomy/`
 with no simulator types in their signatures: a passing test says something
 about the hardware.
 
-**Bluetooth instead of USB?** Find the port, then bridge it:
+**Bluetooth instead of USB?** Not available. That path needed something on the
+robot generating `SensorPacket` JSON to send over a serial link, and with no
+microcontroller nothing does — the packets are assembled on the PC, which is
+already the far end of the link. `services/bt-bridge` was deleted rather than
+left in the README as a workflow that cannot work; `git log` has it if a
+tetherless build ever revives the idea.
 
-```bash
-python services/bt-bridge/main.py --list
-```
-
-```bash
-python services/bt-bridge/main.py --port COM5
-```
+Bluetooth is still used, for the BLE *beacons* that give a bounded position
+fix — a different thing entirely. See
+[docs/BLUETOOTH-POSITIONING.md](docs/BLUETOOTH-POSITIONING.md).
 
 ### Before you let it drive itself
 

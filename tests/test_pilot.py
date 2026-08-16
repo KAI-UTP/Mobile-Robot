@@ -61,19 +61,19 @@ def _stationary(twist) -> bool:
 def test_it_does_not_move_before_any_sensor_data_arrives():
     """Otherwise the robot drives off the instant it is switched on, using a
     world model it does not have yet."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     assert _stationary(pilot.step(None, None, DT))
 
 
 def test_it_does_not_move_with_a_pose_but_no_ranges():
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     assert _stationary(pilot.step(None, _pose(), DT))
 
 
 def test_stale_sensor_data_stops_the_robot():
     """A frozen world model while the robot keeps moving through the real
     world is exactly when it hits something."""
-    pilot = Pilot(PilotConfig(stale_after_s=0.5))
+    pilot = Pilot(contact_only=False, config=PilotConfig(stale_after_s=0.5))
     moving = pilot.step(_packet(), _pose(), DT, age_s=0.1)
     assert not _stationary(moving)
 
@@ -83,7 +83,7 @@ def test_stale_sensor_data_stops_the_robot():
 def test_it_recovers_when_sensor_data_comes_back():
     """A dropped packet must not end the scan — telemetry over Bluetooth drops
     packets routinely."""
-    pilot = Pilot(PilotConfig(stale_after_s=0.5))
+    pilot = Pilot(contact_only=False, config=PilotConfig(stale_after_s=0.5))
     pilot.step(_packet(), _pose(), DT, age_s=0.1)
     pilot.step(_packet(), _pose(), DT, age_s=2.0)
 
@@ -95,7 +95,7 @@ def test_a_single_bump_backs_off_rather_than_abandoning_the_scan():
     robot useless: run against a furnished room it clipped a cabinet standing
     against a wall 43 s in and gave up having measured nothing. Furniture
     against a wall is the normal case."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     twist = pilot.step(_packet(bumper=True), _pose(), DT)
@@ -107,7 +107,7 @@ def test_a_single_bump_backs_off_rather_than_abandoning_the_scan():
 def test_backing_off_covers_a_real_distance():
     """A single reversed control cycle moves under two centimetres, which does
     not clear anything."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
     pilot.step(_packet(bumper=True), _pose(), DT)
 
@@ -122,7 +122,7 @@ def test_backing_off_covers_a_real_distance():
 
 
 def test_it_returns_to_following_the_wall_after_backing_off():
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
     pilot.step(_packet(bumper=True), _pose(), DT)
 
@@ -138,7 +138,7 @@ def test_a_contact_that_clears_is_counted_once():
     """The bumper stays closed for the whole time the robot is against the
     object. Counting per packet would burn the entire budget in under a second
     on a single graze."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     # Held for the first few cycles, then clear as the robot reverses off it.
@@ -155,7 +155,7 @@ def test_a_bumper_that_never_clears_counts_again_and_eventually_halts():
     a completed reverse is a robot that has not got free, and re-counting is
     what turns that into the halt — while still being far cheaper than
     counting every packet."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     packets = 0
@@ -169,7 +169,7 @@ def test_a_bumper_that_never_clears_counts_again_and_eventually_halts():
 
 def test_repeated_contacts_do_halt_the_scan():
     """Backing off does not fix a robot wedged somewhere and shoving."""
-    pilot = Pilot(PilotConfig(max_bumps=3, bump_backoff_m=0.01))
+    pilot = Pilot(contact_only=False, config=PilotConfig(max_bumps=3, bump_backoff_m=0.01))
     pilot.step(_packet(), _pose(), DT)
 
     for _ in range(400):
@@ -184,7 +184,7 @@ def test_repeated_contacts_do_halt_the_scan():
 
 def test_a_halted_scan_stays_halted():
     """It must not resume by itself once it has decided something is wrong."""
-    pilot = Pilot(PilotConfig(max_bumps=0))
+    pilot = Pilot(contact_only=False, config=PilotConfig(max_bumps=0))
     pilot.step(_packet(), _pose(), DT)
     pilot.step(_packet(bumper=True), _pose(), DT)
     assert pilot.status.phase == ScanPhase.STOPPED
@@ -197,7 +197,7 @@ def test_a_halted_scan_stays_halted():
 def test_a_perimeter_that_never_closes_gives_up():
     """Otherwise a robot that has lost the wall drives until its battery is
     flat."""
-    pilot = Pilot(PilotConfig(perimeter_timeout_s=0.0))
+    pilot = Pilot(contact_only=False, config=PilotConfig(perimeter_timeout_s=0.0))
     pilot.step(_packet(), _pose(), DT)
 
     assert _stationary(pilot.step(_packet(), _pose(), DT))
@@ -209,7 +209,7 @@ def test_a_perimeter_that_never_closes_gives_up():
 
 
 def test_speed_is_limited():
-    pilot = Pilot(PilotConfig(max_linear_mps=0.05))
+    pilot = Pilot(contact_only=False, config=PilotConfig(max_linear_mps=0.05))
     twist = pilot.step(_packet(), _pose(), DT)
     assert abs(twist.vx_mps) <= 0.05 + 1e-9
 
@@ -220,7 +220,7 @@ def test_limiting_a_diagonal_keeps_its_direction():
     other than where it was told."""
     from robotmap_common.holonomic import BodyTwist
 
-    pilot = Pilot(PilotConfig(max_linear_mps=0.1))
+    pilot = Pilot(contact_only=False, config=PilotConfig(max_linear_mps=0.1))
     limited = pilot._limit(BodyTwist(vx_mps=3.0, vy_mps=4.0))
 
     assert limited.vx_mps == pytest.approx(0.06, abs=1e-6)
@@ -232,7 +232,7 @@ def test_limiting_a_diagonal_keeps_its_direction():
 def test_rotation_is_limited_too():
     from robotmap_common.holonomic import BodyTwist
 
-    pilot = Pilot(PilotConfig(max_angular_dps=30.0))
+    pilot = Pilot(contact_only=False, config=PilotConfig(max_angular_dps=30.0))
     assert pilot._limit(BodyTwist(omega_dps=500.0)).omega_dps == 30.0
     assert pilot._limit(BodyTwist(omega_dps=-500.0)).omega_dps == -30.0
 
@@ -241,7 +241,7 @@ def test_rotation_is_limited_too():
 
 
 def test_it_starts_the_perimeter_lap_on_the_first_good_packet():
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     twist = pilot.step(_packet(), _pose(), DT)
     assert pilot.status.phase == ScanPhase.PERIMETER
     assert not _stationary(twist)
@@ -251,7 +251,7 @@ def test_the_perimeter_lap_does_not_strafe_when_it_has_room():
     """Hugging a wall means holding a distance to one side while driving along
     it, which is a differential motion. Lateral velocity here would be the
     controller being misused — it is reserved for escaping a squeeze."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     for _ in range(50):
         twist = pilot.step(_packet(), _pose(), DT)
         assert twist.vy_mps == 0.0
@@ -276,7 +276,7 @@ def test_it_sidesteps_away_from_something_crowding_its_flank():
     """Wall-following regulates ONE wall and watches ahead. Nothing watches the
     other side, so the robot drove into a 0.40 m gap between a cabinet and the
     wall reporting 4 m of clear space ahead the whole way in."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     twist = pilot.step(_squeezed(left=0.10, right=3.0), _pose(), DT)
@@ -284,7 +284,7 @@ def test_it_sidesteps_away_from_something_crowding_its_flank():
 
 
 def test_it_sidesteps_the_other_way_too():
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     twist = pilot.step(_squeezed(left=3.0, right=0.10), _pose(), DT)
@@ -302,7 +302,7 @@ def test_the_squeeze_escape_holds_its_heading():
     """
     from robotmap_common.holonomic import BodyTwist
 
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     commanded = BodyTwist(vx_mps=0.18, omega_dps=17.0)
     escaped = pilot._keep_clear(_squeezed(left=0.10, right=3.0).ranges, commanded)
 
@@ -312,7 +312,7 @@ def test_the_squeeze_escape_holds_its_heading():
 
 def test_it_slows_down_when_squeezed():
     """A squeeze taken at cruise speed is a scrape along whatever caused it."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     clear = pilot.step(_packet(), _pose(), DT)
@@ -324,7 +324,7 @@ def test_the_wall_being_followed_does_not_trigger_an_escape():
     """The follower deliberately holds 0.35 m against its wall. If that read as
     a squeeze the robot would sidestep away from the very wall it is measuring
     and lose the outline."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     for _ in range(30):
@@ -333,7 +333,7 @@ def test_the_wall_being_followed_does_not_trigger_an_escape():
 
 
 def test_the_escape_is_stronger_the_closer_the_obstacle():
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     near = pilot.step(_squeezed(left=0.05, right=3.0), _pose(), DT)
@@ -343,7 +343,7 @@ def test_the_escape_is_stronger_the_closer_the_obstacle():
 
 def test_something_dead_ahead_is_not_treated_as_a_flank():
     """That is the follower's job, and reacting to it here would fight it."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     twist = pilot.step(_packet(front=0.10), _pose(), DT)
@@ -352,7 +352,7 @@ def test_something_dead_ahead_is_not_treated_as_a_flank():
 
 def test_the_sweep_can_be_skipped():
     """Some customers only want the outline, and the sweep doubles the time."""
-    pilot = Pilot(PilotConfig(sweep=False))
+    pilot = Pilot(contact_only=False, config=PilotConfig(sweep=False))
     pilot.step(_packet(), _pose(), DT)
     pilot.follower.loop_closed = True
 
@@ -363,7 +363,7 @@ def test_the_sweep_can_be_skipped():
 def test_the_sweep_is_handed_the_measured_outline():
     """Without it the sweep discovers each row's end by driving into the wall,
     which on real hardware is a collision per row."""
-    pilot = Pilot(PilotConfig())
+    pilot = Pilot(contact_only=False, config=PilotConfig())
     pilot.set_bounds((0.0, 0.0, 6.0, 4.5))
     pilot.step(_packet(), _pose(), DT)
     pilot.follower.loop_closed = True
@@ -377,7 +377,7 @@ def test_the_sweep_is_handed_the_measured_outline():
 def test_a_room_measured_late_still_reaches_the_sweep():
     """The mapper publishes the outline when it has one, which may be after
     the sweep has already begun."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
     pilot.follower.loop_closed = True
     pilot.step(_packet(), _pose(), DT)
@@ -388,7 +388,7 @@ def test_a_room_measured_late_still_reaches_the_sweep():
 
 
 def test_a_finished_scan_commands_nothing():
-    pilot = Pilot(PilotConfig(sweep=False))
+    pilot = Pilot(contact_only=False, config=PilotConfig(sweep=False))
     pilot.step(_packet(), _pose(), DT)
     pilot.follower.loop_closed = True
     pilot.step(_packet(), _pose(), DT)
@@ -400,7 +400,7 @@ def test_a_finished_scan_commands_nothing():
 def test_the_status_says_what_it_is_doing():
     """An autonomous robot that cannot explain itself is one nobody will let
     out of the lab."""
-    pilot = Pilot()
+    pilot = Pilot(contact_only=False)
     pilot.step(_packet(), _pose(), DT)
 
     status = pilot.status.as_dict()

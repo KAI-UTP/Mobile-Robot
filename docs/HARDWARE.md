@@ -24,10 +24,12 @@ autonomy — runs as ordinary Python on the PC. `services/servo-bus/driver.py`
 owns the serial port and speaks the STS3215 protocol; `services/robot-agent/`
 assembles the sensor packets; `services/pilot/` drives the scan.
 
-**`firmware/esp32_robot/` is from the earlier design and is not used.** It is
-kept because the ESP32 route is still the right answer for a tetherless robot,
-and section 1 below is the comparison that led there. Nothing in the current
-system flashes it or depends on it.
+There is **no microcontroller**. An earlier design had ESP32 firmware; it was
+deleted rather than kept "just in case", because three separate documents had
+grown a paragraph explaining that it was not used — which is a reliable sign
+that code is costing more to explain than it is worth. Section 1 below is still
+the comparison that led to the PC-side design, and `git log` still has the
+firmware if the tetherless route is ever revived.
 
 Consequences worth knowing:
 
@@ -81,9 +83,9 @@ A Raspberry Pi is a fine choice if you later want to run the mapper on the
 robot itself, but for a battery-powered mapping robot it is heavy, slow to
 boot, and dislikes sudden power loss.
 
-> If you have already bought an Arduino, the project still works — flash the
-> equivalent sketch, send JSON over the HC-05, and run `services/bt-bridge`
-> on your laptop. Everything downstream is identical.
+> If you have already bought an Arduino it is not needed. The servos are
+> driven from the PC over USB and the sensor packets are assembled there, so a
+> microcontroller in the middle would only forward what the PC already has.
 
 ---
 

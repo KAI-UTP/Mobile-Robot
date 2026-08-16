@@ -4,7 +4,8 @@ Purpose
 -------
 The hardware is not finalised, but the whole pipeline downstream of the robot
 can be built and demonstrated today. This simulator stands in for the real
-base and produces the same `SensorPacket` the firmware will.
+base and produces the same `SensorPacket` that `services/robot-agent` builds
+from the servo bus.
 
 The noise here is deliberate and physically motivated. A simulator that emits
 perfect data proves nothing — the filter and the mapper would look flawless
@@ -172,7 +173,7 @@ class NoiseProfile:
     wheel_slip_stddev: float = 0.01
 
     # Residual gyro bias, degrees per second, *after* the stationary
-    # calibration the firmware performs at boot. An uncalibrated MPU6050 sits
+    # calibration the robot agent performs at start-up. An uncalibrated MPU6050 sits
     # around 0.15 deg/s, which integrates to roughly 19 degrees over a
     # two-minute mapping run and shears the finished map badly enough that a
     # rectangular room stops measuring as a rectangle. Averaging a few hundred
@@ -681,6 +682,10 @@ class VirtualRobot:
             ),
             wheel_ticks=list(self.wheel_ticks) if holonomic else None,
             bumper_active=self.bumper_active,
+            # The servo feedback a collision has to be inferred from, since
+            # nothing on this robot can simply report contact.
+            wheel_speeds_mps=list(self.measured_wheel_speeds) or None,
+            wheel_loads=list(self.wheel_loads) or None,
             encoders=EncoderData(
                 left_ticks=self.left_ticks,
                 right_ticks=self.right_ticks,

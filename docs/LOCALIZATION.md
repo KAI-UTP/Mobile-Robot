@@ -128,14 +128,13 @@ blocking, antenna orientation, multipath, and reflections off metal furniture
 far more than on distance. It is also not stable over time — the same robot in
 the same spot reports different strengths as people move around the room.
 
-The firmware supports two Bluetooth paths:
+Neither of those telemetry paths exists any more. Both assumed a
+microcontroller on the robot generating packets to send; there is none, and the
+packets are assembled on the PC the link would have delivered them to.
 
-- **BLE (ESP32).** Notifications over the Nordic UART Service. Note that a
-  BLE notification carries only 20 bytes by default, so telemetry frames are
-  chunked — see `bleSend()` in the firmware.
-- **Classic SPP (HC-05).** Appears as a serial port on the laptop.
-  `services/bt-bridge` reads it and republishes to MQTT, so a robot with no
-  WiFi produces an identical topic stream to an ESP32 with WiFi.
+Bluetooth still matters here, but for **positioning** rather than telemetry:
+fixed BLE beacons whose RSSI gives a coarse but *bounded* position fix. See
+[BLUETOOTH-POSITIONING.md](BLUETOOTH-POSITIONING.md).
 
 ---
 

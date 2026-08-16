@@ -47,6 +47,7 @@ from enum import Enum
 from robotmap_common.holonomic import BodyTwist
 from robotmap_common.models import PoseEstimate, SensorPacket
 
+from autonomy.bump_explorer import BumpExplorer
 from autonomy.coverage import CoveragePlanner, CoverageState
 from autonomy.explorer import ExploreState, WallFollower
 
@@ -130,12 +131,35 @@ class Pilot:
         self,
         config: PilotConfig | None = None,
         bounds: tuple[float, float, float, float] | None = None,
+        contact_only: bool = True,
     ) -> None:
         self.config = config or PilotConfig()
         self.status = PilotStatus()
 
+        # Contact-only by DEFAULT, because that is the robot that exists.
+        #
+        # It has a servo bus, BLE and GNSS — no ultrasonics, no lidar — so
+        # `robot-agent` always emits `ranges=[]`. Wall-following handed an
+        # empty list reads infinite clearance in every direction and drives
+        # dead straight for ever; the previous default would have taken the
+        # real robot across the room into the far wall, having measured
+        # nothing. Pass `contact_only=False` only if range sensors are fitted.
+        self.contact_only = contact_only
+
         self.follower = WallFollower()
+        self.explorer = BumpExplorer()
         self.planner: CoveragePlanner | None = None
+
+        # How much floor the map knows about. The contact explorer stops when
+        # this stops growing, since a robot bouncing across a room passes its
+        # own start within a few metres and "I am home" proves nothing.
+        self.explored_cells = 0
+
+        # What was last asked of the wheels, so the servo feedback can be
+        # judged against it — a wheel is only "not delivering" relative to
+        # something it was told to do.
+        self._last_commanded_mps = 0.0
+
         self._bounds = bounds
         self._phase_started_at = time.monotonic()
         self._backoff_remaining_m = 0.0
@@ -230,6 +254,9 @@ class Pilot:
         if time.monotonic() - self._phase_started_at > self.config.perimeter_timeout_s:
             return self._halt("perimeter lap timed out")
 
+        if self.contact_only:
+            return self._perimeter_by_contact(packet, pose, dt_s)
+
         command = self.follower.step(packet.ranges, pose.x_m, pose.y_m, dt_s)
         self.status.note = command.note
 
@@ -253,6 +280,73 @@ class Pilot:
                 packet.ranges,
                 BodyTwist(vx_mps=command.linear_mps, omega_dps=command.angular_dps),
             )
+        )
+
+    def _contact(self, packet) -> bool:
+        """Has the robot run into something?
+
+        There is no bumper switch, so `packet.bumper_active` is permanently
+        False on this hardware and anything relying on it is relying on a
+        sensor that does not exist. The evidence is the servo bus: a wheel
+        delivering a fraction of its commanded speed, at high load, has
+        something solid in front of it.
+
+        The switch is still honoured, for a build that has one.
+        """
+        if packet.bumper_active:
+            return True
+
+        measured = packet.wheel_speeds_mps
+        loads = packet.wheel_loads
+        if not measured:
+            return False
+
+        commanded = abs(self._last_commanded_mps)
+        if commanded < self.config.min_side_clearance_m * 0.25:
+            # Barely asked to move; a slow wheel proves nothing.
+            return False
+
+        for index, speed in enumerate(measured):
+            if abs(speed) >= commanded * 0.35:
+                continue
+            load = loads[index] if loads and index < len(loads) else 1.0
+            if load >= 0.55:
+                return True
+        return False
+
+    def _perimeter_by_contact(self, packet, pose, dt_s: float) -> BodyTwist:
+        """Map by driving into things, for a robot with no range sensors.
+
+        This is the path the actual hardware takes. `robot-agent` emits
+        `ranges=[]` because there is nothing to read them from, and
+        wall-following handed an empty list sees infinite clearance in every
+        direction: it drives dead straight until it hits something, for ever.
+        The robot would leave the start, cross the room, and stop against the
+        far wall having measured nothing.
+
+        `BumpExplorer` needs only a pose and a contact flag, both of which this
+        robot really has.
+        """
+        blocked = self._contact(packet)
+
+        command = self.explorer.step(
+            pose.x_m, pose.y_m, pose.heading_deg, blocked, dt_s,
+            self.explored_cells,
+        )
+        self.status.note = command.note
+
+        if self.explorer.is_finished:
+            logger.info(
+                "Room covered after %.1f m and %d contacts",
+                self.explorer.stats.distance_m, self.explorer.stats.contacts,
+            )
+            return self._finish("room covered by contact")
+
+        # No lateral escape here. That manoeuvre exists to slip out of a gap
+        # the side sensors can see closing, and there are no side sensors —
+        # backing off and turning is the only recovery available.
+        return self._limit(
+            BodyTwist(vx_mps=command.linear_mps, omega_dps=command.angular_dps)
         )
 
     def _keep_clear(self, ranges, twist: BodyTwist) -> BodyTwist:
@@ -361,6 +455,10 @@ class Pilot:
             -self.config.max_angular_dps,
             min(self.config.max_angular_dps, twist.omega_dps),
         )
+        # Remembered here, at the single point every command passes through, so
+        # the servo feedback on the NEXT packet can be judged against what was
+        # actually asked for.
+        self._last_commanded_mps = math.hypot(vx, vy)
         return BodyTwist(vx_mps=vx, vy_mps=vy, omega_dps=omega)
 
     def _halt(self, reason: str) -> BodyTwist:
