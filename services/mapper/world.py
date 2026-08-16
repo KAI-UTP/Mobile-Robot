@@ -55,6 +55,17 @@ class WorldDescription:
     is_ground_truth: bool = True
     source_note: str = ""
 
+    # Where the pose estimate's origin sits in this room.
+    #
+    # The filter starts every run at (0, 0) wherever the robot happens to be
+    # standing, so pose coordinates are relative to the start point and are
+    # routinely negative. Anything drawing a pose into a room laid out from a
+    # corner — which is every 3D view here — must add this first, or the robot
+    # appears outside its own room. That is not a small offset either: it is
+    # the whole distance from the corner to wherever the robot was set down.
+    robot_start_x_m: float = 1.0
+    robot_start_y_m: float = 1.0
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
@@ -66,6 +77,8 @@ class WorldDescription:
             "is_ground_truth": self.is_ground_truth,
             "source_note": self.source_note,
             "floor_area_m2": round(self.width_m * self.height_m, 2),
+            "robot_start_x_m": self.robot_start_x_m,
+            "robot_start_y_m": self.robot_start_y_m,
         }
 
 
@@ -166,8 +179,17 @@ def _beacons(width: float, height: float) -> list[dict]:
 # ── Named worlds ─────────────────────────────────────────────────────────────
 
 
-def describe_world(room_name: str, is_ground_truth: bool = True) -> WorldDescription:
-    """Build the description matching a simulator room."""
+def describe_world(
+    room_name: str,
+    is_ground_truth: bool = True,
+    robot_start: tuple[float, float] = (1.0, 1.0),
+) -> WorldDescription:
+    """Build the description matching a simulator room.
+
+    `robot_start` is where in the room the robot began, which is the origin of
+    the pose estimate's frame. The simulator knows it exactly; with real
+    hardware it is where the operator set the robot down, and it has to be told.
+    """
     if room_name == "l-shaped":
         # The L is not expressible as one rectangle, so the twin view draws the
         # bounding room and the extra wall that forms the notch.
@@ -205,6 +227,7 @@ def describe_world(room_name: str, is_ground_truth: bool = True) -> WorldDescrip
             beacons=_beacons(6.0, 4.5),
         )
 
+    world.robot_start_x_m, world.robot_start_y_m = robot_start
     world.is_ground_truth = is_ground_truth
     world.source_note = (
         "Ground truth — the simulator built this room, so the comparison is exact."

@@ -55,6 +55,26 @@ POSE_FILE = os.path.join(tempfile.gettempdir(), f"roommapper_{ROBOT_ID}_pose.jso
 USE_MQTT = False
 MQTT_HOST = "localhost"
 
+# Where in this room the robot started.
+#
+# This is the origin of the pose estimate's frame: the filter zeroes itself
+# wherever the robot is standing when a run begins, so every pose it reports is
+# relative to that point and is routinely NEGATIVE. The room below is laid out
+# from a corner at (0, 0), so a pose drawn straight into it puts the robot
+# outside its own room — which is exactly what it did.
+#
+# Must match the mapper, which serves the same figure as `robot_start_x_m` on
+# /api/world. With hardware it is wherever the operator set the robot down.
+ROBOT_START_X_M = 1.0
+ROBOT_START_Y_M = 1.0
+
+# A pose file older than this is ignored in favour of the demo lap. Twin-control
+# rewrites it several times a second while it is running, so anything this stale
+# is left over from a previous session — and silently animating a robot from
+# yesterday's file, frozen whereever it stopped, looks exactly like a bug in the
+# scene.
+POSE_STALE_AFTER_S = 15.0
+
 SHOW_ODOMETRY_GHOST = True
 SHOW_RSSI_MARKER = True
 SHOW_BEACON_RANGES = False   # rings showing inferred distance; busy but instructive
@@ -344,6 +364,11 @@ class FilePose:
     def read(self):
         try:
             mtime = os.path.getmtime(self.path)
+            # A file left over from a previous session is worse than no file:
+            # it pins the robot wherever that run happened to stop, which looks
+            # like the scene being broken rather than like nothing running.
+            if time.time() - mtime > POSE_STALE_AFTER_S:
+                return None
             if mtime != self._mtime:
                 self._mtime = mtime
                 with open(self.path, encoding="utf-8") as handle:
@@ -388,17 +413,27 @@ class DemoPose:
             self.y += dy / distance * step
             self.heading = math.degrees(math.atan2(dy, dx)) % 360.0
 
+        # Emitted in the POSE frame, like the real source, so the one transform
+        # in RoomScene applies to both. The waypoints above stay written as
+        # room positions because that is how anyone reads them against the
+        # furniture, so the start offset comes back off here.
         return {
-            "x_m": self.x,
-            "y_m": self.y,
+            "x_m": self.x - ROBOT_START_X_M,
+            "y_m": self.y - ROBOT_START_Y_M,
             "heading_deg": self.heading,
             # Odometry tracks closely: 0.07 m measured over a circuit.
-            "ideal_x_m": self.x + self.rng.gauss(0, 0.05),
-            "ideal_y_m": self.y + self.rng.gauss(0, 0.05),
+            "ideal_x_m": self.x - ROBOT_START_X_M + self.rng.gauss(0, 0.05),
+            "ideal_y_m": self.y - ROBOT_START_Y_M + self.rng.gauss(0, 0.05),
             "ideal_heading_deg": self.heading,
             # RSSI wanders by metres. 2.71 m mean error, measured.
-            "rssi_x_m": self.x + self.rng.gauss(0, RSSI_TYPICAL_ERROR_M * 0.8),
-            "rssi_y_m": self.y + self.rng.gauss(0, RSSI_TYPICAL_ERROR_M * 0.8),
+            "rssi_x_m": (
+                self.x - ROBOT_START_X_M
+                + self.rng.gauss(0, RSSI_TYPICAL_ERROR_M * 0.8)
+            ),
+            "rssi_y_m": (
+                self.y - ROBOT_START_Y_M
+                + self.rng.gauss(0, RSSI_TYPICAL_ERROR_M * 0.8)
+            ),
         }
 
 
@@ -626,8 +661,11 @@ class RoomScene:
         if not pose:
             return
 
-        tx = float(pose.get("x_m", 0.0))
-        ty = float(pose.get("y_m", 0.0))
+        # Pose frame -> room frame. See ROBOT_START_X_M: pose coordinates are
+        # relative to wherever the robot was standing when the run began, and
+        # this room is laid out from a corner.
+        tx = float(pose.get("x_m", 0.0)) + ROBOT_START_X_M
+        ty = float(pose.get("y_m", 0.0)) + ROBOT_START_Y_M
         th = float(pose.get("heading_deg", 0.0))
 
         # Chase rather than snap: telemetry arrives at ~10 Hz, Kit renders at
@@ -638,8 +676,8 @@ class RoomScene:
         self._place(f"{ROOT}/RobotTrue", self.x, self.y, self.heading)
 
         if SHOW_ODOMETRY_GHOST:
-            gx = float(pose.get("ideal_x_m", tx))
-            gy = float(pose.get("ideal_y_m", ty))
+            gx = float(pose.get("ideal_x_m", tx - ROBOT_START_X_M)) + ROBOT_START_X_M
+            gy = float(pose.get("ideal_y_m", ty - ROBOT_START_Y_M)) + ROBOT_START_Y_M
             self.ox += (gx - self.ox) * SMOOTHING
             self.oy += (gy - self.oy) * SMOOTHING
             self._place(f"{ROOT}/RobotOdometry", self.ox, self.oy,
@@ -648,8 +686,8 @@ class RoomScene:
         if SHOW_RSSI_MARKER and "rssi_x_m" in pose:
             # Slower smoothing: RSSI genuinely jumps, and showing that is the
             # point of the marker.
-            self.rx += (float(pose["rssi_x_m"]) - self.rx) * 0.08
-            self.ry += (float(pose["rssi_y_m"]) - self.ry) * 0.08
+            self.rx += (float(pose["rssi_x_m"]) + ROBOT_START_X_M - self.rx) * 0.08
+            self.ry += (float(pose["rssi_y_m"]) + ROBOT_START_Y_M - self.ry) * 0.08
             self._place(f"{ROOT}/RssiEstimate", self.rx, self.ry)
 
         self._drop_trail()

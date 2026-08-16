@@ -494,6 +494,91 @@ def test_the_summary_reports_both_areas(kit):
     assert "closed" in measured.summary
 
 
+# ── Placing the robot: pose frame vs room frame ──────────────────────────────
+#
+# The pose filter zeroes itself wherever the robot is standing when a run
+# begins, so pose coordinates are relative to the start point and are routinely
+# negative. The room is laid out from a corner at (0, 0). Drawing one in the
+# other without converting put the robot outside its own room.
+
+
+class _FixedPose:
+    def __init__(self, pose):
+        self.pose = pose
+
+    def read(self):
+        return self.pose
+
+
+def _robot_xy(module, stage):
+    return stage.prims[f"{module.ROOT}/RobotTrue"].translate[:2]
+
+
+def _run_scene(module, stage, pose, ticks=200):
+    module.build_all_robots(stage)
+    scene = module.RoomScene(stage, _FixedPose(pose))
+    for _ in range(ticks):        # smoothing chases the target, so settle it
+        scene._on_update(None)
+    return _robot_xy(module, stage)
+
+
+def test_a_pose_at_the_origin_puts_the_robot_where_it_started(kit):
+    """The bug, in one case. A fresh filter reports (0, 0) — which drew the
+    robot at the ROOM's corner, half inside the wall and reading as outside."""
+    module, stage = kit
+    x, y = _run_scene(module, stage, {"x_m": 0.0, "y_m": 0.0, "heading_deg": 0.0})
+
+    assert x == pytest.approx(module.ROBOT_START_X_M, abs=0.05)
+    assert y == pytest.approx(module.ROBOT_START_Y_M, abs=0.05)
+
+
+def test_a_negative_pose_still_lands_inside_the_room(kit):
+    """Poses go negative as soon as the robot moves back past its start, which
+    is most of any lap. Those are the ones that ended up outside the walls."""
+    module, stage = kit
+    x, y = _run_scene(module, stage, {"x_m": -0.32, "y_m": -0.75, "heading_deg": 0.0})
+
+    assert 0.0 < x < module.ROOM_W
+    assert 0.0 < y < module.ROOM_H
+
+
+def test_the_demo_lap_stays_inside_the_room(kit):
+    """The demo emits pose-frame coordinates like the real source, so the one
+    transform applies to both. Applying it twice would walk the robot out
+    through the far wall instead."""
+    module, stage = kit
+    module.build_all_robots(stage)
+    scene = module.RoomScene(stage, module.DemoPose())
+
+    for _ in range(4000):
+        scene._on_update(None)
+        x, y = _robot_xy(module, stage)
+        assert 0.0 <= x <= module.ROOM_W, f"demo lap left the room at x={x:.2f}"
+        assert 0.0 <= y <= module.ROOM_H, f"demo lap left the room at y={y:.2f}"
+
+
+def test_a_stale_pose_file_is_ignored(kit):
+    """A file left over from a previous session pins the robot wherever that
+    run stopped. That reads as the scene being broken rather than as nothing
+    running — which is exactly how this was found."""
+    module, stage = kit
+    import json as _json
+    import os
+    import tempfile
+    import time as _time
+
+    path = os.path.join(tempfile.mkdtemp(), "pose.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        _json.dump({"x_m": 0.0, "y_m": 0.0, "heading_deg": 0.0}, handle)
+
+    source = module.FilePose(path)
+    assert source.read() is not None, "a fresh file must be used"
+
+    old = _time.time() - module.POSE_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+    assert source.read() is None, "a stale file must be ignored"
+
+
 # ── The file itself ──────────────────────────────────────────────────────────
 
 

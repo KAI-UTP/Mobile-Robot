@@ -80,6 +80,16 @@ store = ScanStore(os.environ.get("SCAN_DIR"))
 # knows the real room; with hardware it is an expectation.
 app.state.source_mode = os.environ.get("SOURCE", "sim")
 
+# Where in the room the robot started, which is the origin of the pose
+# estimate's frame — the filter zeroes itself wherever the robot is standing.
+# Any view that draws a pose into a room laid out from a corner must add this,
+# or the robot is drawn outside its own room. With hardware it is wherever the
+# operator set the robot down, so it is configurable.
+app.state.robot_start = (
+    float(os.environ.get("ROBOT_START_X_M", "1.0")),
+    float(os.environ.get("ROBOT_START_Y_M", "1.0")),
+)
+
 # Every connected browser. Guarded because packets arrive on an MQTT thread.
 _clients: set[WebSocket] = set()
 _clients_lock = threading.Lock()
@@ -138,6 +148,7 @@ async def get_world() -> JSONResponse:
     world = describe_world(
         app.state.reference_room_name,
         is_ground_truth=app.state.source_mode == "sim",
+        robot_start=app.state.robot_start,
     )
     return JSONResponse(world.to_dict())
 
@@ -633,7 +644,10 @@ def start_sim_source(room: str, indoor: bool, speed: float, sweep: bool = True) 
     world.indoor = indoor
 
     robot = VirtualRobot(world=world)
-    robot.true_x, robot.true_y = 1.0, 1.0
+    # The pose filter zeroes itself here, so this point is the origin of every
+    # pose coordinate the system reports. The 3D views need it to place the
+    # robot inside the room rather than beside it.
+    robot.true_x, robot.true_y = app.state.robot_start
     follower = WallFollower()
     dt_s = 0.1
 

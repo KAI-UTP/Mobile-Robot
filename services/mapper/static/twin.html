@@ -312,6 +312,19 @@ function collectBox(out, cx, cy, cz, w, d, h, colour, opacity) {
   }
 }
 
+// Pose frame -> room frame.
+//
+// The filter starts every run at (0, 0) wherever the robot is standing, so
+// pose coordinates are relative to the start point and are routinely negative.
+// The 3D room is laid out from a corner at (0, 0). Drawing one in the other
+// without this put the robot outside its own room — by the whole distance from
+// the corner to wherever it was set down.
+//
+// The 2D pane needs no such correction: it draws the occupancy grid, the
+// outline and the pose all in the pose frame, which is self-consistent.
+function toRoomX(x) { return x + (world ? world.robot_start_x_m : 0); }
+function toRoomY(y) { return y + (world ? world.robot_start_y_m : 0); }
+
 function draw3d() {
   g3.fillStyle = '#0a0d12';
   g3.fillRect(0, 0, c3.width, c3.height);
@@ -345,25 +358,27 @@ function draw3d() {
     for (const o of state.room.obstacles) {
       const w = Math.max(0.05, o.max_x_m - o.min_x_m);
       const d = Math.max(0.05, o.max_y_m - o.min_y_m);
-      collectBox(faces, o.centre_x_m, o.centre_y_m, 0.12, w, d, 0.24, '#f85149', 0.5);
+      collectBox(faces, toRoomX(o.centre_x_m), toRoomY(o.centre_y_m), 0.12,
+                 w, d, 0.24, '#f85149', 0.5);
     }
   }
 
   if (state && state.pose) {
     const p = state.pose;
-    collectBox(faces, p.x_m, p.y_m, 0.07, 0.28, 0.28, 0.10, '#4aa3ff', 1);
+    const px = toRoomX(p.x_m), py = toRoomY(p.y_m);
+    collectBox(faces, px, py, 0.07, 0.28, 0.28, 0.10, '#4aa3ff', 1);
     // A nose block, so facing is visible — otherwise driving and strafing
     // look identical, which is the whole point of a holonomic base.
     const a = p.heading_deg * Math.PI / 180;
-    collectBox(faces, p.x_m + 0.16 * Math.cos(a), p.y_m + 0.16 * Math.sin(a), 0.09,
+    collectBox(faces, px + 0.16 * Math.cos(a), py + 0.16 * Math.sin(a), 0.09,
                0.10, 0.10, 0.06, '#f0c674', 1);
 
     if (state.odometry) {
-      collectBox(faces, state.odometry.x_m, state.odometry.y_m, 0.07,
-                 0.30, 0.30, 0.11, '#3fb950', 0.35);
+      collectBox(faces, toRoomX(state.odometry.x_m), toRoomY(state.odometry.y_m),
+                 0.07, 0.30, 0.30, 0.11, '#3fb950', 0.35);
     }
     if (state.rssi) {
-      collectBox(faces, state.rssi.x_m, state.rssi.y_m, 0.30,
+      collectBox(faces, toRoomX(state.rssi.x_m), toRoomY(state.rssi.y_m), 0.30,
                  0.26, 0.26, 0.26, '#f0883e', 0.65);
     }
   }
