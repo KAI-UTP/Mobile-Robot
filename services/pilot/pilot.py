@@ -44,6 +44,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 
+from robotmap_common.hardware import ACTUAL, HardwareProfile, Strategy
 from robotmap_common.holonomic import BodyTwist
 from robotmap_common.models import PoseEstimate, SensorPacket
 
@@ -131,20 +132,29 @@ class Pilot:
         self,
         config: PilotConfig | None = None,
         bounds: tuple[float, float, float, float] | None = None,
-        contact_only: bool = True,
+        contact_only: bool | None = None,
+        hardware: HardwareProfile | None = None,
     ) -> None:
         self.config = config or PilotConfig()
         self.status = PilotStatus()
 
-        # Contact-only by DEFAULT, because that is the robot that exists.
+        # Which strategy to drive follows from what is FITTED, not from a flag.
         #
-        # It has a servo bus, BLE and GNSS — no ultrasonics, no lidar — so
-        # `robot-agent` always emits `ranges=[]`. Wall-following handed an
-        # empty list reads infinite clearance in every direction and drives
-        # dead straight for ever; the previous default would have taken the
-        # real robot across the room into the far wall, having measured
-        # nothing. Pass `contact_only=False` only if range sensors are fitted.
-        self.contact_only = contact_only
+        # Wall-following holds a measured distance to a wall, and this robot —
+        # servo bus, GNSS, Bluetooth — has nothing to measure it with, so
+        # `robot-agent` always emits `ranges=[]`. Handed an empty list the
+        # follower reads infinite clearance in every direction and drives dead
+        # straight for ever, which on real hardware means across the room into
+        # the far wall having measured nothing.
+        #
+        # Deriving it means fitting a lidar changes this line's answer without
+        # anyone editing it. `contact_only` is still accepted so a caller can
+        # force either strategy for a comparison, and it wins when given.
+        self.hardware = hardware or ACTUAL
+        self.contact_only = (
+            contact_only if contact_only is not None
+            else self.hardware.strategy() is Strategy.CONTACT_ONLY
+        )
 
         self.follower = WallFollower()
         self.explorer = BumpExplorer()

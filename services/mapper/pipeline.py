@@ -161,6 +161,17 @@ class MappingPipeline:
             cost = self.costmap.build(occupied, self.grid.resolution_m)
             return self.costmap.summarise(cost, self.grid.resolution_m)
 
+    def explored_cells(self) -> int:
+        """How many grid cells the robot has learned anything about.
+
+        The contact-only explorer stops when this stops growing. Loop closure
+        is meaningless to a robot bouncing across a room — it passes its own
+        start within the first few metres — while "I have stopped discovering
+        floor" is the signal that means the room is mapped.
+        """
+        with self._lock:
+            return self.grid.explored_cells()
+
     def freeze_outline(self) -> None:
         """Keep the outline measured so far, and stop revising it.
 

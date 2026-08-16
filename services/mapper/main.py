@@ -35,9 +35,11 @@ for path in (ROOT / "shared", ROOT / "services", ROOT):
         sys.path.insert(0, str(path))
 
 import uvicorn
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
+from robotmap_common.hardware import Strategy
+from robotmap_common.hardware import profile as hardware_profile
 from robotmap_common.models import SensorPacket, ServiceHealth
 from robotmap_common.topics import Topics
 
@@ -104,6 +106,25 @@ app.state.sim_settings = None
 app.state.coverage = None
 app.state.collisions = None
 
+# The world the simulated robot is actually driving in, once a scan starts.
+#
+# Held on app.state because the Omniverse scene posts room geometry to
+# /api/world/geometry and that has to reach the running simulator — dragging a
+# table in the viewport moves the thing the robot collides with, not just the
+# picture. None in hardware mode: the real room is not ours to rearrange.
+app.state.sim_world = None
+
+# The last layout the 3D scene pushed, kept so it survives a rescan. Without
+# it, "drag a table somewhere, press Scan again" would quietly measure the
+# default room instead of the one that was arranged.
+app.state.scene_geometry = []
+
+# What sensors this robot has, which decides how it maps a room rather than
+# merely describing it. `simulated` is the demo default because the simulator
+# genuinely does produce range readings; `actual` is the robot that exists and
+# maps by driving into things. See robotmap_common.hardware.
+app.state.hardware = hardware_profile(os.environ.get("HARDWARE", "simulated"))
+
 # Mirror the pose into the file the Omniverse scene polls, so the robot shown
 # there is the one actually driving the map — collisions, contacts and all —
 # rather than Kit's scripted fallback lap.
@@ -164,6 +185,84 @@ async def get_state() -> JSONResponse:
 # to beat an RTX renderer at showing a room, and the 2D map it drew alongside
 # is already the whole of `/`. Each tool now does the thing it is best at —
 # Omniverse renders the physical room, the browser draws the floor plan.
+
+
+@app.post("/api/world/geometry")
+async def set_world_geometry(request: Request) -> JSONResponse:
+    """Omniverse tells the simulator what is actually in the room.
+
+    This is the join that makes the 3D view the *physical world* rather than a
+    picture of one. Drag a table across the viewport and the scene posts the
+    new layout here; the simulated robot then drives into the table where it
+    now is, the contact is inferred from the servo bus exactly as it would be
+    on hardware, and it lands on the 2D map at the new place.
+
+    Before this, the renderer and the world the robot drove in were two
+    separate descriptions that merely looked alike, and they drifted apart
+    repeatedly — the robot gliding through a sofa that only existed on screen
+    was the most visible symptom.
+
+    Footprints are axis-aligned boxes in metres, in the room's own frame.
+    The room shell is left alone: this replaces what is standing in the room,
+    not the room.
+    """
+    payload = await request.json()
+    boxes = payload.get("boxes") or []
+
+    world = getattr(app.state, "sim_world", None)
+    if world is None:
+        # Hardware mode, or no scan running. Not an error — the scene pushes
+        # geometry on a timer and should not have to know what is on the other
+        # end — but say so plainly rather than pretending it was applied.
+        return JSONResponse(
+            {"status": "ignored", "reason": "no simulator running"}, status_code=202
+        )
+
+    footprints = []
+    for b in boxes:
+        try:
+            footprints.append(
+                (float(b["min_x_m"]), float(b["min_y_m"]),
+                 float(b["max_x_m"]), float(b["max_y_m"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    count = world.set_furniture(footprints)
+    # Remembered so a rescan starts in the room that was arranged, rather than
+    # silently reverting to the default layout mid-demo.
+    app.state.scene_geometry = footprints
+    logger.info("Room geometry updated from the 3D scene: %d piece(s)", count)
+    return JSONResponse({"status": "applied", "pieces": count})
+
+
+@app.get("/api/world/geometry")
+async def get_world_geometry() -> JSONResponse:
+    """What the simulator currently believes is standing in the room."""
+    world = getattr(app.state, "sim_world", None)
+    if world is None:
+        return JSONResponse({"pieces": [], "source": "no simulator running"})
+
+    return JSONResponse({
+        "pieces": [
+            {"min_x_m": a, "min_y_m": b, "max_x_m": c, "max_y_m": d}
+            for a, b, c, d in world.furniture_footprints
+        ],
+        "source": "simulator",
+    })
+
+
+@app.get("/api/hardware")
+async def get_hardware() -> JSONResponse:
+    """What this robot is running on, and what that implies it can do.
+
+    Exposed because the mapping strategy is *derived* from it rather than
+    configured, so "why is the robot bouncing off the walls instead of
+    following them?" has an answer the dashboard can show: no RANGE fitted.
+    Unfitted hardware is listed too — the physical build is coming and knowing
+    what each option would unlock is the useful half of planning it.
+    """
+    return JSONResponse(app.state.hardware.describe())
 
 
 @app.get("/api/world")
@@ -813,7 +912,35 @@ def start_sim_source(
     world = worlds.get(room, worlds["rectangular"])()
     world.indoor = indoor
 
-    robot = VirtualRobot(world=world)
+    # Furniture arranged in the 3D scene survives a rescan.
+    #
+    # A scan builds a fresh world, and without this the sequence "drag a table
+    # somewhere interesting, press Scan again" would silently delete the table
+    # — the user would be measuring a room they had not arranged. The scene
+    # does re-push within half a second, but a scan that begins in the wrong
+    # room and corrects itself mid-lap is worse than one that starts right.
+    if app.state.scene_geometry:
+        world.set_furniture(app.state.scene_geometry)
+        logger.info(
+            "Restored %d piece(s) of furniture arranged in the 3D scene",
+            len(app.state.scene_geometry),
+        )
+
+    app.state.sim_world = world
+
+    # A robot with no range sensors must not be handed range readings.
+    #
+    # Simulating them anyway is the difference between a twin and a demo: the
+    # wall-follower would map the room beautifully here and then drive the real
+    # robot straight into a wall, having measured nothing. So the sensor stream
+    # matches what is fitted, and with none fitted `ranges` is empty — which is
+    # exactly what `robot-agent` emits from the real hardware.
+    strategy = app.state.hardware.strategy()
+    robot = (
+        VirtualRobot(world=world)
+        if strategy is Strategy.WALL_FOLLOWING
+        else VirtualRobot(world=world, sensor_angles_deg=())
+    )
     # The pose filter zeroes itself here, so this point is the origin of every
     # pose coordinate the system reports. The 3D views need it to place the
     # robot inside the room rather than beside it.
@@ -896,8 +1023,67 @@ def start_sim_source(
         except Exception:
             logger.exception("Could not save the scan after %s", stage)
 
+    def contact_only_loop() -> None:
+        """Map the room by driving into it, for a robot that cannot see.
+
+        There is no perimeter phase and no sweep, because both need range
+        readings to work: the lap holds a measured distance to a wall, and the
+        sweep turns at a boundary it was told about. This robot learns the room
+        one collision at a time and the floor it has swept IS the map, so there
+        is only one phase and it ends when coverage stops growing.
+
+        Slower by a wide margin — about 435 m of driving against 23 m — and it
+        is the strategy the actual hardware can run.
+        """
+        import time
+
+        from autonomy.bump_explorer import BumpExplorer
+
+        logger.info(
+            "Simulator running, contact-only (room=%s, no range sensors fitted)",
+            room,
+        )
+        explorer = BumpExplorer()
+
+        while not explorer.is_finished:
+            if stop is not None and stop.is_set():
+                logger.info("Scan abandoned")
+                return
+            packet = robot.build_packet(dt_ms=int(dt_s * 1000))
+            pipeline.process(packet)
+            publish_raw_packet(packet)
+            pose = pipeline.pose
+
+            command = explorer.step(
+                pose.x_m, pose.y_m, pose.heading_deg,
+                detector.in_contact, dt_s,
+                pipeline.explored_cells(),
+            )
+            if command.state.value == "FINISHED":
+                break
+
+            robot.drive_holonomic(command.linear_mps, 0.0, command.angular_dps, dt_s)
+            check_contact(
+                BodyTwist(vx_mps=command.linear_mps, omega_dps=command.angular_dps)
+            )
+            time.sleep(dt_s / max(speed, 0.01))
+
+        summary = explorer.summary()
+        logger.info(
+            "Contact mapping complete: %d contact(s), %.1f m driven, "
+            "coverage %s",
+            summary["contacts"], summary["distance_m"],
+            "saturated" if summary["saturated"] else "CUT OFF at a limit",
+        )
+        report("Final")
+        save("contact-only mapping")
+
     def loop() -> None:
         import time
+
+        if strategy is Strategy.CONTACT_ONLY:
+            contact_only_loop()
+            return
 
         logger.info("Simulator running (room=%s, indoor=%s)", room, indoor)
 
@@ -1109,6 +1295,16 @@ def main() -> None:
         action="store_true",
         help="Measure the outline only; skip the row-by-row interior sweep",
     )
+    parser.add_argument(
+        "--hardware",
+        choices=["simulated", "actual", "with-lidar"],
+        default="simulated",
+        help=(
+            "What sensors to assume are fitted. 'actual' is the robot that "
+            "exists — servos, GNSS, Bluetooth, no range sensing — and maps by "
+            "driving into things. See robotmap_common.hardware."
+        ),
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument(
@@ -1120,6 +1316,7 @@ def main() -> None:
 
     app.state.mqtt_publisher = None
     app.state.source_mode = args.source
+    app.state.hardware = hardware_profile(args.hardware)
     if not args.no_mqtt_publish:
         connect_publisher()
 

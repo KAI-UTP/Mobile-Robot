@@ -61,6 +61,12 @@ class Wall:
     y1: float
     x2: float
     y2: float
+    # "shell" is the room itself; "furniture" is something standing in it.
+    #
+    # The distinction exists so the furniture can be replaced without touching
+    # the room — which is what happens every time someone drags a table in the
+    # Omniverse viewport and the scene pushes the new layout over.
+    kind: str = "shell"
 
 
 @dataclass
@@ -104,8 +110,54 @@ class VirtualWorld:
         """
         world = cls.rectangular_room(width_m, height_m)
         for x1, y1, x2, y2 in furnished_room_edges():
-            world.walls.append(Wall(x1, y1, x2, y2))
+            world.walls.append(Wall(x1, y1, x2, y2, kind="furniture"))
         return world
+
+    def set_furniture(self, footprints: list[tuple[float, float, float, float]]) -> int:
+        """Replace everything standing in the room, keeping the room itself.
+
+        This is what makes the Omniverse scene the *physical world* rather than
+        a picture of it. Drag a table across the viewport and the scene pushes
+        the new layout here; the robot then bumps into the table where it now
+        is, and the contact lands on the 2D map at the new place. Without this
+        the 3D view and the thing the robot drives around in were two separate
+        rooms that merely looked alike — and they drifted apart constantly.
+
+        Footprints are axis-aligned `(min_x, min_y, max_x, max_y)` in metres,
+        in the room's own frame. Each becomes four wall segments, because that
+        is what the raycaster and the contact test already understand; nothing
+        downstream needs to know these came from a renderer.
+
+        Returns how many pieces are now in the room.
+        """
+        self.walls = [w for w in self.walls if w.kind != "furniture"]
+
+        for min_x, min_y, max_x, max_y in footprints:
+            # Degenerate footprints would be invisible to the raycaster and
+            # produce contact at a point, which reads as a phantom obstacle.
+            if max_x - min_x < 1e-6 or max_y - min_y < 1e-6:
+                continue
+            corners = [
+                (min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y),
+            ]
+            for index in range(4):
+                x1, y1 = corners[index]
+                x2, y2 = corners[(index + 1) % 4]
+                self.walls.append(Wall(x1, y1, x2, y2, kind="furniture"))
+
+        return sum(1 for w in self.walls if w.kind == "furniture") // 4
+
+    @property
+    def furniture_footprints(self) -> list[tuple[float, float, float, float]]:
+        """The bounding box of each piece currently in the room."""
+        pieces: list[tuple[float, float, float, float]] = []
+        edges = [w for w in self.walls if w.kind == "furniture"]
+        for index in range(0, len(edges) - 3, 4):
+            group = edges[index:index + 4]
+            xs = [c for w in group for c in (w.x1, w.x2)]
+            ys = [c for w in group for c in (w.y1, w.y2)]
+            pieces.append((min(xs), min(ys), max(xs), max(ys)))
+        return pieces
 
     def raycast(self, x: float, y: float, bearing_deg: float, max_range: float) -> float:
         """Exact distance to the nearest wall along a bearing."""

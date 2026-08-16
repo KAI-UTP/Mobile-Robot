@@ -422,6 +422,140 @@ class FilePose:
         return self.latest
 
 
+#: Furniture prims that are decoration rather than obstruction. A rug is not
+#: something a robot bumps into, and reporting it as an obstacle would put a
+#: red patch on the 2D map where the floor is perfectly clear.
+NOT_SOLID = ("Rug", "Shadow", "Label")
+
+
+def furniture_footprints(stage):
+    """Where every solid piece of furniture is on the stage *right now*.
+
+    Read from the prims rather than from the layout constants they were built
+    from, which is the entire point: drag a table across the viewport and this
+    returns its new place, so the robot bumps into it where you just put it.
+
+    Returns axis-aligned `(min_x, min_y, max_x, max_y)` boxes in metres, in the
+    room's own frame. A box footprint is what the simulator's raycaster and
+    contact test already understand, and flattening a 3D prim to its floor
+    footprint is right for a robot that is 0.2 m tall and drives underneath
+    nothing.
+    """
+    root = stage.GetPrimAtPath(Sdf.Path(f"{ROOT}/Furniture"))
+    if not root:
+        return []
+
+    boxes = []
+    for prim in root.GetChildren():
+        path = prim.GetPath().pathString
+        if any(skip in path for skip in NOT_SOLID):
+            continue
+
+        placement = _prim_placement(prim)
+        if placement is None:
+            continue
+        (cx, cy), (half_w, half_d) = placement
+        if half_w <= 0.0 or half_d <= 0.0:
+            continue
+        boxes.append((cx - half_w, cy - half_d, cx + half_w, cy + half_d))
+
+    return boxes
+
+
+def _prim_placement(prim):
+    """Centre and half-extents on the floor plane, or None if it has neither.
+
+    Cubes carry their size in the scale; cylinders carry it in a radius. Both
+    are read through `XformCommonAPI` so that a prim someone has *moved* in the
+    viewport reports where it now is rather than where the script first put it.
+    """
+    try:
+        vectors = UsdGeom.XformCommonAPI(prim).GetXformVectors(0)
+    except Exception:
+        return None
+    if not vectors:
+        return None
+
+    translate, _rotate, scale = vectors[0], vectors[1], vectors[2]
+    cx, cy = float(translate[0]), float(translate[1])
+
+    radius = getattr(prim, "radius", None)
+    if radius is None:
+        try:
+            radius = prim.GetRadiusAttr().Get()
+        except Exception:
+            radius = None
+
+    if radius:
+        # A cylinder's scale is uniform unless someone stretched it.
+        return (cx, cy), (float(radius) * float(scale[0]),
+                          float(radius) * float(scale[1]))
+
+    return (cx, cy), (abs(float(scale[0])) / 2.0, abs(float(scale[1])) / 2.0)
+
+
+class GeometryPublisher:
+    """Tells the mapper what is in the room, whenever it changes.
+
+    The scene is the physical world in this twin, so when someone rearranges it
+    the simulated robot has to be rearranged with it. Without this the renderer
+    and the world the robot drives in were two descriptions that merely looked
+    alike, and they drifted apart repeatedly — the robot gliding through a sofa
+    that existed only on screen was the visible symptom.
+
+    Only posts when the layout actually differs, because this runs off the
+    render loop at 60 Hz and the mapper does not need 60 identical messages a
+    second. Dragging a prim changes the signature; nothing else does.
+    """
+
+    def __init__(self, stage, url=None, interval_s=0.5):
+        self.stage = stage
+        self.url = url or MAPPER_URL
+        self.interval_s = interval_s
+        self._signature = None
+        self._next_check = 0.0
+        self._complained = False
+
+    def poll(self, now):
+        if now < self._next_check:
+            return False
+        self._next_check = now + self.interval_s
+
+        boxes = furniture_footprints(self.stage)
+        signature = tuple(tuple(round(v, 3) for v in b) for b in boxes)
+        if signature == self._signature:
+            return False
+        self._signature = signature
+
+        return self._post(boxes)
+
+    def _post(self, boxes):
+        import urllib.request
+
+        payload = json.dumps({
+            "boxes": [
+                {"min_x_m": a, "min_y_m": b, "max_x_m": c, "max_y_m": d}
+                for a, b, c, d in boxes
+            ]
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            f"{self.url}/api/world/geometry", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=1.5):
+                pass
+        except Exception as exc:
+            if not self._complained:
+                print(f"[room] could not push room geometry: {exc}")
+                self._complained = True
+            return False
+
+        print(f"[room] pushed {len(boxes)} piece(s) of furniture to the simulator")
+        return True
+
+
 class HttpPose:
     """Reads the pose from the same mapper the room comes from.
 
@@ -886,10 +1020,13 @@ class MeasuredRoom:
 
 
 class RoomScene:
-    def __init__(self, stage, source, measured=None):
+    def __init__(self, stage, source, measured=None, geometry=None):
         self.stage = stage
         self.source = source
         self.measured = measured
+        # Pushes the room's furniture to the simulator whenever it is moved,
+        # so the robot drives in the room you can see. See GeometryPublisher.
+        self.geometry = geometry
         self.subscription = None
 
         self.x = self.y = self.heading = 0.0
@@ -916,11 +1053,21 @@ class RoomScene:
             api.SetRotate(Gf.Vec3f(0.0, 0.0, heading))
 
     def _on_update(self, event):
+        now = time.monotonic()
+
         # Polled before the early return below, so the measured room keeps
         # updating even when no pose is arriving — the map is still being
         # refined by a robot this scene cannot see.
         if self.measured is not None:
-            self.measured.poll(time.monotonic())
+            self.measured.poll(now)
+
+        # And the room the robot drives in follows the room on screen. Move a
+        # table in the viewport and the simulated robot meets it in its new
+        # place; this is what makes the 3D scene the physical world rather
+        # than a picture of one. Also before the early return: rearranging the
+        # furniture must work whether or not a scan is currently running.
+        if self.geometry is not None:
+            self.geometry.poll(now)
 
         pose = self.source.read()
         if not pose:
@@ -1059,7 +1206,18 @@ def run_room():
             print("       start services/mapper/main.py --source sim")
             source = DemoPose()
 
-    _scene = RoomScene(stage, source, measured)
+    # The scene is the physical world: move the furniture here and the robot
+    # meets it where you put it. Pushed on a timer rather than on an edit
+    # notification, because dragging a prim in the viewport does not raise one
+    # this script can hook without pulling in more of Kit than it should.
+    publisher = GeometryPublisher(stage)
+    pieces = furniture_footprints(stage)
+    print(
+        f"[room] {len(pieces)} solid piece(s) of furniture — drag them in the "
+        f"viewport and the robot will find them there"
+    )
+
+    _scene = RoomScene(stage, source, measured, geometry=publisher)
     _scene.start()
 
 

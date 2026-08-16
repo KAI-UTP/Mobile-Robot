@@ -126,6 +126,18 @@ def _build_stub_modules(stage: FakeStage):
         def SetRotate(self, value):
             self.prim.rotate = tuple(value)
 
+        def GetXformVectors(self, _time=0):
+            """USD returns (translate, rotate, scale, pivot, rotationOrder).
+
+            Reading the transform back is what lets the scene notice that
+            someone has *dragged* a piece of furniture, which is the whole
+            mechanism behind the 3D view being the physical world.
+            """
+            return (
+                self.prim.translate, self.prim.rotate, self.prim.scale,
+                (0.0, 0.0, 0.0), 0,
+            )
+
     class _Gprim:
         def __init__(self, prim):
             self.prim = prim
@@ -205,26 +217,6 @@ def _load_kit_module(stage: FakeStage) -> types.ModuleType:
 
     exec(compile("\n".join(lines), str(KIT_SCRIPT), "exec"), module.__dict__)
     return module
-
-
-@pytest.fixture
-def kit():
-    stage = FakeStage()
-    module = _load_kit_module(stage)
-
-    # No test reaches the network.
-    #
-    # `room_has_furniture` asks a running mapper what is in the room, which is
-    # the right thing for the scene and the wrong thing for a test: whether
-    # this machine happens to have a container up, and which room it happens to
-    # be simulating, then decides what the scene contains. It did — with the
-    # mapper up and simulating the empty room, the sofa was never built and
-    # `test_the_sofa_is_solid` failed on a change that had nothing to do with
-    # it. Tests that care about the empty room set this themselves, and the
-    # real function is kept reachable so it can be tested directly.
-    module.real_room_has_furniture = module.room_has_furniture
-    module.room_has_furniture = lambda: True
-    return module, stage
 
 
 # ── A room to draw ───────────────────────────────────────────────────────────
