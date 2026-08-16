@@ -260,13 +260,24 @@ def describe_world(
         )
 
     else:
-        # The default rectangular room, drawn furnished so the twin view is
-        # worth looking at even though the simulator's walls are bare.
+        # The default rectangular room. EMPTY, because the simulator's walls
+        # are bare and this description has to be the truth about the room the
+        # robot is in.
+        #
+        # It used to be drawn furnished "so the twin view is worth looking at",
+        # and that made every 3D view a lie: the browser and Omniverse showed a
+        # table, four chairs and a sofa that the robot's world did not contain,
+        # so the robot drove straight through all of them and the 2D map came
+        # back as a bare rectangle. Three views, three different rooms.
+        #
+        # A twin that decorates itself is not a twin. Use --room furnished for
+        # a room with furniture in it, and the simulator will have the
+        # furniture too.
         world = WorldDescription(
-            name="Rectangular room",
+            name="Empty rectangular room",
             width_m=6.0,
             height_m=4.5,
-            boxes=_walls(6.0, 4.5, 2.4, door_x=4.3) + _furniture(6.0, 4.5),
+            boxes=_walls(6.0, 4.5, 2.4, door_x=4.3),
             beacons=_beacons(6.0, 4.5),
         )
 

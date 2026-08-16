@@ -209,6 +209,17 @@ def test_a_finished_explorer_commands_nothing():
 # ── Reporting ────────────────────────────────────────────────────────────────
 
 
+def test_the_distance_cap_is_a_backstop_not_the_intended_finish():
+    """It used to be the thing that actually ended every run.
+
+    Measured on a 6.0 x 4.5 m room the robot needs about 435 m of bouncing to
+    cover it, and the cap sat at 200 m — so runs reported themselves FINISHED
+    at 87.7 % coverage while still discovering 6 % of new floor every 50 m.
+    The cap has to sit well clear of the distance a real room needs.
+    """
+    assert BumpConfig().max_distance_m >= 500.0
+
+
 def test_the_summary_says_whether_it_finished_or_gave_up():
     """Saturated means the room was covered. Hitting a limit does not, and a
     scan that stopped early should not look the same as one that finished."""

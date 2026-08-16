@@ -675,18 +675,32 @@ def test_a_camera_is_created(kit):
     assert f"{module.ROOT}/Camera" in stage.prims
 
 
-def test_the_camera_can_see_both_rooms(kit):
-    """It is a two-screen comparison; a camera framing only the left half
-    defeats the point."""
+def test_the_camera_frames_whatever_is_being_shown(kit):
+    """The camera has to follow the scene's own extent.
+
+    With the measured room switched off the scene is one room wide, and a
+    camera still centred across two would put the room in the left half of the
+    frame with empty floor beside it.
+    """
     module, stage = kit
+    module.SHOW_MEASURED = False
+    module.build_room()
+    camera = stage.prims[f"{module.ROOT}/Camera"]
+
+    assert camera.translate[0] == pytest.approx(module.ROOM_W / 2.0, abs=0.5)
+    assert camera.translate[1] < 0, "camera must stand back from the room"
+    assert camera.translate[2] > 2.4, "camera must be above the walls"
+
+
+def test_the_camera_widens_when_the_measured_room_is_shown(kit):
+    """And back out again if the second room is turned on."""
+    module, stage = kit
+    module.SHOW_MEASURED = True
     module.build_room()
     camera = stage.prims[f"{module.ROOT}/Camera"]
 
     span_x = module.ROOM_W + module.MEASURED_GAP_M + module.ROOM_W
-    # Centred across both rooms, and standing back far enough to see them.
     assert camera.translate[0] == pytest.approx(span_x / 2.0, abs=0.5)
-    assert camera.translate[1] < 0, "camera must stand back from the rooms"
-    assert camera.translate[2] > 2.4, "camera must be above the walls"
 
 
 def test_the_camera_is_tilted_down_at_the_floor(kit):

@@ -106,8 +106,22 @@ class BumpConfig:
     min_new_cells: int = 40
 
     # Hard stops, so a run always ends.
-    max_contacts: int = 400
-    max_distance_m: float = 200.0
+    #
+    # These are backstops, NOT the intended finish. That distinction was lost
+    # when the distance cap sat at 200 m: measured on a 6.0 x 4.5 m room the
+    # robot needs about 435 m of bouncing to cover it, so every run stopped at
+    # 200 m and reported itself FINISHED while coverage was still climbing —
+    # 87.7 % of the floor, and rising 6 % over the previous 50 m.
+    #
+    #     cap 200 m   87.7 % covered, saturated=False   cut off
+    #     cap 400 m   97.7 % covered, saturated=False   cut off
+    #     cap 600 m   97.7 % covered, saturated=True    finished at 435 m
+    #
+    # Set well clear of that so coverage saturation is what ends a run.
+    # `summary()["saturated"]` still says which of the two it was, and a scan
+    # that hit a cap should be read as incomplete.
+    max_contacts: int = 600
+    max_distance_m: float = 600.0
 
 
 @dataclass

@@ -157,10 +157,13 @@ async def get_state() -> JSONResponse:
     return JSONResponse(pipeline.state())
 
 
-@app.get("/twin")
-async def twin_page() -> FileResponse:
-    """The digital twin: the physical room in 3D beside the robot's own map."""
-    return FileResponse(STATIC_DIR / "twin.html")
+# /twin has been removed.
+#
+# It drew the physical room in 3D beside the measured map, which duplicated
+# Omniverse badly: a browser canvas doing painter's-algorithm 3D is never going
+# to beat an RTX renderer at showing a room, and the 2D map it drew alongside
+# is already the whole of `/`. Each tool now does the thing it is best at —
+# Omniverse renders the physical room, the browser draws the floor plan.
 
 
 @app.get("/api/world")

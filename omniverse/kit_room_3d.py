@@ -79,7 +79,19 @@ ROBOT_START_Y_M = 1.0
 POSE_STALE_AFTER_S = 15.0
 
 SHOW_ODOMETRY_GHOST = True
-SHOW_RSSI_MARKER = True
+
+# The orange ball showing where Bluetooth thinks the robot is, and the 2.71 m
+# disc showing how sure it is.
+#
+# OFF, because BLE fusion is switched off. Measuring it showed it made the pose
+# worse — 0.51 m of error became 1.42 m — so the filter ignores it, and drawing
+# a marker for a sensor that contributes nothing implies it is being used.
+#
+# The disc was also the single most visually dominant thing in the room: 2.71 m
+# of radius is 5.42 m across, which covers almost the whole floor of a 6 x 4.5 m
+# room in translucent orange. Honest about BLE's uncertainty, and completely in
+# the way.
+SHOW_RSSI_MARKER = False
 SHOW_BEACON_RANGES = False   # rings showing inferred distance; busy but instructive
 
 # Give the walls and furniture colliders, and the robot a kinematic body.
@@ -94,7 +106,13 @@ ENABLE_PHYSICS = True
 # Build the room the ROBOT drew, standing beside the real one — the two-screen
 # comparison, in 3D, in Omniverse rather than in a browser canvas. Read live
 # from the mapper over plain HTTP, so nothing needs installing inside Kit.
-SHOW_MEASURED = True
+# Build the room the ROBOT drew, standing beside the real one.
+#
+# OFF. Omniverse's job is the physical room; the measured floor plan belongs on
+# the 2D map at http://localhost:8080, which reads it far better — a flat plan
+# is simply a better way to look at a floor plan than an extruded outline seen
+# in perspective.
+SHOW_MEASURED = False
 
 # Which mapper the measured room is read from.
 #
@@ -493,6 +511,32 @@ class DemoPose:
 def _shortest_angle(target, current):
     diff = (target - current + 180.0) % 360.0 - 180.0
     return diff + 360.0 if diff <= -180.0 else diff
+
+
+def room_has_furniture() -> bool:
+    """Does the room the mapper is simulating actually contain furniture?
+
+    Asked rather than assumed, because assuming is how this scene ended up
+    showing a table, four chairs and a sofa in a room the robot knew to be
+    empty. The robot drove straight through all of it, the 2D map came back a
+    bare rectangle, and three views disagreed about the same room.
+
+    Falls back to drawing the furniture when the mapper cannot be reached, so
+    the scene is still worth looking at on its own — but says so, because a
+    silent fallback is what made the original mismatch invisible.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{MAPPER_URL}/api/world", timeout=1.5) as reply:
+            world = json.loads(reply.read().decode("utf-8"))
+    except Exception:
+        print("[room] no mapper reachable — drawing the demo furniture")
+        return True
+
+    furniture = [b for b in world.get("boxes", []) if b.get("kind") == "furniture"]
+    print(f"[room] mapper reports '{world.get('name')}' with {len(furniture)} furniture pieces")
+    return bool(furniture)
 
 
 def build_camera(stage):
@@ -910,7 +954,10 @@ def build_room():
     UsdGeom.Xform.Define(stage, Sdf.Path(ROOT))
 
     build_shell(stage)
-    build_furniture(stage)
+    if room_has_furniture():
+        build_furniture(stage)
+    else:
+        print("[room] the mapper's room is empty — drawing no furniture")
     build_beacons(stage)
     build_lighting(stage)
     build_all_robots(stage)
