@@ -28,9 +28,15 @@
     font-size: 10px; text-transform: uppercase; letter-spacing: .8px;
     padding: 2px 8px; border-radius: 99px; background: #21262d; color: var(--muted);
   }
-  header nav { margin-left: auto; display: flex; gap: 12px; }
+  header nav { margin-left: auto; display: flex; gap: 12px; align-items: center; }
   header nav a { color: var(--accent); text-decoration: none; font-size: 12px; }
   header nav a:hover { text-decoration: underline; }
+  header nav button {
+    background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
+    padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  header nav button:hover:not(:disabled) { background: #388bfd; }
+  header nav button:disabled { opacity: .5; cursor: default; }
 
   #panes { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
   @media (max-width: 1000px) { #panes { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
@@ -94,6 +100,7 @@
   <h1>Digital Twin</h1>
   <span class="tag" id="roomTag">loading…</span>
   <nav>
+    <button id="rescanBtn" onclick="rescan()">Scan again</button>
     <a href="/">map</a>
     <a href="/compare">comparison</a>
     <a href="/scans">scans</a>
@@ -576,6 +583,32 @@ function updateStats() {
   if (meta) {
     document.getElementById('gridHint').textContent =
       `${meta.width}×${meta.height} cells @ ${meta.resolution_m} m`;
+  }
+}
+
+async function rescan() {
+  const measured = state && state.room && state.room.polygon.length >= 3;
+  const finished = measured && state.room.is_closed;
+  if (measured && !confirm(
+      'Wipe the measured room and scan again from the start?\n\n' +
+      (finished
+        ? 'The finished scan stays in the library as its own entry.'
+        : 'This scan has not finished, so it will be discarded.'))) {
+    return;
+  }
+
+  const button = document.getElementById('rescanBtn');
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Restarting…';
+  try {
+    const body = await fetch('/api/rescan', { method: 'POST' }).then(r => r.json());
+    if (body.status !== 'restarted') alert(body.detail || body.status);
+  } catch (err) {
+    alert('Could not reach the mapper: ' + err);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
   }
 }
 

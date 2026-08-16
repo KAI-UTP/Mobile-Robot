@@ -146,6 +146,16 @@
 
   <div class="card">
     <h2>Controls</h2>
+    <button id="rescanBtn" onclick="rescan()"
+            style="background:#1f6feb;border-color:#1f6feb;font-weight:600">
+      Scan the room again
+    </button>
+    <div class="note" id="rescanNote">
+      Wipes the map and drives the whole scan from the start — the perimeter
+      lap, then the row-by-row sweep. A scan that already finished stays in the
+      library as its own entry, so two runs of one room can be compared. A scan
+      still in progress is discarded.
+    </div>
     <button onclick="send('refresh')">Re-extract room</button>
     <button onclick="send('reset_pose')">Reset pose only</button>
     <button onclick="send('clear_map')">Clear map and restart</button>
@@ -463,6 +473,42 @@ function send(action) {
 }
 
 // ── Export ───────────────────────────────────────────────────────────────
+
+// Deliberately over the HTTP endpoint rather than the websocket: this one
+// takes seconds and can be refused, and the reply is worth showing. Fire and
+// forget would leave the user pressing a button that appears to do nothing
+// while the previous scan winds down.
+async function rescan() {
+  const room = state && state.room && state.room.polygon.length >= 3;
+  const finished = room && state.room.is_closed;
+  if (room && !confirm(
+      'Wipe the current map and scan the room again from the start?\n\n' +
+      (finished
+        ? 'The finished scan stays in the library as its own entry.'
+        : 'This scan has not finished, so it will be discarded.'))) {
+    return;
+  }
+
+  const button = document.getElementById('rescanBtn');
+  const note = document.getElementById('rescanNote');
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Restarting…';
+
+  try {
+    const reply = await fetch('/api/rescan', { method: 'POST' });
+    const body = await reply.json();
+    note.textContent =
+      body.status === 'restarted'
+        ? `Scanning "${body.room}" again from the start.`
+        : body.detail || body.status;
+  } catch (err) {
+    note.textContent = 'Could not reach the mapper: ' + err;
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
 
 function downloadMap() {
   if (!state || !state.room || state.room.polygon.length < 3) {

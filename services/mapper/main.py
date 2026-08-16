@@ -90,6 +90,12 @@ app.state.robot_start = (
     float(os.environ.get("ROBOT_START_Y_M", "1.0")),
 )
 
+# How the current scan was set up, so "scan again" can repeat it exactly.
+# None in hardware mode: there is no simulator to restart, and a rescan there
+# can only clear the map and wait for the robot to be driven round again.
+app.state.sim_settings = None
+app.state.coverage = None
+
 # Every connected browser. Guarded because packets arrive on an MQTT thread.
 _clients: set[WebSocket] = set()
 _clients_lock = threading.Lock()
@@ -445,6 +451,19 @@ async def reset() -> JSONResponse:
     return JSONResponse({"status": "reset"})
 
 
+@app.post("/api/rescan")
+async def post_rescan() -> JSONResponse:
+    """Measure the room again, from scratch.
+
+    Run off the event loop: stopping the previous scan means joining its
+    thread, and blocking the loop for that would stall every websocket and
+    freeze the map for everyone watching.
+    """
+    result = await asyncio.to_thread(rescan)
+    status = 409 if result["status"] in ("busy", "error") else 200
+    return JSONResponse(result, status_code=status)
+
+
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
 
@@ -478,6 +497,8 @@ async def _handle_command(message: dict) -> None:
         pipeline.reset(clear_map=True)
     elif action == "refresh":
         pipeline.refresh_room()
+    elif action == "rescan":
+        await asyncio.to_thread(rescan)
     else:
         logger.warning("Unknown command from browser: %r", action)
 
@@ -616,8 +637,19 @@ def start_mqtt_source() -> None:
     threading.Thread(target=subscribe, daemon=True, name="mqtt-source").start()
 
 
-def start_sim_source(room: str, indoor: bool, speed: float, sweep: bool = True) -> None:
+def start_sim_source(
+    room: str,
+    indoor: bool,
+    speed: float,
+    sweep: bool = True,
+    stop: threading.Event | None = None,
+) -> None:
     """Drive the virtual robot on a background thread.
+
+    `stop` lets a run be abandoned part-way, which is what "scan again" needs:
+    the previous robot has to stop touching the pipeline before a new one
+    starts, or two simulators interleave packets into one map and the result is
+    a room drawn by two robots in different places.
 
     Two phases, in this order and for different reasons:
 
@@ -693,6 +725,9 @@ def start_sim_source(room: str, indoor: bool, speed: float, sweep: bool = True) 
 
         # ── Phase 1: the perimeter ────────────────────────────────────────
         while True:
+            if stop is not None and stop.is_set():
+                logger.info("Scan abandoned during the perimeter lap")
+                return
             packet = robot.build_packet(dt_ms=int(dt_s * 1000))
             pipeline.process(packet)
 
@@ -734,6 +769,9 @@ def start_sim_source(room: str, indoor: bool, speed: float, sweep: bool = True) 
         app.state.coverage = planner
 
         while not planner.is_finished:
+            if stop is not None and stop.is_set():
+                logger.info("Scan abandoned during the interior sweep")
+                return
             packet = robot.build_packet(dt_ms=int(dt_s * 1000))
             pipeline.process(packet)
             pose = pipeline.pose
@@ -770,7 +808,73 @@ def start_sim_source(room: str, indoor: bool, speed: float, sweep: bool = True) 
         report("Final")
         save("the interior sweep")
 
-    threading.Thread(target=loop, daemon=True, name="simulator").start()
+    thread = threading.Thread(target=loop, daemon=True, name="simulator")
+    thread.start()
+    return thread
+
+
+# ── Re-running a scan ────────────────────────────────────────────────────────
+#
+# A scan is a one-shot: the robot drives its lap, sweeps, saves, and the thread
+# ends. Measuring the room a second time meant restarting the container, which
+# is a strange thing to ask of someone comparing two runs of the same room.
+
+_scan_lock = threading.Lock()
+_scan_stop = threading.Event()
+_scan_thread: threading.Thread | None = None
+
+
+def rescan() -> dict:
+    """Wipe the map and drive the whole scan again from the start.
+
+    Serialised on a lock, and the running scan is stopped and *joined* before
+    the next one starts. Both matter: two simulator threads interleaving
+    packets into one pipeline would draw a room from two robots standing in
+    different places, and it would look like a mapping bug rather than like two
+    scans fighting.
+    """
+    global _scan_thread
+
+    if not _scan_lock.acquire(blocking=False):
+        return {"status": "busy", "detail": "a restart is already in progress"}
+
+    try:
+        settings = getattr(app.state, "sim_settings", None)
+
+        if _scan_thread is not None and _scan_thread.is_alive():
+            _scan_stop.set()
+            # Generous next to a 0.1 s control step, but the thread may be
+            # inside a sleep scaled by --speed. Joining rather than assuming is
+            # the whole point.
+            _scan_thread.join(timeout=10.0)
+            if _scan_thread.is_alive():
+                return {
+                    "status": "error",
+                    "detail": "the previous scan did not stop; map left untouched",
+                }
+
+        _scan_stop.clear()
+        _scan_thread = None
+
+        # Clear only once the old robot has definitely stopped writing.
+        pipeline.reset(clear_map=True)
+        app.state.coverage = None
+
+        if settings is None:
+            # Hardware mode: there is no simulator to restart, so the honest
+            # thing is to clear the map and say the robot has to be sent round
+            # again — which this service cannot do on its own.
+            logger.info("Map cleared; waiting for the robot to drive again")
+            return {
+                "status": "cleared",
+                "detail": "map cleared — drive the robot again to build a new one",
+            }
+
+        _scan_thread = start_sim_source(stop=_scan_stop, **settings)
+        logger.info("Scan restarted (room=%s)", settings["room"])
+        return {"status": "restarted", "room": settings["room"]}
+    finally:
+        _scan_lock.release()
 
 
 def main() -> None:
@@ -817,12 +921,17 @@ def main() -> None:
     if args.source == "sim":
         # The simulated room IS the ground truth, so score against it.
         app.state.reference_room_name = args.room
-        start_sim_source(
-            args.room,
-            indoor=not args.outdoor,
-            speed=args.speed,
-            sweep=not args.no_sweep,
-        )
+        # Remembered so "scan again" repeats this exact run rather than a
+        # default one — a comparison between two scans is only meaningful if
+        # both were driven the same way.
+        app.state.sim_settings = {
+            "room": args.room,
+            "indoor": not args.outdoor,
+            "speed": args.speed,
+            "sweep": not args.no_sweep,
+        }
+        global _scan_thread
+        _scan_thread = start_sim_source(stop=_scan_stop, **app.state.sim_settings)
     else:
         start_mqtt_source()
 

@@ -582,6 +582,17 @@ is specified rather than assumed, and tested in `tests/test_pilot.py`:
   keeps moving is exactly when it hits something.
 - **The driver's watchdog is the backstop.** It halts the wheels if no command
   arrives, so even `kill -9` stops the robot within `watchdog_s`.
+- **Scan again** (button on the map and twin pages, or `POST /api/rescan`)
+  wipes the map and drives the whole scan from the start, repeating the run it
+  was configured with rather than a default one — two scans of "the same room"
+  are only comparable if both were driven the same way. A finished scan stays
+  in the library as its own entry; an unfinished one is discarded.
+
+  The previous simulator is stopped **and joined** before the map is cleared.
+  Two of them interleaving packets into one pipeline would draw a room from two
+  robots standing in different places, and that looks like a mapping bug rather
+  than like two scans fighting. Concurrent presses get `409 busy` instead of a
+  second robot.
 - **A bump backs the robot off; repeated bumps halt the scan.** Halting on the
   first contact was the original behaviour and it made the robot useless — run
   against a furnished room it clipped a cabinet 43 s in and gave up having
