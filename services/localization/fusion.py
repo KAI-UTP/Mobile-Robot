@@ -300,6 +300,27 @@ class PoseFilter:
             deltas, self.heading_deg, dt_s, self.holonomic_geometry
         )
 
+        # A raised bumper is direct evidence that the robot is NOT translating,
+        # whatever the wheels report. Encoders cannot see the difference
+        # between driving and spinning against an obstacle, so without this the
+        # pose walks straight through whatever the robot is pressed against —
+        # and the map is redrawn around a robot that never went there.
+        #
+        # Rotation is still integrated: a robot held against a wall can pivot,
+        # and discarding that would leave the heading wrong for the recovery.
+        if packet.bumper_active:
+            self.heading_deg = normalize_deg(
+                self.heading_deg + delta.delta_heading_deg
+            )
+            self.linear_velocity_mps = 0.0
+            self.angular_velocity_dps = (
+                delta.delta_heading_deg / dt_s if dt_s > 0 else 0.0
+            )
+            # The contact itself is information, but it is not a fix: grow the
+            # covariance so the filter knows the pose got no better here.
+            self._grow_covariance(0.0, abs(delta.delta_heading_deg))
+            return
+
         self.x_m += delta.delta_x_m
         self.y_m += delta.delta_y_m
         self.heading_deg = normalize_deg(self.heading_deg + delta.delta_heading_deg)

@@ -259,6 +259,61 @@ packets are sent, so no wheel can move. Then:
 python services/servo-bus/calibrate.py --port COM5 --spin-each
 ```
 
+## Two passes, because one is not enough
+
+A scan runs in two phases, and they measure different things.
+
+**1. The perimeter lap.** Wall-following, hugging the boundary all the way
+round. Close range and good incidence angles are what an outline needs, and
+this is what produces the room area. It learns nothing whatsoever about the
+middle of the room.
+
+**2. The row-by-row sweep.** A boustrophedon pass over the interior — along a
+row, sidestep across, back along the next. Slower, and the only way to find a
+table standing in open floor.
+
+The outline is measured and saved after phase 1, so a sweep that is
+interrupted still leaves a usable measurement behind. Phase 2 then adds what
+it found to that same scan rather than creating a second one.
+
+Three details in the sweep are not obvious and are each there for a measured
+reason:
+
+- **It about-faces between rows rather than reversing.** The base is holonomic
+  and *could* drive the next row backwards, but every range sensor faces
+  forward and nothing watches the rear. Holonomy still earns its keep in the
+  sidestep: the robot translates to the next row without rotating, so the row
+  spacing is exactly what was commanded. A differential base has to arc
+  across, and the arc is what makes its rows drift out of parallel.
+- **The turn is closed on the measured heading, not run for a fixed time.** An
+  open-loop about-face falls short by one control step every row; six rows
+  later the sweep is visibly fanning out instead of covering the floor.
+- **The sensors, not the map, decide when the sweep is done.** The room bounds
+  handed over by phase 1 are expressed in the pose estimate's own frame, so
+  they drift with it over a long sweep. A wall actually alongside the robot
+  does not drift.
+
+`/api/coverage` reports the sweep live: rows done, collisions, and every
+obstacle the robot has remembered.
+
+### Two floor areas, not one
+
+| | |
+|---|---|
+| **Total floor** | includes the space under the table — it still has to be floored |
+| **Blocked** | what furniture stands on, hatched in red on both maps |
+| **Usable floor** | what a cleaning robot could actually reach |
+
+A wall and a table leg look identical to a range sensor; both are just
+"occupied". What separates them is where they sit — a wall encloses the room,
+furniture is surrounded by the room's own floor.
+
+One subtlety worth stating, because it caused a wrong answer the first time: a
+range sensor only ever sees an object's *outer faces*, never its middle, so a
+1 m table appears as a hollow 5 cm outline and measures 0.19 m² instead of
+about 1 m². Blocked floor is therefore the room's filled footprint minus its
+observed free floor, not the occupied cells.
+
 ## The product loop
 
 **Scan → judge → save → export.** A demo stops after the first step.
@@ -515,7 +570,8 @@ With the mapper running:
 | Endpoint | Returns |
 |---|---|
 | `GET /` | Live map viewer |
-| `GET /api/room` | Room polygon, area, dimensions, closure |
+| `GET /api/room` | Room polygon, area, dimensions, closure, obstacles, blocked area |
+| `GET /api/coverage` | Sweep progress, collisions, remembered obstacles |
 | `GET /api/state` | Pose, trail, grid metadata, diagnostics |
 | `GET /api/grid` | Raw occupancy bytes |
 | `GET /health` | Service health and filter diagnostics |
@@ -543,3 +599,18 @@ Stated plainly, because a research project should be honest about them:
 - **Sonar hates angled walls.** Beyond ~60° of incidence the pulse reflects
   away and reads as maximum range. The mapper defends against this in two
   independent ways; ToF sensors avoid it at the source.
+- **The sweep costs accuracy to buy coverage.** The interior pass adds roughly
+  50 m of driving to a 6 × 4.5 m room, and dead reckoning drifts over all of
+  it. That is why the outline is kept from the perimeter lap when the sweep
+  grades worse — each pass is used for what it actually measures well, and the
+  grade reported is the one that outline earned.
+- **Furniture pushed against a wall is counted as wall.** The wall/furniture
+  distinction is "enclosed by the room's own floor", so a cabinet flush to a
+  wall is not enclosed and does not appear as blocked area. It is a real gap,
+  not a bug in the implementation: separating the two needs a height sensor,
+  which this robot does not have.
+- **Obstacle memory drifts with the pose.** Obstacles the sweep remembers are
+  stored in the pose estimate's frame, so on a long sweep the same table can
+  be recorded more than once. The map's obstacles come from the occupancy grid
+  and do not have this problem; `/api/coverage` is the robot's own account and
+  does.

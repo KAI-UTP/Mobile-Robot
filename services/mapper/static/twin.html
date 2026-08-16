@@ -153,6 +153,14 @@
     <div class="v" id="err">—</div>
   </div>
   <div class="stat">
+    <div class="k">Blocked floor</div>
+    <div class="v" style="color:#f85149"><span id="blocked">—</span> <small>m²</small></div>
+  </div>
+  <div class="stat">
+    <div class="k">Usable floor</div>
+    <div class="v"><span id="usable">—</span> <small>m²</small></div>
+  </div>
+  <div class="stat">
     <div class="k">Boundary</div>
     <div class="v" id="closed">—</div>
   </div>
@@ -328,6 +336,19 @@ function draw3d() {
     collectBox(faces, bc.x_m, bc.y_m, bc.z_m, 0.13, 0.13, 0.13, '#c74ec7', 1);
   }
 
+  // Blocked floor the robot found for itself. Deliberately drawn as low slabs
+  // rather than as furniture-shaped boxes: the robot measured a footprint on
+  // the floor, not a table, and drawing a table would be claiming knowledge it
+  // does not have. The eye can then compare these against the real furniture
+  // in the same view, which is the entire point of putting them side by side.
+  if (state && state.room && state.room.obstacles) {
+    for (const o of state.room.obstacles) {
+      const w = Math.max(0.05, o.max_x_m - o.min_x_m);
+      const d = Math.max(0.05, o.max_y_m - o.min_y_m);
+      collectBox(faces, o.centre_x_m, o.centre_y_m, 0.12, w, d, 0.24, '#f85149', 0.5);
+    }
+  }
+
   if (state && state.pose) {
     const p = state.pose;
     collectBox(faces, p.x_m, p.y_m, 0.07, 0.28, 0.28, 0.10, '#4aa3ff', 1);
@@ -427,6 +448,33 @@ function overlay2d(X, Y, scale) {
     g2.closePath(); g2.stroke(); g2.setLineDash([]);
   }
 
+  // Blocked floor, hatched rather than solid-filled so the occupancy cells
+  // underneath stay readable — a solid block would hide the very evidence the
+  // area was derived from.
+  if (state && state.room && state.room.obstacles) {
+    for (const o of state.room.obstacles) {
+      const x0 = X(o.min_x_m), x1 = X(o.max_x_m);
+      const y0 = Y(o.max_y_m), y1 = Y(o.min_y_m);   // canvas y is flipped
+      const w = x1 - x0, h = y1 - y0;
+
+      g2.save();
+      g2.beginPath(); g2.rect(x0, y0, w, h); g2.clip();
+      g2.strokeStyle = 'rgba(248,81,73,.55)';
+      g2.lineWidth = 2;
+      g2.beginPath();
+      for (let d = -h; d < w; d += 7) {
+        g2.moveTo(x0 + d, y0 + h);
+        g2.lineTo(x0 + d + h, y0);
+      }
+      g2.stroke();
+      g2.restore();
+
+      g2.strokeStyle = '#f85149';
+      g2.lineWidth = 1.5;
+      g2.strokeRect(x0, y0, w, h);
+    }
+  }
+
   if (state && state.pose) {
     const p = state.pose, px = X(p.x_m), py = Y(p.y_m);
     const sigma = Math.max(p.std_x_m, p.std_y_m);
@@ -485,6 +533,18 @@ function updateStats() {
                          : room.coverage_pct > 50 ? 'var(--warn)' : 'var(--bad)';
     document.getElementById('closed').innerHTML = room.is_closed
       ? '<span class="pill ok">closed</span>' : '<span class="pill warn">open</span>';
+
+    // Two areas, not one. The floor under a table still has to be laid, so a
+    // flooring quote wants `area_m2`; a cleaning robot cannot reach it, so a
+    // cleaning quote wants what is left after the furniture.
+    const blocked = room.blocked_area_m2 || 0;
+    const count = (room.obstacles || []).length;
+    document.getElementById('blocked').textContent = blocked.toFixed(2);
+    document.getElementById('blocked').title =
+      count ? `${count} obstacle${count === 1 ? '' : 's'} found on the floor`
+            : 'no obstacles found';
+    document.getElementById('usable').textContent =
+      Math.max(0, room.area_m2 - blocked).toFixed(2);
 
     if (world) {
       const err = (room.area_m2 - world.floor_area_m2) / world.floor_area_m2 * 100;

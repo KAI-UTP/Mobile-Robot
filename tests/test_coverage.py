@@ -84,16 +84,55 @@ def test_rows_alternate_direction():
     assert planner.sweep_direction == -first
 
 
-def test_it_returns_to_sweeping_after_stepping_across():
+def test_it_about_faces_between_rows():
+    """The base could drive the next row backwards without turning, but every
+    range sensor faces forward — so it turns and keeps them leading."""
     planner = CoveragePlanner(config=CoverageConfig(row_spacing_m=0.2))
     planner.step(_clear(), 1.0, 1.0, 0.0, False, DT)
     planner.step(_blocked(0.25), 3.0, 1.0, 0.0, False, DT)
 
-    for _ in range(40):
-        cmd = planner.step(_clear(), 3.0, 1.0, 0.0, False, DT)
-        if cmd.state == CoverageState.SWEEPING:
+    heading = 0.0
+    for _ in range(200):
+        cmd = planner.step(_clear(), 3.0, 1.0, heading, False, DT)
+        heading = (heading + cmd.angular_dps * DT) % 360
+        if cmd.state == CoverageState.TURNING:
             break
+    assert planner.state == CoverageState.TURNING
+
+
+def test_it_returns_to_sweeping_after_turning_round():
+    planner = CoveragePlanner(config=CoverageConfig(row_spacing_m=0.2))
+    planner.step(_clear(), 1.0, 1.0, 0.0, False, DT)
+    planner.step(_blocked(0.25), 3.0, 1.0, 0.0, False, DT)
+
+    heading = 0.0
+    for _ in range(400):
+        cmd = planner.step(_clear(), 3.0, 1.0, heading, False, DT)
+        heading = (heading + cmd.angular_dps * DT) % 360
+        if planner.row_index > 0 and cmd.state == CoverageState.SWEEPING:
+            break
+
     assert planner.state == CoverageState.SWEEPING
+    # It should now be facing back down the row it came from.
+    assert abs(((heading - 180.0 + 180.0) % 360.0) - 180.0) < 15.0
+
+
+def test_a_turn_that_never_completes_is_abandoned():
+    """Closing the turn on the measured heading means a heading that stops
+    updating — a failed IMU, a robot picked up — would otherwise spin for
+    ever. It must give up and get on with the row."""
+    config = CoverageConfig(row_spacing_m=0.2, turn_timeout_s=1.0)
+    planner = CoveragePlanner(config=config)
+    planner.step(_clear(), 1.0, 1.0, 0.0, False, DT)
+    planner.step(_blocked(0.25), 3.0, 1.0, 0.0, False, DT)
+
+    # Heading pinned at 0 throughout: the turn can never reach its target.
+    for _ in range(400):
+        planner.step(_clear(), 3.0, 1.0, 0.0, False, DT)
+        if planner.row_index > 0 and planner.state == CoverageState.SWEEPING:
+            break
+
+    assert planner.state != CoverageState.TURNING
 
 
 # ── Collisions ───────────────────────────────────────────────────────────────
@@ -219,14 +258,72 @@ def test_the_sweep_terminates():
     """It must finish rather than sweep forever."""
     planner = CoveragePlanner(config=CoverageConfig(max_rows=3, row_spacing_m=0.1))
 
-    for step in range(4000):
+    heading = 0.0
+    for step in range(8000):
         x = 1.0 + (step % 30) * 0.05
         ranges = _clear() if (step % 30) < 25 else _blocked(0.2)
-        planner.step(ranges, x, 1.0, 0.0, False, DT)
+        cmd = planner.step(ranges, x, 1.0, heading, False, DT)
+        heading = (heading + cmd.angular_dps * DT) % 360
         if planner.is_finished:
             break
 
     assert planner.is_finished
+
+
+def test_a_wall_alongside_ends_the_sweep():
+    """`bounds` is expressed in the pose estimate's own frame, so it drifts
+    over a long sweep. The range readings do not, so they get the final say."""
+    planner = CoveragePlanner(bounds=(0.0, 0.0, 100.0, 100.0))
+    planner.step(_clear(), 1.0, 1.0, 0.0, False, DT)
+    planner.step(_blocked(0.25), 3.0, 1.0, 0.0, False, DT)
+
+    # Plenty of room according to the (stale) bounds, but a wall 10 cm to the
+    # left, which is the way the sweep is trying to advance.
+    hemmed_in = [
+        RangeReading(angle_deg=0.0, distance_m=4.0),
+        RangeReading(angle_deg=90.0, distance_m=0.10),
+        RangeReading(angle_deg=-90.0, distance_m=0.10),
+    ]
+    for _ in range(30):
+        planner.step(hemmed_in, 3.0, 1.0, 0.0, False, DT)
+        if planner.is_finished:
+            break
+
+    assert planner.is_finished
+
+
+def test_rows_stay_parallel_over_a_long_sweep():
+    """An open-loop about-face falls short by one control step every row. Six
+    rows later the sweep is fanning out across the room instead of covering
+    it, and the gaps between passes are unswept floor."""
+    planner = CoveragePlanner(config=CoverageConfig(row_spacing_m=0.2))
+
+    heading = 0.0
+    row_headings: list[float] = []
+    last_row = 0
+
+    for _ in range(6000):
+        # End each row after a fixed distance, alternating like a real sweep.
+        blocked = len(row_headings) < 8 and (_ % 400) > 380
+        ranges = _blocked(0.2) if blocked else _clear()
+        cmd = planner.step(ranges, 3.0, 1.0, heading, False, DT)
+        heading = (heading + cmd.angular_dps * DT) % 360
+
+        if cmd.state == CoverageState.SWEEPING and planner.row_index != last_row:
+            row_headings.append(heading)
+            last_row = planner.row_index
+        if len(row_headings) >= 6:
+            break
+
+    # Every row must run along the axis or exactly against it — never at a
+    # steadily growing angle to it.
+    for h in row_headings:
+        off_axis = min(abs(_signed(h)), abs(_signed(h - 180.0)))
+        assert off_axis < 10.0, f"row heading {h:.1f} has drifted off the axis"
+
+
+def _signed(degrees: float) -> float:
+    return (degrees + 180.0) % 360.0 - 180.0
 
 
 def test_a_cluttered_row_is_abandoned_rather_than_swept_forever():

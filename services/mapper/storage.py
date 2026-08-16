@@ -82,6 +82,14 @@ class Scan:
     polygon: list[dict]
 
     quality: ScanQuality
+
+    # What was standing on the floor, and how much of it that covers. Kept
+    # separate from `area_m2` rather than subtracted from it because the two
+    # numbers are sold to different people: a flooring quote needs the floor
+    # under the table, a cleaning quote does not.
+    obstacles: list[dict] = field(default_factory=list)
+    blocked_area_m2: float = 0.0
+
     distance_travelled_m: float = 0.0
     duration_s: float = 0.0
     notes: str = ""
@@ -92,6 +100,11 @@ class Scan:
     grid_meta: dict | None = None
 
     schema_version: int = SCHEMA_VERSION
+
+    @property
+    def usable_area_m2(self) -> float:
+        """Floor the robot could actually reach, after furniture."""
+        return max(0.0, self.area_m2 - self.blocked_area_m2)
 
     def summary(self) -> dict:
         """The subset the library list needs — deliberately without the grid.
@@ -104,6 +117,9 @@ class Scan:
             "name": self.name,
             "created_at": self.created_at,
             "area_m2": round(self.area_m2, 2),
+            "blocked_area_m2": round(self.blocked_area_m2, 2),
+            "usable_area_m2": round(self.usable_area_m2, 2),
+            "obstacle_count": len(self.obstacles),
             "long_side_m": round(self.long_side_m, 2),
             "short_side_m": round(self.short_side_m, 2),
             "perimeter_m": round(self.perimeter_m, 1),

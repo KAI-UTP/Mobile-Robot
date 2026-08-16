@@ -142,6 +142,35 @@ async def get_world() -> JSONResponse:
     return JSONResponse(world.to_dict())
 
 
+@app.get("/api/coverage")
+async def get_coverage() -> JSONResponse:
+    """How the interior sweep is going, and what it has bumped into.
+
+    Separate from `/api/room` because the two answer different questions: the
+    room outline is the *result*, this is the *process*. It is also the only
+    place the robot's own account of an obstacle appears — the map's obstacles
+    come from the occupancy grid, and the two agreeing is a good sign.
+    """
+    planner = getattr(app.state, "coverage", None)
+    if planner is None:
+        return JSONResponse({"active": False, "state": "NOT_STARTED"})
+
+    payload = planner.summary()
+    payload["active"] = not planner.is_finished
+    payload["row_index"] = planner.row_index
+    payload["contacts"] = [
+        {
+            "x_m": round(o.x_m, 3),
+            "y_m": round(o.y_m, 3),
+            "radius_m": o.radius_m,
+            "hits": o.hit_count,
+            "from_collision": o.from_collision,
+        }
+        for o in planner.stats.obstacles
+    ]
+    return JSONResponse(payload)
+
+
 @app.get("/scans")
 async def scans_page() -> FileResponse:
     """The saved-scan library."""
@@ -157,12 +186,27 @@ async def compare_page() -> FileResponse:
 # ── Saved scans ───────────────────────────────────────────────────────────────
 
 
-def save_current_scan(name: str | None = None) -> dict:
+_GRADE_ORDER = {"UNUSABLE": 0, "POOR": 1, "ACCEPTABLE": 2, "GOOD": 3}
+
+
+def save_current_scan(name: str | None = None, replace: str | None = None) -> dict:
     """Persist whatever the robot has mapped so far.
 
     Called automatically when a circuit closes, and manually from the UI. The
     grade is computed here rather than trusted from the caller so a scan
     cannot be saved claiming to be better than it was.
+
+    `replace` re-saves over an existing scan, which is how the two-phase run
+    works: the perimeter lap saves the outline immediately so an interrupted
+    sweep cannot lose it, and the sweep then adds what it found to that same
+    record. One room should produce one scan, not two rows in the library that
+    the user has to work out are the same room.
+
+    When replacing, the outline is kept from whichever pass graded better. The
+    perimeter lap measures the boundary from close range and usually wins; the
+    sweep contributes the obstacles, which only it can see. Taking the best of
+    each is not flattery — it is using each pass for what it actually measured
+    well, and the grade reported is still the one that outline earned.
     """
     room = pipeline.refresh_room()
     if room is None or not room.polygon:
@@ -175,10 +219,15 @@ def save_current_scan(name: str | None = None) -> dict:
         pose_confidence=pose.position_confidence if pose else 0.0,
     )
 
+    previous = store.load(replace) if replace else None
+
     scan = Scan(
-        scan_id=store.new_id(),
-        name=safe_name(name or "", fallback=f"Room {len(store.list_scans()) + 1}"),
-        created_at=datetime.now(UTC).isoformat(),
+        scan_id=previous.scan_id if previous else store.new_id(),
+        name=(
+            previous.name if previous
+            else safe_name(name or "", fallback=f"Room {len(store.list_scans()) + 1}")
+        ),
+        created_at=previous.created_at if previous else datetime.now(UTC).isoformat(),
         robot_id=pipeline.robot_id,
         area_m2=room.area_m2,
         perimeter_m=room.perimeter_m,
@@ -186,10 +235,25 @@ def save_current_scan(name: str | None = None) -> dict:
         short_side_m=room.bounding_height_m,
         polygon=[{"x_m": p.x_m, "y_m": p.y_m} for p in room.polygon],
         quality=quality,
+        obstacles=[o.model_dump() for o in room.obstacles],
+        blocked_area_m2=room.blocked_area_m2,
         distance_travelled_m=pose.distance_travelled_m if pose else 0.0,
         grid_b64=ScanStore.encode_grid(pipeline.grid_bytes()),
         grid_meta=pipeline.state()["grid"],
     )
+
+    if previous is not None and _GRADE_ORDER.get(
+        previous.quality.grade, 0
+    ) > _GRADE_ORDER.get(quality.grade, 0):
+        # The earlier pass measured the boundary better. Keep its outline and
+        # its honest grade; only the obstacle findings carry forward.
+        scan.area_m2 = previous.area_m2
+        scan.perimeter_m = previous.perimeter_m
+        scan.long_side_m = previous.long_side_m
+        scan.short_side_m = previous.short_side_m
+        scan.polygon = previous.polygon
+        scan.quality = previous.quality
+
     store.save(scan)
     return scan.summary()
 
@@ -541,8 +605,22 @@ def start_mqtt_source() -> None:
     threading.Thread(target=subscribe, daemon=True, name="mqtt-source").start()
 
 
-def start_sim_source(room: str, indoor: bool, speed: float) -> None:
-    """Drive the virtual robot on a background thread."""
+def start_sim_source(room: str, indoor: bool, speed: float, sweep: bool = True) -> None:
+    """Drive the virtual robot on a background thread.
+
+    Two phases, in this order and for different reasons:
+
+    1. **Perimeter lap.** Wall-following observes the boundary from close
+       range and at good incidence angles, which is what the room *outline*
+       needs. It learns nothing about the middle of the room.
+    2. **Row-by-row sweep.** A boustrophedon pass over the interior, which is
+       the only way to find a table standing in open floor. Without it the
+       reported floor area silently includes the space furniture occupies.
+
+    The outline is measured and saved after phase 1 regardless, so a sweep
+    that is interrupted still leaves a usable room measurement behind.
+    """
+    from simulator.coverage import CoveragePlanner, CoverageState
     from simulator.explorer import ExploreState, WallFollower
     from simulator.virtual_robot import VirtualRobot, VirtualWorld
 
@@ -559,10 +637,47 @@ def start_sim_source(room: str, indoor: bool, speed: float) -> None:
     follower = WallFollower()
     dt_s = 0.1
 
+    def report(stage: str) -> None:
+        pipeline.refresh_room()
+        result = pipeline.room
+        if result is None:
+            return
+        logger.info(
+            "%s — %.2f m2 floor, %.2f m2 blocked by %d obstacle(s), "
+            "%.2f m2 usable, %.2f x %.2f m, closed=%s",
+            stage,
+            result.area_m2,
+            result.blocked_area_m2,
+            len(result.obstacles),
+            result.usable_area_m2,
+            result.bounding_width_m,
+            result.bounding_height_m,
+            result.is_closed,
+        )
+
+    saved_scan_id: dict[str, str | None] = {"id": None}
+
+    def save(stage: str) -> None:
+        # Saved automatically. Finishing a scan and then losing it because
+        # nobody pressed a button is the worst possible outcome for someone who
+        # just drove a robot round a room.
+        try:
+            saved = save_current_scan(replace=saved_scan_id["id"])
+            saved_scan_id["id"] = saved["scan_id"]
+            logger.info(
+                "Saved '%s' (%s) after %s — %s",
+                saved["name"], saved["grade"], stage,
+                f"{saved['usable_area_m2']} m2 usable of {saved['area_m2']} m2",
+            )
+        except Exception:
+            logger.exception("Could not save the scan after %s", stage)
+
     def loop() -> None:
         import time
 
         logger.info("Simulator running (room=%s, indoor=%s)", room, indoor)
+
+        # ── Phase 1: the perimeter ────────────────────────────────────────
         while True:
             packet = robot.build_packet(dt_ms=int(dt_s * 1000))
             pipeline.process(packet)
@@ -571,35 +686,75 @@ def start_sim_source(room: str, indoor: bool, speed: float) -> None:
                 packet.ranges, pipeline.pose.x_m, pipeline.pose.y_m, dt_s
             )
             if command.state == ExploreState.FINISHED:
-                logger.info(
-                    "Circuit complete after %.1f m", follower.distance_travelled_m
-                )
-                pipeline.refresh_room()
-                room_result = pipeline.room
-                if room_result:
-                    logger.info(
-                        "Room: %.2f m2, %.2f x %.2f m, closed=%s",
-                        room_result.area_m2,
-                        room_result.bounding_width_m,
-                        room_result.bounding_height_m,
-                        room_result.is_closed,
-                    )
-                # Save automatically. Finishing a scan and then losing it
-                # because nobody pressed a button is the worst possible
-                # outcome for someone who just drove a robot round a room.
-                try:
-                    saved = save_current_scan()
-                    logger.info(
-                        "Saved as '%s' (%s) — see http://localhost:8080/scans",
-                        saved["name"], saved["grade"],
-                    )
-                except Exception:
-                    logger.exception("Could not save the completed scan")
                 break
 
             robot.drive(command.linear_mps, command.angular_dps, dt_s)
             # speed > 1 fast-forwards the demo; the physics step is unchanged.
             time.sleep(dt_s / max(speed, 0.01))
+
+        logger.info("Perimeter complete after %.1f m", follower.distance_travelled_m)
+        report("Outline")
+        save("the perimeter lap")
+
+        if not sweep:
+            return
+
+        # ── Phase 2: the interior ─────────────────────────────────────────
+        # The sweep is given the outline phase 1 just measured, so it turns at
+        # the end of each row instead of discovering the wall by hitting it.
+        # This is the payoff for doing the perimeter first.
+        outline = pipeline.room
+        bounds = None
+        if outline and outline.polygon:
+            xs = [p.x_m for p in outline.polygon]
+            ys = [p.y_m for p in outline.polygon]
+            bounds = (min(xs), min(ys), max(xs), max(ys))
+
+        logger.info(
+            "Sweeping the interior row by row to find what is on the floor "
+            "(bounds %s)",
+            "unknown" if bounds is None else
+            f"{bounds[0]:.1f},{bounds[1]:.1f} to {bounds[2]:.1f},{bounds[3]:.1f}",
+        )
+        planner = CoveragePlanner(bounds=bounds)
+        app.state.coverage = planner
+
+        while not planner.is_finished:
+            packet = robot.build_packet(dt_ms=int(dt_s * 1000))
+            pipeline.process(packet)
+            pose = pipeline.pose
+
+            command = planner.step(
+                packet.ranges,
+                pose.x_m,
+                pose.y_m,
+                pose.heading_deg,
+                packet.bumper_active,
+                dt_s,
+            )
+            if command.state == CoverageState.FINISHED:
+                break
+
+            # Strafing, not turning: the base is holonomic, so it changes rows
+            # without ever taking its forward sensor off the direction of
+            # travel. This is the one manoeuvre a differential robot cannot do.
+            robot.drive_holonomic(
+                command.linear_mps, command.lateral_mps, command.angular_dps, dt_s
+            )
+            time.sleep(dt_s / max(speed, 0.01))
+
+        summary = planner.summary()
+        logger.info(
+            "Sweep complete: %d rows, %.1f m driven, %d obstacle(s) found "
+            "(%d by contact), %d collision(s)",
+            summary["rows_completed"],
+            summary["distance_m"],
+            summary["obstacles_found"],
+            summary["obstacles_from_contact"],
+            summary["collisions"],
+        )
+        report("Final")
+        save("the interior sweep")
 
     threading.Thread(target=loop, daemon=True, name="simulator").start()
 
@@ -626,6 +781,11 @@ def main() -> None:
     parser.add_argument(
         "--speed", type=float, default=4.0, help="Simulation speed multiplier"
     )
+    parser.add_argument(
+        "--no-sweep",
+        action="store_true",
+        help="Measure the outline only; skip the row-by-row interior sweep",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument(
@@ -643,7 +803,12 @@ def main() -> None:
     if args.source == "sim":
         # The simulated room IS the ground truth, so score against it.
         app.state.reference_room_name = args.room
-        start_sim_source(args.room, indoor=not args.outdoor, speed=args.speed)
+        start_sim_source(
+            args.room,
+            indoor=not args.outdoor,
+            speed=args.speed,
+            sweep=not args.no_sweep,
+        )
     else:
         start_mqtt_source()
 

@@ -27,7 +27,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from robotmap_common.geometry import RobotGeometry, local_xy_to_gps, normalize_deg
+from robotmap_common.holonomic import (
+    BodyTwist,
+    HolonomicGeometry,
+    integrate_twist,
+    inverse_kinematics,
+)
 from robotmap_common.models import (
+    DriveKind,
     EncoderData,
     GpsData,
     GpsFixQuality,
@@ -118,6 +125,18 @@ class VirtualWorld:
                     crossings += 1
         return crossings % 2 == 1
 
+    def nearest_wall_distance(self, x: float, y: float) -> float:
+        """Distance from a point to the closest surface, in any direction.
+
+        Unlike `raycast` this does not care which way the robot is facing,
+        which is exactly right for a bumper: contact is contact regardless of
+        heading, and the furniture the robot clips with its shoulder is the
+        furniture the forward sensor never saw.
+        """
+        if not self.walls:
+            return math.inf
+        return min(_point_segment_distance(x, y, wall) for wall in self.walls)
+
 
 def _ray_segment_intersection(
     ox: float, oy: float, dx: float, dy: float, wall: Wall
@@ -205,6 +224,7 @@ class VirtualRobot:
         sensor_angles_deg: tuple[float, ...] = (0.0, -45.0, 45.0, -90.0, 90.0),
         max_range_m: float = 4.0,
         seed: int = 42,
+        holonomic_geometry: HolonomicGeometry | None = None,
     ) -> None:
         self.robot_id = robot_id
         self.world = world or VirtualWorld.rectangular_room()
@@ -214,6 +234,12 @@ class VirtualRobot:
         self.max_range_m = max_range_m
         self.rng = random.Random(seed)
 
+        # The kiwi base, used by `drive_holonomic`. Kept alongside the
+        # differential `geometry` rather than replacing it: the two-wheel model
+        # still drives the wall-following lap and all the tests written against
+        # it, and swapping it out wholesale would rewrite work that is correct.
+        self.holonomic_geometry = holonomic_geometry or HolonomicGeometry()
+
         # Ground truth — never exposed in telemetry, only used for scoring.
         self.true_x = 1.0
         self.true_y = 1.0
@@ -221,8 +247,17 @@ class VirtualRobot:
 
         self.left_ticks = 0
         self.right_ticks = 0
+        # Cumulative counts for all three omni wheels. Only filled once the
+        # robot has been driven holonomically; a differential run leaves this
+        # None so the packet does not claim a drive it did not use.
+        self.wheel_ticks: list[int] | None = None
         self.sequence = 0
         self.battery_soc = 100.0
+
+        # True while the robot is in contact with something. Set by the drive
+        # step, cleared once it has backed away.
+        self.bumper_active = False
+        self.collision_count = 0
 
         self._gyro_accumulated_bias = 0.0
         self._imu_heading = 0.0
@@ -284,6 +319,91 @@ class VirtualRobot:
             self.true_heading + self._gyro_accumulated_bias
         )
 
+        self.battery_soc = max(0.0, self.battery_soc - 0.002 * dt_s)
+
+    def drive_holonomic(
+        self, vx_mps: float, vy_mps: float, omega_dps: float, dt_s: float
+    ) -> None:
+        """Advance ground truth for the kiwi base, including contact.
+
+        The difference from `drive` is `vy`: this base can strafe. That is what
+        lets the coverage sweep step sideways to the next row while still
+        facing along it, keeping the forward sensor pointed where the robot is
+        actually going.
+
+        Contact is resolved here rather than left to the controller, because a
+        simulator in which the robot glides through a table teaches the
+        avoidance logic nothing. The robot is stopped at the surface and the
+        bumper is raised — which is precisely the event the planner exists to
+        handle.
+        """
+        twist = BodyTwist(vx_mps=vx_mps, vy_mps=vy_mps, omega_dps=omega_dps)
+
+        # Slip first, so the encoders below are derived from the motion that
+        # actually happened rather than the motion that was asked for. Omni
+        # wheels slip more than plain ones: the free rollers on the passive
+        # axis are in contact over a much smaller patch.
+        slip = 1.0 + self.rng.gauss(0.0, self.noise.wheel_slip_stddev * 1.5)
+        actual = BodyTwist(
+            vx_mps=twist.vx_mps * slip,
+            vy_mps=twist.vy_mps * slip,
+            omega_dps=twist.omega_dps,
+        )
+
+        delta = integrate_twist(actual, self.true_heading, dt_s)
+        next_x = self.true_x + delta.delta_x_m
+        next_y = self.true_y + delta.delta_y_m
+
+        # Contact test at the destination. Checked before committing, so the
+        # robot stops against the obstacle instead of ending up inside it and
+        # then reporting nonsense ranges from within a wall.
+        # The chassis radius is the wheel offset: the wheels sit at the rim, so
+        # that is the distance from centre to the outermost part of the robot.
+        radius = self.holonomic_geometry.wheel_offset_m
+        clearance_now = self.world.nearest_wall_distance(self.true_x, self.true_y)
+        clearance_next = self.world.nearest_wall_distance(next_x, next_y)
+
+        # A move is refused only if it would press *further* into something.
+        # Testing the destination alone is not enough: once the robot is inside
+        # the contact radius every destination fails that test, including the
+        # one that backs it out, and it stays wedged for the rest of the run.
+        # Real contact constrains the direction of motion, not all of it.
+        touching = clearance_next < radius
+        blocked = touching and clearance_next <= clearance_now
+
+        if not blocked:
+            self.true_x, self.true_y = next_x, next_y
+
+        if touching and not self.bumper_active:
+            self.collision_count += 1
+        self.bumper_active = touching
+
+        # Rotation always resolves. A robot pressed against a wall can still
+        # turn on the spot, and forbidding it would leave the recovery
+        # manoeuvre with nothing that works.
+        self.true_heading = normalize_deg(self.true_heading + delta.delta_heading_deg)
+
+        # Servo encoders count the wheel turning whether or not the chassis
+        # moved. Driving into a wall therefore looks like progress to odometry
+        # alone — which is the whole reason the map is built from ranges.
+        speeds = inverse_kinematics(actual, self.holonomic_geometry)
+        counts = self.holonomic_geometry.ticks_per_revolution
+        circumference = self.holonomic_geometry.wheel_circumference_m
+        if self.wheel_ticks is None:
+            self.wheel_ticks = [0, 0, 0]
+        for index, rim_speed in enumerate(speeds.values):
+            self.wheel_ticks[index] += round(
+                rim_speed * dt_s / circumference * counts
+            )
+
+        # Keep the two-wheel fields consistent for readers that only know the
+        # older contract. `drive` says which to trust.
+        self.left_ticks, self.right_ticks = self.wheel_ticks[0], self.wheel_ticks[1]
+
+        self._gyro_accumulated_bias += self.noise.gyro_bias_dps * dt_s
+        self._imu_heading = normalize_deg(
+            self.true_heading + self._gyro_accumulated_bias
+        )
         self.battery_soc = max(0.0, self.battery_soc - 0.002 * dt_s)
 
     # ── Sensors ───────────────────────────────────────────────────────────
@@ -454,11 +574,21 @@ class VirtualRobot:
 
     def build_packet(self, dt_ms: int = 100, include_gps: bool = True) -> SensorPacket:
         self.sequence += 1
+        # The drive kind reports how the robot was last actually moved, rather
+        # than what it is capable of. A packet claiming three wheels while
+        # carrying two wheels' worth of counts would make the odometry silently
+        # wrong in a way that is very hard to see.
+        holonomic = self.wheel_ticks is not None
         return SensorPacket(
             robot_id=self.robot_id,
             timestamp=datetime.now(UTC).isoformat(),
             sequence=self.sequence,
             link=LinkType.SIMULATED,
+            drive=(
+                DriveKind.HOLONOMIC_3WHEEL if holonomic else DriveKind.DIFFERENTIAL
+            ),
+            wheel_ticks=list(self.wheel_ticks) if holonomic else None,
+            bumper_active=self.bumper_active,
             encoders=EncoderData(
                 left_ticks=self.left_ticks,
                 right_ticks=self.right_ticks,

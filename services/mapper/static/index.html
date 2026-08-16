@@ -90,6 +90,7 @@
     <div><i style="background:#30363d"></i> not yet seen</div>
     <div><i style="background:#f0c674"></i> path driven</div>
     <div><i style="background:#3fb950"></i> room outline</div>
+    <div><i style="background:#f85149"></i> blocked (furniture)</div>
   </div>
 </div>
 
@@ -109,6 +110,17 @@
     <div class="row"><span>Perimeter</span><b id="perim">—</b></div>
     <div class="row"><span>Boundary</span><b id="closed">—</b></div>
     <div class="note" id="areaNote">Drive the robot around the walls to close the boundary.</div>
+  </div>
+
+  <div class="card">
+    <h2>What is on the floor</h2>
+    <div class="row"><span>Obstacles found</span><b id="obsCount">—</b></div>
+    <div class="row"><span>Blocked</span><b id="blocked">—</b></div>
+    <div class="row"><span>Usable floor</span><b id="usable">—</b></div>
+    <div class="note" id="obsNote">
+      Total floor area still counts the space under a table — it has to be
+      floored. Usable floor is what the robot could actually reach.
+    </div>
   </div>
 
   <div class="card">
@@ -195,6 +207,7 @@ function draw() {
   drawGrid(T);
   drawTrail(T);
   drawRoom(T);
+  drawObstacles(T);
   drawRobot(T);
 }
 
@@ -222,7 +235,7 @@ function drawGrid(T) {
                        T.y(meta.origin_y_m + meta.height * meta.resolution_m),
                        meta.width  * meta.resolution_m * T.scale,
                        meta.height * meta.resolution_m * T.scale);
-    drawTrail(T); drawRoom(T); drawRobot(T);
+    drawTrail(T); drawRoom(T); drawObstacles(T); drawRobot(T);
   });
 }
 
@@ -252,6 +265,36 @@ function drawRoom(T) {
   ctx.closePath();
   ctx.stroke();
   ctx.setLineDash([]);
+}
+
+function drawObstacles(T) {
+  const obstacles = state && state.room && state.room.obstacles;
+  if (!obstacles || !obstacles.length) return;
+
+  // Hatched, not filled. The occupancy cells underneath are the evidence the
+  // blocked area was derived from, and a solid block would hide them.
+  for (const o of obstacles) {
+    const x0 = T.x(o.min_x_m), x1 = T.x(o.max_x_m);
+    const y0 = T.y(o.max_y_m), y1 = T.y(o.min_y_m);   // canvas y is flipped
+    const w = x1 - x0, h = y1 - y0;
+    if (!(w > 0) || !(h > 0)) continue;
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0, y0, w, h); ctx.clip();
+    ctx.strokeStyle = 'rgba(248,81,73,.55)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let d = -h; d < w; d += 7) {
+      ctx.moveTo(x0 + d, y0 + h);
+      ctx.lineTo(x0 + d + h, y0);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.strokeStyle = '#f85149';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0, y0, w, h);
+  }
 }
 
 function drawRobot(T) {
@@ -304,6 +347,25 @@ function updatePanel() {
     document.getElementById('areaNote').textContent = room.is_closed
       ? `Boundary complete. ${room.coverage_pct.toFixed(0)}% of the floor was directly observed; the rest is enclosed by it.`
       : 'Boundary still open — keep following the walls until the loop closes.';
+
+    const obstacles = room.obstacles || [];
+    const blocked = room.blocked_area_m2 || 0;
+    document.getElementById('obsCount').textContent = obstacles.length;
+    document.getElementById('blocked').textContent  = fmt(blocked, 2, ' m²');
+    document.getElementById('usable').textContent   =
+      fmt(Math.max(0, room.area_m2 - blocked), 2, ' m²');
+
+    if (!obstacles.length) {
+      // Say why nothing is shown. A blank "0" invites the reader to conclude
+      // the room is empty, when the more likely explanation is that only the
+      // walls have been driven so far.
+      document.getElementById('obsNote').textContent = room.coverage_pct < 50
+        ? 'Nothing found yet — wall-following only sees the edges. The row-by-row sweep is what finds furniture in the middle.'
+        : 'No furniture detected standing in the open floor.';
+    } else {
+      document.getElementById('obsNote').textContent =
+        `${obstacles.length} area${obstacles.length === 1 ? '' : 's'} the robot cannot drive over, hatched in red on the map. Total floor still includes the space beneath them.`;
+    }
   }
 
   const p = state.pose;
