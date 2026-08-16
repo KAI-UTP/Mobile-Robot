@@ -582,9 +582,17 @@ is specified rather than assumed, and tested in `tests/test_pilot.py`:
   keeps moving is exactly when it hits something.
 - **The driver's watchdog is the backstop.** It halts the wheels if no command
   arrives, so even `kill -9` stops the robot within `watchdog_s`.
-- **A bump during the perimeter lap halts the scan.** Wall-following has no
-  recovery behaviour — it assumed the sensors saw the wall, and a contact means
-  they did not.
+- **A bump backs the robot off; repeated bumps halt the scan.** Halting on the
+  first contact was the original behaviour and it made the robot useless — run
+  against a furnished room it clipped a cabinet 43 s in and gave up having
+  measured nothing. Furniture against a wall is the normal case. Six contacts
+  in one lap is not, and means a robot wedged somewhere shoving.
+- **It sidesteps out of a squeeze.** Wall-following regulates one wall and
+  watches ahead; nothing watches the other flank, so the robot drove into the
+  0.40 m gap between a cabinet and the wall reporting 4 m of clear space ahead
+  the whole way in. Because the base is holonomic it translates out sideways
+  *while holding its heading*, so the wall-following loop is never disturbed —
+  a differential robot would have to turn away and re-acquire the wall.
 - **Speed is limited in the pilot *and* in the driver**, independently, because
   the one that matters is whichever is lower.
 

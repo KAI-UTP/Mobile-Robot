@@ -71,6 +71,24 @@ class PilotConfig:
     # Sensor data older than this means the robot is driving blind.
     stale_after_s: float = 0.6
 
+    # How far to reverse after grazing something during the perimeter lap, and
+    # how many such contacts the lap is allowed before the scan is abandoned.
+    #
+    # Halting on the first bump was the original behaviour and it is wrong:
+    # run against a furnished room the robot clipped a cabinet standing against
+    # a wall 43 seconds in and gave up, having measured nothing. Furniture
+    # against a wall is the normal case, not an anomaly. Repeated bumps are
+    # still a fault — that is a robot wedged somewhere, shoving.
+    bump_backoff_m: float = 0.16
+    max_bumps: int = 6
+
+    # How close anything may come to the robot's flank before it sidesteps
+    # away. The chassis radius is 0.10 m, so this is contact plus a working
+    # margin — deliberately well below the 0.35 m the follower holds against
+    # the wall it is following, which must not trigger it.
+    min_side_clearance_m: float = 0.20
+    side_escape_mps: float = 0.10
+
     # Skip the interior sweep and measure the outline only.
     sweep: bool = True
 
@@ -84,6 +102,7 @@ class PilotStatus:
     phase: ScanPhase = ScanPhase.WAITING
     note: str = ""
     packets: int = 0
+    bumps: int = 0
     stopped_reason: str = ""
     started_at: float = field(default_factory=time.monotonic)
 
@@ -92,6 +111,7 @@ class PilotStatus:
             "phase": self.phase.value,
             "note": self.note,
             "packets": self.packets,
+            "bumps": self.bumps,
             "stopped_reason": self.stopped_reason,
             "elapsed_s": round(time.monotonic() - self.started_at, 1),
         }
@@ -118,6 +138,7 @@ class Pilot:
         self.planner: CoveragePlanner | None = None
         self._bounds = bounds
         self._phase_started_at = time.monotonic()
+        self._backoff_remaining_m = 0.0
 
     # ── The loop ──────────────────────────────────────────────────────────
 
@@ -143,11 +164,14 @@ class Pilot:
 
         self.status.packets += 1
 
-        if packet.bumper_active and self.status.phase == ScanPhase.PERIMETER:
-            # Wall-following has no recovery behaviour — it assumes the range
-            # sensors saw the wall. A contact means they did not, and pressing
-            # on grinds the wheels against it.
-            return self._halt("bumper triggered during the perimeter lap")
+        if self.status.phase == ScanPhase.PERIMETER:
+            # Wall-following has no recovery behaviour of its own — it assumes
+            # the range sensors saw the wall, and a contact means they did not.
+            # The pilot supplies the recovery rather than the controller,
+            # because backing off is about the robot, not about the strategy.
+            recovery = self._handle_bump(packet, dt_s)
+            if recovery is not None:
+                return recovery
 
         if self.status.phase == ScanPhase.WAITING:
             self.status.phase = ScanPhase.PERIMETER
@@ -157,6 +181,50 @@ class Pilot:
             return self._perimeter(packet, pose, dt_s)
 
         return self._sweep(packet, pose, dt_s)
+
+    def _handle_bump(self, packet, dt_s: float) -> BodyTwist | None:
+        """Back away from a contact, or give up if they keep happening.
+
+        Returns the twist to send while recovering, or None to carry on with
+        the lap.
+
+        A cabinet or a skirting board sticking out is normal in a real room,
+        and the sensors miss the low ones — the first version of this halted
+        the whole scan on the first graze, which against a furnished room meant
+        giving up 43 seconds in having measured nothing.
+
+        Repeated contacts are a different matter: that is a robot wedged
+        somewhere and shoving, which no amount of backing off will fix.
+        """
+        if packet.bumper_active and self._backoff_remaining_m <= 0.0:
+            self.status.bumps += 1
+            if self.status.bumps > self.config.max_bumps:
+                return self._halt(
+                    f"{self.status.bumps} contacts during the perimeter lap — "
+                    "the robot appears to be stuck"
+                )
+            logger.warning(
+                "Contact %d of %d — backing off",
+                self.status.bumps, self.config.max_bumps,
+            )
+            self._backoff_remaining_m = self.config.bump_backoff_m
+
+        if self._backoff_remaining_m <= 0.0:
+            return None
+
+        self._backoff_remaining_m -= self.config.max_linear_mps * dt_s
+        self.status.note = "backing off after contact"
+
+        # Reverse and turn away from the wall being followed, so the follower
+        # re-acquires it from a clear position rather than immediately driving
+        # back into whatever was just hit.
+        away = 1.0 if self.follower.config.follow_right_wall else -1.0
+        return self._limit(
+            BodyTwist(
+                vx_mps=-self.config.max_linear_mps * 0.6,
+                omega_dps=away * 25.0,
+            )
+        )
 
     def _perimeter(self, packet, pose, dt_s: float) -> BodyTwist:
         if time.monotonic() - self._phase_started_at > self.config.perimeter_timeout_s:
@@ -176,12 +244,70 @@ class Pilot:
             self.planner = CoveragePlanner(bounds=self._bounds)
             return BodyTwist()
 
-        # Wall-following predates the holonomic base and speaks in forward and
-        # turn only. That is not a gap worth closing: hugging a wall means
-        # holding a distance to one side while driving along it, which is
-        # exactly a differential motion. Strafing would not make the lap
-        # shorter or the outline better.
-        return self._limit(BodyTwist(vx_mps=command.linear_mps, omega_dps=command.angular_dps))
+        # Wall-following itself speaks in forward and turn only — hugging a
+        # wall means holding a distance to one side while driving along it,
+        # which is a differential motion. Keeping clear of everything else is
+        # a separate concern, and that one does need the third axis.
+        return self._limit(
+            self._keep_clear(
+                packet.ranges,
+                BodyTwist(vx_mps=command.linear_mps, omega_dps=command.angular_dps),
+            )
+        )
+
+    def _keep_clear(self, ranges, twist: BodyTwist) -> BodyTwist:
+        """Sidestep away from anything crowding the robot's flanks.
+
+        Wall-following regulates the distance to ONE wall and watches ahead.
+        Nothing watches the other side, so the robot will drive straight into
+        a gap too narrow for it: measured against a furnished room it wedged
+        itself in the 0.40 m slot between a cabinet and the wall, reporting
+        4.0 m of clear space ahead the whole way in, and bumped six times
+        against one piece of furniture.
+
+        The fix uses the platform. A holonomic base can translate sideways out
+        of a squeeze *while holding its heading*, so the wall-following loop is
+        left completely undisturbed — it still sees the wall at the angle it
+        expects. A differential robot would have to turn away, lose the wall,
+        and re-acquire it, which is why this layer is usually a stop instead.
+
+        Only hard clearance triggers it. The followed wall legitimately sits at
+        the target distance, so the threshold is set by the chassis rather than
+        by the controller: below this the robot is about to touch something.
+        """
+        left = self._closest(ranges, +1)
+        right = self._closest(ranges, -1)
+        limit = self.config.min_side_clearance_m
+
+        if min(left, right) >= limit:
+            return twist
+
+        # Push away from the nearer side, hardest when it is closest.
+        nearest = min(left, right)
+        away = -1.0 if left < right else 1.0
+        urgency = min(1.0, (limit - nearest) / limit)
+
+        return BodyTwist(
+            # Slow down as well as sidestep: a squeeze taken at cruise speed is
+            # a scrape along whatever is causing it.
+            vx_mps=twist.vx_mps * (1.0 - 0.6 * urgency),
+            vy_mps=away * self.config.side_escape_mps * urgency,
+            omega_dps=twist.omega_dps,
+        )
+
+    @staticmethod
+    def _closest(ranges, side: int) -> float:
+        """Nearest valid reading on one flank. `side` is +1 left, -1 right."""
+        best = math.inf
+        for reading in ranges:
+            if not reading.valid:
+                continue
+            angle = reading.angle_deg * side
+            # 20° to 110°: the flank, excluding whatever is straight ahead,
+            # which the follower is already responsible for.
+            if 20.0 <= angle <= 110.0:
+                best = min(best, reading.distance_m)
+        return best
 
     def _sweep(self, packet, pose, dt_s: float) -> BodyTwist:
         assert self.planner is not None
