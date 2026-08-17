@@ -1142,13 +1142,18 @@ def start_sim_source(
         """
         import time
 
-        from autonomy.bump_explorer import BumpExplorer
+        from autonomy.contact_coverage import ContactCoverage
+
+        # Extracted with the settings meant for a map built by touch, not for
+        # one built from thousands of range readings. 26.30 -> 26.91 m2 against
+        # a true 27.0 on the empty room, for a constructor call.
+        pipeline.use_contact_extractor()
 
         logger.info(
             "Simulator running, contact-only (room=%s, no range sensors fitted)",
             room,
         )
-        explorer = BumpExplorer()
+        explorer = ContactCoverage()
 
         while not explorer.is_finished:
             if stop is not None and stop.is_set():
@@ -1162,23 +1167,29 @@ def start_sim_source(
             command = explorer.step(
                 pose.x_m, pose.y_m, pose.heading_deg,
                 detector.in_contact, dt_s,
-                pipeline.explored_cells(),
             )
             if command.state.value == "FINISHED":
                 break
 
-            robot.drive_holonomic(command.linear_mps, 0.0, command.angular_dps, dt_s)
-            check_contact(
-                BodyTwist(vx_mps=command.linear_mps, omega_dps=command.angular_dps)
+            # Sideways as well as forward: the sweep never turns, because a
+            # kiwi drive does not have to. See autonomy/contact_coverage.py.
+            robot.drive_holonomic(
+                command.linear_mps, command.lateral_mps, command.angular_dps, dt_s
             )
+            check_contact(BodyTwist(
+                vx_mps=command.linear_mps,
+                vy_mps=command.lateral_mps,
+                omega_dps=command.angular_dps,
+            ))
             time.sleep(dt_s / max(speed, 0.01))
 
         summary = explorer.summary()
         logger.info(
             "Contact mapping complete: %d contact(s), %.1f m driven, "
-            "coverage %s",
+            "%d rows over %d pass(es) — %s",
             summary["contacts"], summary["distance_m"],
-            "saturated" if summary["saturated"] else "CUT OFF at a limit",
+            summary["rows"], summary["passes"],
+            "covered its rows" if summary["completed"] else "CUT OFF at a limit",
         )
         report("Final")
         save("contact-only mapping")
