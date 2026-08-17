@@ -27,7 +27,24 @@
   @media (max-width: 860px) {
     body { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
   }
-  #stage { position: relative; overflow: hidden; }
+  /* Two maps, side by side: what the robot has sensed, and what it has
+     concluded. They answer different questions — "how much of this has the
+     robot actually been over?" and "what shape is the room?" — and putting
+     them next to each other is what /compare used to be for, except that
+     compared the robot's map against a room only the simulator knows. */
+  #stage {
+    position: relative; overflow: hidden;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+    background: var(--border);
+  }
+  @media (max-width: 1100px) { #stage { grid-template-columns: 1fr; } }
+  .pane { position: relative; overflow: hidden; background: var(--bg); }
+  .pane-title {
+    position: absolute; top: 10px; left: 12px; z-index: 4;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--muted); background: rgba(13,17,23,.85);
+    border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px;
+  }
   canvas { display: block; width: 100%; height: 100%; }
   aside {
     background: var(--panel); border-left: 1px solid var(--border);
@@ -76,21 +93,35 @@
     background: rgba(13,17,23,.85); border: 1px solid var(--border);
     border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--muted);
   }
+  #planNote {
+    position: absolute; bottom: 12px; left: 12px; z-index: 5;
+    background: rgba(13,17,23,.85); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 11px; color: var(--muted);
+  }
   #legend div { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
   #legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 </style>
 </head>
 <body>
 <div id="stage">
-  <div id="status">connecting…</div>
-  <canvas id="map"></canvas>
-  <div id="legend">
-    <div><i style="background:#e6edf3"></i> wall</div>
-    <div><i style="background:#1d6fa5"></i> open floor</div>
-    <div><i style="background:#30363d"></i> not yet seen</div>
-    <div><i style="background:#f0c674"></i> path driven</div>
-    <div><i style="background:#3fb950"></i> room outline</div>
-    <div><i style="background:#f85149"></i> blocked (furniture)</div>
+  <div class="pane">
+    <div class="pane-title">Live &mdash; what the robot has sensed</div>
+    <div id="status">connecting…</div>
+    <canvas id="map"></canvas>
+    <div id="legend">
+      <div><i style="background:#e6edf3"></i> wall</div>
+      <div><i style="background:#1d6fa5"></i> open floor</div>
+      <div><i style="background:#30363d"></i> not yet seen</div>
+      <div><i style="background:#f0c674"></i> path driven</div>
+      <div><i style="background:#3fb950"></i> room outline</div>
+      <div><i style="background:#f85149"></i> blocked (furniture)</div>
+    </div>
+  </div>
+
+  <div class="pane">
+    <div class="pane-title">The map the robot drew</div>
+    <canvas id="plan"></canvas>
+    <div id="planNote">nothing measured yet</div>
   </div>
 </div>
 
@@ -98,44 +129,43 @@
   <h1>Room Mapper</h1>
   <div class="sub">3-wheel holonomic · <span id="robotId">—</span></div>
   <div style="display:flex;gap:10px;margin-bottom:14px;font-size:12px">
-    <a href="/compare" style="color:var(--accent);text-decoration:none">comparison</a>
-    <a href="/scans" style="color:var(--accent);text-decoration:none">scans</a>
+    <a href="/scans" style="color:var(--accent);text-decoration:none">saved scans</a>
   </div>
 
   <!--
-    Set up the run, then start it.
+    Two stages, and only one is on screen at a time.
 
-    The order is the point. What the robot can sense decides HOW it maps, and
-    what is standing in the room decides how hard that is — so both are chosen
-    before the robot goes out, not configured in a file somewhere and hoped
-    for. Tick a lidar and the same room is measured in 23 m instead of 435.
+    Choose the sensors, then wait for Start. What the robot can sense decides
+    HOW it maps — tick a lidar and the same room is measured in 23 m instead of
+    435 — so it is settled before the robot goes out, and locked once it has.
+
+    The room is not chosen here. It is arranged in the Omniverse window, which
+    is the thing you can actually reach into and move furniture around in.
   -->
-  <div class="card" id="setupCard">
-    <h2>1 · Sensors</h2>
+  <div class="card" id="stageSensors">
+    <h2>Step 1 &middot; Choose the sensors</h2>
     <div class="note" style="margin-top:0">
       What is bolted to the robot. The mapping strategy follows from it.
     </div>
     <div id="sensorList" style="margin-top:8px"></div>
     <div class="row" style="margin-top:8px">
-      <span>Strategy</span><b id="strategyPill" class="pill">—</b>
+      <span>Strategy</span><b id="strategyPill" class="pill">&mdash;</b>
     </div>
-    <div class="note" id="strategyNote">—</div>
+    <div class="note" id="strategyNote">&mdash;</div>
+    <button id="confirmBtn" onclick="confirmSensors()"
+            style="background:#1f6feb;border-color:#1f6feb;font-weight:600">
+      Confirm these sensors
+    </button>
   </div>
 
-  <div class="card">
-    <h2>2 · The room</h2>
-    <div class="row"><span>Furniture in the room</span><b id="pieceCount">—</b></div>
-    <div class="note" style="margin-top:6px">
-      Arrange it in the Omniverse window and the robot meets it where you put
-      it. These are the shortcuts.
+  <div class="card" id="stageReady" style="display:none">
+    <h2>Step 2 &middot; Waiting for start</h2>
+    <div class="row"><span>Sensors</span><b id="readySensors">&mdash;</b></div>
+    <div class="row"><span>Strategy</span><b id="readyStrategy" class="pill">&mdash;</b></div>
+    <div class="note" style="margin-top:8px">
+      Arrange the room in the Omniverse window &mdash; drag the furniture
+      wherever you want it. The robot will meet it where you put it.
     </div>
-    <button onclick="setRoom('empty')">Empty the room</button>
-    <button onclick="setRoom('table')">One table in the middle</button>
-    <button onclick="setRoom('furnished')">Table, sofa and a cabinet</button>
-  </div>
-
-  <div class="card">
-    <h2>3 · Go</h2>
     <button id="startBtn" onclick="startScan()"
             style="background:#238636;border-color:#238636;font-weight:600">
       Start
@@ -145,7 +175,10 @@
             disabled>
       Stop
     </button>
-    <div class="note" id="runNote">Choose the sensors and the room, then press Start.</div>
+    <button id="rechooseBtn" onclick="rechoose()">
+      Re-choose sensors &mdash; resets the room
+    </button>
+    <div class="note" id="runNote">Press Start when the room is how you want it.</div>
   </div>
 
   <div class="card">
@@ -237,11 +270,14 @@ let ws = null;
 // ── Rendering ────────────────────────────────────────────────────────────
 
 function resize() {
-  const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width  = Math.max(1, Math.round(rect.width  * dpr));
-  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  for (const c of [canvas, planCanvas]) {
+    const rect = c.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    c.width  = Math.max(1, Math.round(rect.width  * dpr));
+    c.height = Math.max(1, Math.round(rect.height * dpr));
+  }
   draw();
+  drawPlan();
 }
 window.addEventListener('resize', resize);
 
@@ -271,6 +307,7 @@ function makeTransform() {
 }
 
 function draw() {
+  drawPlan();
   ctx.fillStyle = '#0e1116';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   const T = makeTransform();
@@ -692,40 +729,108 @@ function downloadMap() {
   URL.revokeObjectURL(url);
 }
 
+// ── The map the robot drew ──────────────────────────────────────────────────
+//
+// The other pane shows every cell the robot has sensed, which is the evidence.
+// This shows what it concluded from that evidence: one outline, the obstacles
+// inside it, and the area. They answer different questions, and seeing them
+// together is what /compare was reaching for — except that scored against a
+// room only the simulator knows, which does not exist on real hardware.
+
+const planCanvas = document.getElementById('plan');
+const planCtx = planCanvas.getContext('2d');
+
+function drawPlan() {
+  const W = planCanvas.width, H = planCanvas.height;
+  planCtx.fillStyle = '#0e1116';
+  planCtx.fillRect(0, 0, W, H);
+
+  const room = state && state.room;
+  const note = document.getElementById('planNote');
+  if (!room || !room.polygon || room.polygon.length < 3) {
+    note.textContent = 'nothing measured yet';
+    return;
+  }
+
+  const xs = room.polygon.map(p => p.x_m);
+  const ys = room.polygon.map(p => p.y_m);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 40 * (window.devicePixelRatio || 1);
+  const scale = Math.min(
+    (W - 2 * pad) / Math.max(0.1, maxX - minX),
+    (H - 2 * pad) / Math.max(0.1, maxY - minY),
+  );
+  // y up, as a floor plan is read, not down as a canvas counts.
+  const px = x => pad + (x - minX) * scale;
+  const py = y => H - pad - (y - minY) * scale;
+
+  // The floor.
+  planCtx.beginPath();
+  room.polygon.forEach((p, i) =>
+    i ? planCtx.lineTo(px(p.x_m), py(p.y_m)) : planCtx.moveTo(px(p.x_m), py(p.y_m)));
+  planCtx.closePath();
+  planCtx.fillStyle = 'rgba(29,111,165,.22)';
+  planCtx.fill();
+  // Green once the boundary has closed, amber while it is still open — an
+  // open outline is a lower bound, not a measurement.
+  planCtx.strokeStyle = room.is_closed ? '#3fb950' : '#d29922';
+  planCtx.lineWidth = 3 * (window.devicePixelRatio || 1);
+  planCtx.stroke();
+
+  // Whatever is standing on the floor.
+  planCtx.fillStyle = 'rgba(248,81,73,.35)';
+  planCtx.strokeStyle = '#f85149';
+  planCtx.lineWidth = 1.5 * (window.devicePixelRatio || 1);
+  for (const o of room.obstacles || []) {
+    const x = px(o.min_x_m), y = py(o.max_y_m);
+    const w = (o.max_x_m - o.min_x_m) * scale;
+    const h = (o.max_y_m - o.min_y_m) * scale;
+    planCtx.fillRect(x, y, w, h);
+    planCtx.strokeRect(x, y, w, h);
+  }
+
+  // The measurement, on the drawing, where it belongs.
+  const dpr = window.devicePixelRatio || 1;
+  planCtx.fillStyle = '#e6edf3';
+  planCtx.font = `${20 * dpr}px ui-sans-serif, system-ui, sans-serif`;
+  planCtx.textAlign = 'center';
+  planCtx.fillText(`${room.area_m2.toFixed(2)} m²`,
+                   (px(minX) + px(maxX)) / 2, (py(minY) + py(maxY)) / 2);
+
+  const blocked = room.blocked_area_m2 || 0;
+  note.textContent =
+    `${room.bounding_width_m.toFixed(2)} × ${room.bounding_height_m.toFixed(2)} m · `
+    + `${(room.obstacles || []).length} obstacle(s), ${blocked.toFixed(2)} m² blocked · `
+    + (room.is_closed ? 'boundary closed' : 'boundary still open');
+}
+
 // ── Setting up a run ────────────────────────────────────────────────────────
 //
-// Sensors first, then the room, then Start. The order matters: what the robot
-// can sense decides how it maps, and what is in the room decides how hard that
-// is, so both are settled before it goes out rather than configured somewhere
-// and hoped for.
-
-// Rooms the shortcut buttons build, in metres, in the room's own frame.
-// Deliberately small sets — the Omniverse window is where a room gets
-// arranged properly, and these exist so the page is usable without it.
-const ROOMS = {
-  empty: [],
-  table: [
-    { min_x_m: 2.3, min_y_m: 1.7, max_x_m: 3.7, max_y_m: 2.6 },
-  ],
-  furnished: [
-    { min_x_m: 2.3, min_y_m: 1.7, max_x_m: 3.7, max_y_m: 2.6 },   // table
-    { min_x_m: 0.2, min_y_m: 3.4, max_x_m: 2.2, max_y_m: 4.3 },   // sofa
-    { min_x_m: 5.4, min_y_m: 1.8, max_x_m: 5.9, max_y_m: 3.3 },   // cabinet
-  ],
-};
+// Two stages, one on screen at a time. Choose the sensors, then wait for
+// Start. What the robot can sense decides HOW it maps, so it is settled before
+// the robot goes out and locked once it has.
+//
+// The room is not chosen here. It is arranged in the Omniverse window, which
+// is the thing you can reach into and move furniture around in.
 
 let scanRunning = false;
+let sensorsConfirmed = false;
+
+function showStage(which) {
+  document.getElementById('stageSensors').style.display =
+    which === 'sensors' ? '' : 'none';
+  document.getElementById('stageReady').style.display =
+    which === 'ready' ? '' : 'none';
+}
 
 async function loadSensors() {
-  const reply = await fetch('/api/hardware');
-  const hw = await reply.json();
-  const list = document.getElementById('sensorList');
-
-  list.innerHTML = hw.devices.map((d, i) => `
+  const hw = await (await fetch('/api/hardware')).json();
+  document.getElementById('sensorList').innerHTML = hw.devices.map(d => `
     <label style="display:flex;gap:8px;align-items:flex-start;padding:3px 0;
                   font-size:12px;cursor:pointer">
       <input type="checkbox" data-name="${d.name.replace(/"/g, '&quot;')}"
-             ${d.fitted ? 'checked' : ''} onchange="applySensors()"
+             ${d.fitted ? 'checked' : ''} onchange="previewStrategy()"
              style="margin-top:2px;flex:none">
       <span>
         <b style="font-weight:600">${d.name}</b>
@@ -733,26 +838,33 @@ async function loadSensors() {
         <span style="display:block;color:var(--muted);font-size:10.5px">${d.accuracy}</span>
       </span>
     </label>`).join('');
-
-  showStrategy(hw.strategy);
+  previewStrategy();
 }
 
-function showStrategy(strategy) {
-  const pill = document.getElementById('strategyPill');
-  const note = document.getElementById('strategyNote');
-  const contact = strategy === 'CONTACT_ONLY';
+// Worked out in the page as the boxes are ticked, so the consequence of a
+// choice is visible before it is committed. The server decides for real.
+function previewStrategy() {
+  const canSee = [...document.querySelectorAll('#sensorList input:checked')]
+    .some(box => /lidar|ultrasonic|radar|arduino/i.test(box.dataset.name));
+  paintStrategy(canSee ? 'WALL_FOLLOWING' : 'CONTACT_ONLY',
+                'strategyPill', 'strategyNote');
+}
 
+function paintStrategy(strategy, pillId, noteId) {
+  const contact = strategy === 'CONTACT_ONLY';
+  const pill = document.getElementById(pillId);
   pill.textContent = contact ? 'contact only' : 'wall following';
   pill.className = 'pill ' + (contact ? 'warn' : 'ok');
-  note.textContent = contact
+  if (!noteId) return;
+  document.getElementById(noteId).textContent = contact
     ? 'Nothing fitted can measure distance, so the robot finds the room by '
-      + 'driving into it — about 435 m of bouncing, and roughly 8 % low. This '
-      + 'is the robot that exists today.'
+      + 'driving into it and covering it in rows. Slower, and it is the robot '
+      + 'that exists today.'
     : 'Something can measure distance, so the robot holds a set gap from the '
       + 'wall and follows it round — about 23 m, and accurate to 1.4 %.';
 }
 
-async function applySensors() {
+async function confirmSensors() {
   const fitted = [...document.querySelectorAll('#sensorList input:checked')]
     .map(box => box.dataset.name);
 
@@ -762,49 +874,45 @@ async function applySensors() {
     body: JSON.stringify({ fitted }),
   });
   const body = await reply.json();
-
   if (!reply.ok) {
-    // Most likely a scan is running. Put the boxes back rather than leaving
-    // them showing a suite the robot is not using.
-    document.getElementById('strategyNote').textContent = body.error || 'could not change the sensors';
-    loadSensors();
+    document.getElementById('strategyNote').textContent =
+      body.error || 'could not set the sensors';
     return;
   }
-  showStrategy(body.strategy);
+
+  sensorsConfirmed = true;
+  document.getElementById('readySensors').textContent =
+    fitted.length ? `${fitted.length} fitted` : 'none';
+  paintStrategy(body.strategy, 'readyStrategy', null);
+  showStage('ready');
+  refreshRunState();
 }
 
-async function setRoom(which) {
-  const boxes = ROOMS[which] || [];
-  await fetch('/api/world/geometry', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ boxes }),
-  });
-  refreshRoomCount();
-}
-
-async function refreshRoomCount() {
-  try {
-    const reply = await fetch('/api/world/geometry');
-    const body = await reply.json();
-    document.getElementById('pieceCount').textContent =
-      body.pieces.length === 0 ? 'empty' : `${body.pieces.length} piece(s)`;
-  } catch { /* the page is still useful without this */ }
+async function rechoose() {
+  // Going back means starting over, and starting over means the room too —
+  // otherwise the next run happens in whatever arrangement the last one was
+  // left in, a difference nobody asked for and nobody would notice until the
+  // numbers disagreed.
+  if (scanRunning) await stopScan();
+  await fetch('/api/scene/reset', { method: 'POST' });
+  sensorsConfirmed = false;
+  document.getElementById('runNote').textContent =
+    'Press Start when the room is how you want it.';
+  showStage('sensors');
+  loadSensors();
 }
 
 async function startScan() {
-  const button = document.getElementById('startBtn');
   const note = document.getElementById('runNote');
-  button.disabled = true;
+  document.getElementById('startBtn').disabled = true;
   note.textContent = 'Sending the robot out…';
-
   try {
     const reply = await fetch('/api/scan/start', { method: 'POST' });
     const body = await reply.json();
     note.textContent = reply.ok
-      ? `Running — ${body.strategy === 'CONTACT_ONLY'
-          ? 'mapping by contact, this takes a while'
-          : 'following the walls'}.`
+      ? (body.strategy === 'CONTACT_ONLY'
+          ? 'Running — covering the room in rows by touch. This takes a while.'
+          : 'Running — following the walls.')
       : (body.detail || 'could not start');
   } catch (e) {
     note.textContent = 'could not start: ' + e;
@@ -816,12 +924,10 @@ async function stopScan() {
   const note = document.getElementById('runNote');
   document.getElementById('stopBtn').disabled = true;
   note.textContent = 'Stopping…';
-
   try {
-    const reply = await fetch('/api/scan/stop', { method: 'POST' });
-    const body = await reply.json();
+    const body = await (await fetch('/api/scan/stop', { method: 'POST' })).json();
     // Stop keeps the map: whoever pressed it wanted the driving to end, not
-    // the measurement, and the half-room already mapped is the point.
+    // the measurement.
     note.textContent = body.status === 'idle'
       ? 'Nothing was running.'
       : `Stopped. Keeping the ${body.area_m2} m² measured so far.`;
@@ -833,23 +939,30 @@ async function stopScan() {
 
 async function refreshRunState() {
   try {
-    const reply = await fetch('/api/scan/status');
-    const body = await reply.json();
+    const body = await (await fetch('/api/scan/status')).json();
     scanRunning = body.running;
   } catch { return; }
 
+  if (!sensorsConfirmed && scanRunning) {
+    // A run already going when the page was opened. Skip the setup rather than
+    // offer to change sensors mid-scan.
+    sensorsConfirmed = true;
+    showStage('ready');
+  }
   document.getElementById('startBtn').disabled = scanRunning;
   document.getElementById('stopBtn').disabled = !scanRunning;
-  // Changing the sensor suite mid-run would leave half a map built one way
-  // and half the other, with no honest way to grade it.
-  document.querySelectorAll('#sensorList input')
-    .forEach(box => { box.disabled = scanRunning; });
+  // Re-choosing mid-run would leave half a map built one way and half the
+  // other, so it stops the robot first — but say so rather than surprising
+  // anyone.
+  document.getElementById('rechooseBtn').textContent = scanRunning
+    ? 'Stop and re-choose sensors — resets the room'
+    : 'Re-choose sensors — resets the room';
 }
 
+showStage('sensors');
 loadSensors();
-refreshRoomCount();
 refreshRunState();
-setInterval(() => { refreshRunState(); refreshRoomCount(); }, 2000);
+setInterval(refreshRunState, 2000);
 
 resize();
 connect();

@@ -126,6 +126,12 @@ app.state.scene_geometry = []
 # and it stays None for contact-only mapping, which has no perimeter phase.
 app.state.lap_distance_m = None
 
+# Bumped whenever the room should go back to how it started. The Omniverse
+# scene polls it and rebuilds its furniture when it changes — the mapper cannot
+# call into Kit, and a scene that asks recovers on its own after either end has
+# been restarted. See /api/scene/reset.
+app.state.scene_reset_token = 0
+
 # What sensors this robot has, which decides how it maps a room rather than
 # merely describing it. `simulated` is the demo default because the simulator
 # genuinely does produce range readings; `actual` is the robot that exists and
@@ -305,6 +311,33 @@ async def set_hardware(request: Request) -> JSONResponse:
     return JSONResponse(described)
 
 
+@app.post("/api/scene/reset")
+async def post_scene_reset() -> JSONResponse:
+    """Put the room back how it started.
+
+    Going back to choose the sensors again means starting over, and starting
+    over means the room too — otherwise the next run happens in whatever
+    arrangement the last one was left in, which is a difference nobody asked
+    for and nobody would notice until the numbers disagreed.
+
+    Pull, not push: this bumps a token, and the Omniverse scene notices on its
+    next poll and rebuilds its furniture. The mapper cannot call into Kit, and
+    a scene that asks is a scene that recovers on its own after either end has
+    been restarted.
+    """
+    app.state.scene_reset_token += 1
+    app.state.scene_geometry = []
+
+    world = getattr(app.state, "sim_world", None)
+    if world is not None:
+        world.set_furniture([])
+
+    logger.info("Room reset requested (token %d)", app.state.scene_reset_token)
+    return JSONResponse({
+        "status": "reset", "token": app.state.scene_reset_token,
+    })
+
+
 @app.get("/api/hardware")
 async def get_hardware() -> JSONResponse:
     """What this robot is running on, and what that implies it can do.
@@ -386,10 +419,15 @@ async def scans_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "scans.html")
 
 
-@app.get("/compare")
-async def compare_page() -> FileResponse:
-    """Two screens: the real room, and the room the robot drew."""
-    return FileResponse(STATIC_DIR / "compare.html")
+# /compare has been removed.
+#
+# It put the room the simulator knows beside the room the robot drew. That is
+# only meaningful with a simulator — with real hardware there is no true room
+# to score against — and the honest half of it, "how much of this has the robot
+# actually been over versus what shape did it conclude", now sits side by side
+# on the main page where it is always visible rather than on a page nobody
+# navigated to. /api/compare stays: the score is still worth having, and CI
+# still checks it.
 
 
 # ── Saved scans ───────────────────────────────────────────────────────────────
@@ -727,6 +765,9 @@ async def get_scan_status() -> JSONResponse:
         "strategy": app.state.hardware.strategy().value,
         "packets": pipeline.packets_processed,
         "contacts": pipeline.contacts,
+        # The Omniverse scene watches this and rebuilds its room when it
+        # changes. Served here so the scene needs only one endpoint to poll.
+        "scene_reset_token": app.state.scene_reset_token,
     })
 
 

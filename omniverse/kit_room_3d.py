@@ -538,10 +538,15 @@ class GeometryPublisher:
     #: is on screen — the exact failure this whole mechanism exists to prevent.
     HEARTBEAT_S = 20.0
 
-    def __init__(self, stage, url=None, interval_s=0.5):
+    def __init__(self, stage, url=None, interval_s=0.5, rebuild=None):
         self.stage = stage
         self.url = url or MAPPER_URL
         self.interval_s = interval_s
+        # Called to put the furniture back where it started, when the page asks
+        # for a reset. Pull rather than push: the mapper cannot call into Kit,
+        # and a scene that asks recovers on its own after either end restarts.
+        self.rebuild = rebuild
+        self._reset_token = None
         self._signature = None
         self._next_check = 0.0
         self._next_heartbeat = 0.0
@@ -551,6 +556,12 @@ class GeometryPublisher:
         if now < self._next_check:
             return False
         self._next_check = now + self.interval_s
+
+        if self._check_for_reset():
+            # The furniture has just moved back to where it started, so the
+            # signature below is about to differ and the new layout goes out on
+            # this same tick.
+            pass
 
         boxes = furniture_footprints(self.stage)
         signature = tuple(tuple(round(v, 3) for v in b) for b in boxes)
@@ -568,6 +579,36 @@ class GeometryPublisher:
             # never received.
             self._signature = None
         return sent
+
+    def _check_for_reset(self):
+        """Has the page asked for the room to go back to how it started?"""
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(
+                f"{self.url}/api/scan/status", timeout=1.5
+            ) as reply:
+                token = json.loads(reply.read().decode("utf-8")).get(
+                    "scene_reset_token"
+                )
+        except Exception:
+            return False
+
+        if token is None:
+            return False
+
+        first_look = self._reset_token is None
+        changed = token != self._reset_token
+        self._reset_token = token
+
+        # Not on the first look: the scene has only just built the room, and
+        # tearing it down and building it again would be a visible flicker for
+        # nothing.
+        if changed and not first_look and self.rebuild is not None:
+            print("[room] resetting the furniture to where it started")
+            self.rebuild()
+            return True
+        return False
 
     def _post(self, boxes):
         import urllib.request
@@ -1236,7 +1277,14 @@ def run_room():
     # meets it where you put it. Pushed on a timer rather than on an edit
     # notification, because dragging a prim in the viewport does not raise one
     # this script can hook without pulling in more of Kit than it should.
-    publisher = GeometryPublisher(stage)
+    def rebuild_furniture():
+        """Delete the furniture and draw it again where it started."""
+        stage.RemovePrim(Sdf.Path(f"{ROOT}/Furniture"))
+        build_furniture(stage)
+        if ENABLE_PHYSICS:
+            make_solid(stage)
+
+    publisher = GeometryPublisher(stage, rebuild=rebuild_furniture)
     pieces = furniture_footprints(stage)
     print(
         f"[room] {len(pieces)} solid piece(s) of furniture — drag them in the "
