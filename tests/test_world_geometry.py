@@ -356,3 +356,59 @@ def test_a_recycled_dot_moves_to_where_the_robot_now_is(kit):
         scene._drop_trail()
 
     assert first.translate[0] == pytest.approx((cap + 1) * 0.2)
+
+
+# ── The 3D robot is the physical one ─────────────────────────────────────────
+#
+# This scene draws the true room at fixed coordinates, so it has to draw the
+# true robot. Placed by an estimate that has drifted, the robot appears outside
+# a room it is nowhere near the edge of — which reads as collision being broken
+# when the simulator is in fact stopping it dead at its own radius from the wall.
+
+
+def _scene_with(module, stage, pose):
+    scene = module.RoomScene(stage, source=type("S", (), {"read": lambda s: pose})())
+    scene._on_update(None)
+    return scene
+
+
+def test_the_solid_robot_follows_the_true_pose(kit):
+    module, stage = kit
+    module.build_room()
+
+    # An estimate that has drifted well outside the room, and the truth.
+    pose = {
+        "x_m": 9.0, "y_m": 9.0, "heading_deg": 0.0,
+        "true_x_m": 2.0, "true_y_m": 1.5, "true_heading_deg": 0.0,
+    }
+    scene = _scene_with(module, stage, pose)
+
+    # Smoothing chases rather than snaps, so it should have moved towards the
+    # truth and away from the drifted estimate.
+    assert scene.x < 6.0, "the solid robot followed the drifted estimate"
+    assert scene.y < 6.0
+
+
+def test_the_ghost_follows_the_estimate(kit):
+    """The gap between the two IS the drift, and it is the most useful thing
+    this scene shows."""
+    module, stage = kit
+    module.build_room()
+
+    pose = {
+        "x_m": 4.0, "y_m": 3.0, "heading_deg": 0.0,
+        "true_x_m": 1.0, "true_y_m": 1.0, "true_heading_deg": 0.0,
+    }
+    scene = _scene_with(module, stage, pose)
+
+    assert scene.ox > scene.x, "the ghost is not tracking the estimate"
+
+
+def test_hardware_falls_back_to_the_estimate(kit):
+    """There is no true pose on a real robot, and the scene still has to draw
+    something."""
+    module, stage = kit
+    module.build_room()
+
+    scene = _scene_with(module, stage, {"x_m": 2.0, "y_m": 1.5, "heading_deg": 0.0})
+    assert scene.x > 0.0 and scene.y > 0.0

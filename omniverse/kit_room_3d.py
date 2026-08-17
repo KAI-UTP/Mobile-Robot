@@ -1159,9 +1159,23 @@ class RoomScene:
         # Pose frame -> room frame. See ROBOT_START_X_M: pose coordinates are
         # relative to wherever the robot was standing when the run began, and
         # this room is laid out from a corner.
-        tx = float(pose.get("x_m", 0.0)) + ROBOT_START_X_M
-        ty = float(pose.get("y_m", 0.0)) + ROBOT_START_Y_M
-        th = float(pose.get("heading_deg", 0.0))
+        # The solid robot is where it ACTUALLY is; the green ghost is where
+        # odometry thinks it is. That is what this scene has always said it
+        # drew, and for a long time it drew the estimate for both.
+        #
+        # It showed. This room is the true room, drawn at fixed coordinates, so
+        # a robot placed by an estimate that has drifted a few hundred metres'
+        # worth appears outside it — walking through a wall it was nowhere near.
+        # That reads as collision being broken, when in fact the simulator stops
+        # the robot dead at 4.39 m against a wall at 4.50, exactly its own
+        # radius short.
+        #
+        # `true_*` is absent with real hardware, where no such number exists,
+        # and the estimate is then the best the scene can do.
+        has_truth = "true_x_m" in pose
+        tx = float(pose.get("true_x_m", pose.get("x_m", 0.0))) + ROBOT_START_X_M
+        ty = float(pose.get("true_y_m", pose.get("y_m", 0.0))) + ROBOT_START_Y_M
+        th = float(pose.get("true_heading_deg", pose.get("heading_deg", 0.0)))
 
         # Chase rather than snap: telemetry arrives at ~10 Hz, Kit renders at
         # 60, and snapping shows as a visible stutter.
@@ -1170,13 +1184,18 @@ class RoomScene:
         self.heading = (self.heading + _shortest_angle(th, self.heading) * SMOOTHING) % 360.0
         self._place(f"{ROOT}/RobotTrue", self.x, self.y, self.heading)
 
-        if SHOW_ODOMETRY_GHOST:
-            gx = float(pose.get("ideal_x_m", tx - ROBOT_START_X_M)) + ROBOT_START_X_M
-            gy = float(pose.get("ideal_y_m", ty - ROBOT_START_Y_M)) + ROBOT_START_Y_M
+        # The filter's own estimate, beside the truth. The gap between the two
+        # IS the drift, and watching it open up over a long run is the single
+        # most useful thing this scene shows — it is the reason the map comes
+        # back a few per cent large. Nothing to draw when the two are the same
+        # number, which is the case with real hardware.
+        if SHOW_ODOMETRY_GHOST and has_truth:
+            gx = float(pose.get("x_m", 0.0)) + ROBOT_START_X_M
+            gy = float(pose.get("y_m", 0.0)) + ROBOT_START_Y_M
             self.ox += (gx - self.ox) * SMOOTHING
             self.oy += (gy - self.oy) * SMOOTHING
             self._place(f"{ROOT}/RobotOdometry", self.ox, self.oy,
-                        float(pose.get("ideal_heading_deg", th)))
+                        float(pose.get("heading_deg", th)))
 
         if SHOW_RSSI_MARKER and "rssi_x_m" in pose:
             # Slower smoothing: RSSI genuinely jumps, and showing that is the

@@ -145,6 +145,12 @@ app.state.run_id = 0
 # map neither of them recognises.
 app.state.mode = "idle"
 
+# The simulated robot itself, when one is running, so the twin feed can publish
+# where it ACTUALLY is as well as where the filter thinks it is. None with real
+# hardware, where no such number exists.
+app.state.sim_robot = None
+
+
 # What the manual controls are asking for, as (vx, vy, omega) in the body
 # frame. Held rather than queued: a driving command is a statement about what
 # the robot should be doing NOW, and a stale one that arrived late is worse
@@ -240,7 +246,19 @@ async def get_room() -> JSONResponse:
 
 @app.get("/api/state")
 async def get_state() -> JSONResponse:
-    return JSONResponse(pipeline.state())
+    state = pipeline.state()
+
+    # The true pose rides alongside the estimate for the same reason it does in
+    # the pose file: the 3D scene draws the physical room and needs the
+    # physical robot. See `_write_pose_file`.
+    robot = getattr(app.state, "sim_robot", None)
+    if robot is not None and state.get("pose"):
+        true_x, true_y, true_heading = robot.true_pose()
+        state["pose"]["true_x_m"] = true_x
+        state["pose"]["true_y_m"] = true_y
+        state["pose"]["true_heading_deg"] = true_heading
+
+    return JSONResponse(state)
 
 
 # /twin has been removed.
@@ -957,10 +975,33 @@ def _write_pose_file() -> None:
         return
 
     try:
+        payload = pipeline.pose.model_dump()
+
+        # Where the robot ACTUALLY is, as well as where it thinks it is.
+        #
+        # The 3D scene draws the physical room, so it has to draw the physical
+        # robot; the estimate belongs on the 2D map, where it is drawn against
+        # the map the same estimate built and the two agree by construction.
+        #
+        # Sending only the estimate made the scene's own description false —
+        # "solid blue: where the robot actually is" — and it showed: after a
+        # few hundred metres of dead reckoning the estimate drifts outside the
+        # true room, so the robot was drawn walking through the wall of a room
+        # it was nowhere near the edge of. That reads as broken collision.
+        #
+        # Absent with real hardware, where there is no true pose to publish,
+        # and the scene falls back to the estimate.
+        robot = getattr(app.state, "sim_robot", None)
+        if robot is not None:
+            true_x, true_y, true_heading = robot.true_pose()
+            payload["true_x_m"] = true_x
+            payload["true_y_m"] = true_y
+            payload["true_heading_deg"] = true_heading
+
         path = app.state.pose_file_path
         temp_path = f"{path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
-            handle.write(pipeline.pose.model_dump_json())
+            handle.write(json.dumps(payload))
         os.replace(temp_path, path)
     except Exception:
         # Losing the twin feed must never take the map down with it.
@@ -1213,6 +1254,7 @@ def start_sim_source(
     # pose coordinate the system reports. The 3D views need it to place the
     # robot inside the room rather than beside it.
     robot.true_x, robot.true_y = app.state.robot_start
+    app.state.sim_robot = robot
     follower = WallFollower()
     dt_s = 0.1
 
@@ -1743,6 +1785,7 @@ def stop_scan() -> dict:
             _scan_thread = None
 
         app.state.mode = "idle"
+
         room = pipeline.room
         logger.info(
             "Scan stopped by request — keeping %s",
