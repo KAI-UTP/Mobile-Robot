@@ -139,6 +139,12 @@ app.state.scene_reset_token = 0
 # not been this time.
 app.state.run_id = 0
 
+# Who is driving: "automatic" (the explorer), "manual" (someone holding the
+# controls), or "idle". Switching between the two is the one thing that must
+# never leave both running — there is one robot, and two pilots would draw a
+# map neither of them recognises.
+app.state.mode = "idle"
+
 # What the manual controls are asking for, as (vx, vy, omega) in the body
 # frame. Held rather than queued: a driving command is a statement about what
 # the robot should be doing NOW, and a stale one that arrived late is worse
@@ -837,6 +843,23 @@ async def post_drive(request: Request) -> JSONResponse:
     })
 
 
+@app.post("/api/mode")
+async def post_mode(request: Request) -> JSONResponse:
+    """Switch between the explorer driving and you driving.
+
+    One call, because the dangerous half is stopping what was running before
+    starting the other, and a page that had to do that itself would eventually
+    get it wrong and leave two pilots on one robot.
+    """
+    payload = await request.json()
+    mode = str(payload.get("mode", "")).lower()
+    clear = bool(payload.get("clear_map", False))
+
+    result = await asyncio.to_thread(switch_mode, mode, clear)
+    status = 200 if result["status"] == "ok" else 409
+    return JSONResponse(result, status_code=status)
+
+
 @app.post("/api/scan/stop")
 async def post_scan_stop() -> JSONResponse:
     """Stop the robot where it is, and keep what it has measured.
@@ -865,6 +888,7 @@ async def get_scan_status() -> JSONResponse:
         # Changes when a fresh run starts, so the 3D scene knows to wipe the
         # trail it drew for the last one.
         "run_id": app.state.run_id,
+        "mode": app.state.mode,
     })
 
 
@@ -1572,6 +1596,7 @@ def rescan() -> dict:
             }
 
         app.state.run_id += 1
+        app.state.mode = "automatic"
         _scan_thread = start_sim_source(stop=_scan_stop, **settings)
         logger.info(
             "Scan started (room=%s, strategy=%s)",
@@ -1616,10 +1641,80 @@ def start_manual() -> dict:
 
         _scan_stop.clear()
         app.state.run_id += 1
+        app.state.mode = "manual"
         _scan_thread = start_sim_source(
             stop=_scan_stop, manual=True, **settings
         )
         return {"status": "driving"}
+    finally:
+        _scan_lock.release()
+
+
+def switch_mode(mode: str, clear_map: bool = False) -> dict:
+    """Hand the robot to the explorer, or to whoever is holding the controls.
+
+    Deliberately does NOT clear the map by default. Switching to manual is
+    normally someone taking over to finish a corner the autonomy gave up on,
+    and wiping what it had already measured would defeat the point; switching
+    back is normally them handing it over again. Only the deliberate Start at
+    the beginning of a run clears, and it asks.
+
+    Whatever was running is stopped and joined first. Two pilots steering one
+    robot would produce a map drawn by both and recognised by neither, and it
+    would look like a mapping fault rather than like what it was.
+    """
+    global _scan_thread
+
+    if mode not in ("automatic", "manual", "idle"):
+        return {"status": "error", "detail": f"unknown mode {mode!r}"}
+
+    if not _scan_lock.acquire(blocking=False):
+        return {"status": "busy", "detail": "a change is already in progress"}
+
+    try:
+        if _scan_thread is not None and _scan_thread.is_alive():
+            _scan_stop.set()
+            _scan_thread.join(timeout=10.0)
+            if _scan_thread.is_alive():
+                return {
+                    "status": "error",
+                    "detail": "the previous run did not stop; nothing changed",
+                }
+        _scan_stop.clear()
+        _scan_thread = None
+        app.state.manual_twist = (0.0, 0.0, 0.0)
+
+        if clear_map:
+            pipeline.reset(clear_map=True)
+            app.state.coverage = None
+            app.state.collisions = None
+
+        if mode == "idle":
+            app.state.mode = "idle"
+            return {"status": "ok", "mode": "idle"}
+
+        settings = getattr(app.state, "sim_settings", None)
+        if settings is None:
+            app.state.mode = "idle"
+            return {
+                "status": "unavailable",
+                "detail": "no simulator to drive — this is hardware mode",
+            }
+
+        app.state.run_id += 1
+        app.state.mode = mode
+        _scan_thread = start_sim_source(
+            stop=_scan_stop, manual=(mode == "manual"), **settings
+        )
+        logger.info(
+            "Now driving in %s mode (strategy=%s)",
+            mode, app.state.hardware.strategy().value,
+        )
+        return {
+            "status": "ok",
+            "mode": mode,
+            "strategy": app.state.hardware.strategy().value,
+        }
     finally:
         _scan_lock.release()
 
@@ -1647,6 +1742,7 @@ def stop_scan() -> dict:
         if not still_going:
             _scan_thread = None
 
+        app.state.mode = "idle"
         room = pipeline.room
         logger.info(
             "Scan stopped by request — keeping %s",

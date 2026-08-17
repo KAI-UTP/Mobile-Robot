@@ -93,6 +93,32 @@
     background: rgba(13,17,23,.85); border: 1px solid var(--border);
     border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--muted);
   }
+  /* The page waits behind these rather than being usable through them: a
+     half-configured run is not something to start. */
+  .scrim {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(1, 4, 9, .82);
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+    backdrop-filter: blur(3px);
+  }
+  .scrim.gone { display: none; }
+  .dialog {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px; width: 100%; max-width: 420px;
+    max-height: 88vh; overflow-y: auto;
+    box-shadow: 0 18px 50px rgba(0,0,0,.55);
+  }
+  .dialog h2 {
+    font-size: 17px; margin: 0 0 6px; font-weight: 600;
+    text-transform: none; letter-spacing: 0; color: var(--text);
+  }
+  .dialog .lead { margin: 0 0 14px; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+  .dialog .actions { display: flex; gap: 8px; margin-top: 18px; }
+  .dialog .actions button { margin-top: 0; }
+  .dialog button.primary { background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  #modeSwitch button.on, #modeChoice button.chosen {
+    background: var(--accent); border-color: var(--accent); font-weight: 600;
+  }
   #planNote {
     position: absolute; bottom: 12px; left: 12px; z-index: 5;
     background: rgba(13,17,23,.85); border: 1px solid var(--border);
@@ -103,6 +129,57 @@
 </style>
 </head>
 <body>
+<!--
+  Two dialogs, in order, then the page.
+
+  Setting a run up is a sequence of decisions that each change what the next
+  one means: what the robot can sense decides how it maps, and how it maps
+  decides what to expect of the room. Showing all of it at once, beside a map
+  of a run that has not happened, invited people to press Start before they had
+  chosen anything. One question at a time, over a page that waits.
+-->
+<div class="scrim" id="setupScrim">
+  <div class="dialog" id="dlgSensors">
+    <h2>What is on the robot?</h2>
+    <p class="lead">
+      The mapping strategy follows from this — it is not a separate choice.
+    </p>
+    <div id="sensorList"></div>
+    <div class="row" style="margin-top:10px">
+      <span>That gives you</span><b id="strategyPill" class="pill">&mdash;</b>
+    </div>
+    <div class="note" id="strategyNote">&mdash;</div>
+    <div class="actions">
+      <button class="primary" onclick="confirmSensors()">Continue</button>
+    </div>
+  </div>
+
+  <div class="dialog" id="dlgStart" style="display:none">
+    <h2>Ready when you are</h2>
+    <p class="lead">
+      Arrange the room in the Omniverse window first &mdash; drag the furniture
+      wherever you want it. The robot meets it where you put it.
+    </p>
+    <div class="row"><span>Sensors</span><b id="readySensors">&mdash;</b></div>
+    <div class="row"><span>Strategy</span><b id="readyStrategy" class="pill">&mdash;</b></div>
+    <div class="row"><span>In the room</span><b id="readyPieces">&mdash;</b></div>
+
+    <div class="note" style="margin-top:12px;margin-bottom:4px">How should it drive?</div>
+    <div id="modeChoice" style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+      <button data-choice="automatic" class="chosen">Automatic</button>
+      <button data-choice="manual">Manual</button>
+    </div>
+    <div class="note" id="modeChoiceNote">
+      The robot maps the room on its own.
+    </div>
+
+    <div class="actions">
+      <button onclick="backToSensors()">Back</button>
+      <button class="primary" id="startBtn" onclick="startRun()">Start</button>
+    </div>
+  </div>
+</div>
+
 <div id="stage">
   <div class="pane">
     <div class="pane-title">Live &mdash; what the robot has sensed</div>
@@ -134,52 +211,22 @@
   </div>
 
   <!--
-    Two stages, and only one is on screen at a time.
-
-    Choose the sensors, then wait for Start. What the robot can sense decides
-    HOW it maps — tick a lidar and the same room is measured in 23 m instead of
-    435 — so it is settled before the robot goes out, and locked once it has.
-
-    The room is not chosen here. It is arranged in the Omniverse window, which
-    is the thing you can actually reach into and move furniture around in.
+    Setting up happens in the dialogs over the page, not here. By the time the
+    page itself is visible the run is configured, so the sidebar is for what
+    the robot is doing rather than for what it is about to do.
   -->
-  <div class="card" id="stageSensors">
-    <h2>Step 1 &middot; Choose the sensors</h2>
-    <div class="note" style="margin-top:0">
-      What is bolted to the robot. The mapping strategy follows from it.
+  <div class="card">
+    <h2>Mode</h2>
+    <div id="modeSwitch" style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+      <button data-mode="automatic">Automatic</button>
+      <button data-mode="manual">Manual</button>
     </div>
-    <div id="sensorList" style="margin-top:8px"></div>
-    <div class="row" style="margin-top:8px">
-      <span>Strategy</span><b id="strategyPill" class="pill">&mdash;</b>
-    </div>
-    <div class="note" id="strategyNote">&mdash;</div>
-    <button id="confirmBtn" onclick="confirmSensors()"
-            style="background:#1f6feb;border-color:#1f6feb;font-weight:600">
-      Confirm these sensors
-    </button>
-  </div>
-
-  <div class="card" id="stageReady" style="display:none">
-    <h2>Step 2 &middot; Waiting for start</h2>
-    <div class="row"><span>Sensors</span><b id="readySensors">&mdash;</b></div>
-    <div class="row"><span>Strategy</span><b id="readyStrategy" class="pill">&mdash;</b></div>
-    <div class="note" style="margin-top:8px">
-      Arrange the room in the Omniverse window &mdash; drag the furniture
-      wherever you want it. The robot will meet it where you put it.
-    </div>
-    <button id="startBtn" onclick="startScan()"
-            style="background:#238636;border-color:#238636;font-weight:600">
-      Start
-    </button>
+    <div class="note" id="modeNote">&mdash;</div>
     <button id="stopBtn" onclick="stopScan()"
-            style="background:#8b2c2c;border-color:#8b2c2c;font-weight:600"
-            disabled>
+            style="background:#8b2c2c;border-color:#8b2c2c;font-weight:600">
       Stop
     </button>
-    <button id="rechooseBtn" onclick="rechoose()">
-      Re-choose sensors &mdash; resets the room
-    </button>
-    <div class="note" id="runNote">Press Start when the room is how you want it.</div>
+    <button onclick="reopenSetup()">Set up a new run&hellip;</button>
   </div>
 
   <div class="card" id="manualCard">
@@ -882,47 +929,46 @@ addEventListener('blur', () => { if (driving && driving !== 'stop') drive('stop'
 
 // ── Setting up a run ────────────────────────────────────────────────────────
 //
-// Two stages, one on screen at a time. Choose the sensors, then wait for
-// Start. What the robot can sense decides HOW it maps, so it is settled before
-// the robot goes out and locked once it has.
-//
-// The room is not chosen here. It is arranged in the Omniverse window, which
-// is the thing you can reach into and move furniture around in.
+// Two dialogs, in order, then the page. Each decision changes what the next one
+// means — what the robot can sense decides how it maps, and how it maps decides
+// what to expect of the room — so they are asked one at a time over a page that
+// waits, rather than all at once beside a map of a run that has not happened.
 
 let scanRunning = false;
-let sensorsConfirmed = false;
+let currentMode = 'idle';
+let chosenMode = 'automatic';
 
-function showStage(which) {
-  document.getElementById('stageSensors').style.display =
-    which === 'sensors' ? '' : 'none';
-  document.getElementById('stageReady').style.display =
-    which === 'ready' ? '' : 'none';
+function showDialog(which) {
+  document.getElementById('setupScrim').classList.toggle('gone', which === null);
+  document.getElementById('dlgSensors').style.display = which === 'sensors' ? '' : 'none';
+  document.getElementById('dlgStart').style.display = which === 'start' ? '' : 'none';
 }
+
+// ── Dialog 1: the sensors ───────────────────────────────────────────────────
 
 async function loadSensors() {
   const hw = await (await fetch('/api/hardware')).json();
-  document.getElementById('sensorList').innerHTML = hw.devices.map(d => `
-    <label style="display:flex;gap:8px;align-items:flex-start;padding:3px 0;
-                  font-size:12px;cursor:pointer">
-      <input type="checkbox" data-name="${d.name.replace(/"/g, '&quot;')}"
-             ${d.fitted ? 'checked' : ''} onchange="previewStrategy()"
-             style="margin-top:2px;flex:none">
-      <span>
-        <b style="font-weight:600">${d.name}</b>
-        <span style="color:var(--muted)">${d.capabilities.join(', ').toLowerCase()}</span>
-        <span style="display:block;color:var(--muted);font-size:10.5px">${d.accuracy}</span>
-      </span>
-    </label>`).join('');
+  document.getElementById('sensorList').innerHTML = hw.devices.map(function (d) {
+    const safe = d.name.replace(/"/g, '&quot;');
+    const caps = d.capabilities.join(', ').toLowerCase();
+    return '<label style="display:flex;gap:9px;align-items:flex-start;padding:5px 0;'
+      + 'font-size:12.5px;cursor:pointer">'
+      + '<input type="checkbox" data-name="' + safe + '" '
+      + (d.fitted ? 'checked' : '') + ' onchange="previewStrategy()" '
+      + 'style="margin-top:3px;flex:none">'
+      + '<span><b style="font-weight:600">' + d.name + '</b>'
+      + '<span style="display:block;color:var(--muted);font-size:11px">'
+      + caps + ' &middot; ' + d.accuracy + '</span></span></label>';
+  }).join('');
   previewStrategy();
 }
 
-// Worked out in the page as the boxes are ticked, so the consequence of a
-// choice is visible before it is committed. The server decides for real.
+// Worked out in the page as boxes are ticked, so the consequence of a choice is
+// visible before it is committed. The server decides for real.
 function previewStrategy() {
   const canSee = [...document.querySelectorAll('#sensorList input:checked')]
-    .some(box => /lidar|ultrasonic|radar|arduino/i.test(box.dataset.name));
-  paintStrategy(canSee ? 'WALL_FOLLOWING' : 'CONTACT_ONLY',
-                'strategyPill', 'strategyNote');
+    .some(b => /lidar|ultrasonic|radar|arduino/i.test(b.dataset.name));
+  paintStrategy(canSee ? 'WALL_FOLLOWING' : 'CONTACT_ONLY', 'strategyPill', 'strategyNote');
 }
 
 function paintStrategy(strategy, pillId, noteId) {
@@ -934,14 +980,14 @@ function paintStrategy(strategy, pillId, noteId) {
   document.getElementById(noteId).textContent = contact
     ? 'Nothing fitted can measure distance, so the robot finds the room by '
       + 'driving into it and covering it in rows. Slower, and it is the robot '
-      + 'that exists today.'
-    : 'Something can measure distance, so the robot holds a set gap from the '
-      + 'wall and follows it round — about 23 m, and accurate to 1.4 %.';
+      + 'you actually have.'
+    : 'Something can measure distance, so it holds a gap from the wall and '
+      + 'follows it round — about 23 m, and accurate to 1.4 %.';
 }
 
 async function confirmSensors() {
   const fitted = [...document.querySelectorAll('#sensorList input:checked')]
-    .map(box => box.dataset.name);
+    .map(b => b.dataset.name);
 
   const reply = await fetch('/api/hardware', {
     method: 'POST',
@@ -955,57 +1001,92 @@ async function confirmSensors() {
     return;
   }
 
-  sensorsConfirmed = true;
   document.getElementById('readySensors').textContent =
-    fitted.length ? `${fitted.length} fitted` : 'none';
+    fitted.length ? fitted.length + ' fitted' : 'none';
   paintStrategy(body.strategy, 'readyStrategy', null);
-  showStage('ready');
-  refreshRunState();
+  refreshPieces();
+  showDialog('start');
 }
 
-async function rechoose() {
-  // Going back means starting over, and starting over means the room too —
-  // otherwise the next run happens in whatever arrangement the last one was
-  // left in, a difference nobody asked for and nobody would notice until the
-  // numbers disagreed.
-  if (scanRunning) await stopScan();
-  await fetch('/api/scene/reset', { method: 'POST' });
-  sensorsConfirmed = false;
-  document.getElementById('runNote').textContent =
-    'Press Start when the room is how you want it.';
-  showStage('sensors');
-  loadSensors();
-}
+// ── Dialog 2: confirm the room, pick a mode, go ─────────────────────────────
 
-async function startScan() {
-  const note = document.getElementById('runNote');
-  document.getElementById('startBtn').disabled = true;
-  note.textContent = 'Sending the robot out…';
+async function refreshPieces() {
   try {
-    const reply = await fetch('/api/scan/start', { method: 'POST' });
-    const body = await reply.json();
-    note.textContent = reply.ok
-      ? (body.strategy === 'CONTACT_ONLY'
-          ? 'Running — covering the room in rows by touch. This takes a while.'
-          : 'Running — following the walls.')
-      : (body.detail || 'could not start');
-  } catch (e) {
-    note.textContent = 'could not start: ' + e;
+    const body = await (await fetch('/api/world/geometry')).json();
+    document.getElementById('readyPieces').textContent =
+      body.pieces.length ? body.pieces.length + ' piece(s)' : 'nothing — empty room';
+  } catch { /* the dialog is still usable without it */ }
+}
+
+for (const button of document.querySelectorAll('#modeChoice button')) {
+  button.addEventListener('click', () => {
+    chosenMode = button.dataset.choice;
+    for (const b of document.querySelectorAll('#modeChoice button')) {
+      b.classList.toggle('chosen', b === button);
+    }
+    document.getElementById('modeChoiceNote').textContent = chosenMode === 'manual'
+      ? 'You drive. It maps as you go — W A S D to move, Q E to spin.'
+      : 'The robot maps the room on its own.';
+  });
+}
+
+function backToSensors() { showDialog('sensors'); }
+
+async function startRun() {
+  const button = document.getElementById('startBtn');
+  button.disabled = true;
+  button.textContent = 'Starting…';
+  try {
+    // Clears the map: this is the deliberate beginning of a run, unlike a
+    // mid-run mode switch, which keeps what has been measured.
+    await fetch('/api/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: chosenMode, clear_map: true }),
+    });
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Start';
   }
+  showDialog(null);
   refreshRunState();
+}
+
+function reopenSetup() {
+  // Deliberately does not stop the robot. Reopening the setup is usually
+  // someone checking what they chose, and halting a run to answer that would be
+  // a surprising price.
+  loadSensors();
+  showDialog('sensors');
+}
+
+// ── Switching mode mid-run ──────────────────────────────────────────────────
+
+for (const button of document.querySelectorAll('#modeSwitch button')) {
+  button.addEventListener('click', async () => {
+    document.getElementById('modeNote').textContent = 'switching…';
+    // No clear_map: switching is handing the robot over, not starting again.
+    // Taking the controls to finish a corner the autonomy gave up on is the
+    // main reason to do it, and wiping the room would defeat that.
+    const body = await (await fetch('/api/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: button.dataset.mode }),
+    })).json();
+    document.getElementById('modeNote').textContent =
+      body.status === 'ok' ? '' : (body.detail || 'could not switch');
+    refreshRunState();
+  });
 }
 
 async function stopScan() {
-  const note = document.getElementById('runNote');
-  document.getElementById('stopBtn').disabled = true;
-  note.textContent = 'Stopping…';
+  const note = document.getElementById('modeNote');
+  note.textContent = 'stopping…';
   try {
     const body = await (await fetch('/api/scan/stop', { method: 'POST' })).json();
-    // Stop keeps the map: whoever pressed it wanted the driving to end, not
-    // the measurement.
     note.textContent = body.status === 'idle'
-      ? 'Nothing was running.'
-      : `Stopped. Keeping the ${body.area_m2} m² measured so far.`;
+      ? 'nothing was running'
+      : 'stopped — keeping the ' + body.area_m2 + ' m² measured so far';
   } catch (e) {
     note.textContent = 'could not stop: ' + e;
   }
@@ -1016,27 +1097,37 @@ async function refreshRunState() {
   try {
     const body = await (await fetch('/api/scan/status')).json();
     scanRunning = body.running;
+    currentMode = body.mode || 'idle';
   } catch { return; }
 
-  if (!sensorsConfirmed && scanRunning) {
-    // A run already going when the page was opened. Skip the setup rather than
-    // offer to change sensors mid-scan.
-    sensorsConfirmed = true;
-    showStage('ready');
+  for (const b of document.querySelectorAll('#modeSwitch button')) {
+    b.classList.toggle('on', b.dataset.mode === currentMode);
   }
-  document.getElementById('startBtn').disabled = scanRunning;
   document.getElementById('stopBtn').disabled = !scanRunning;
-  // Re-choosing mid-run would leave half a map built one way and half the
-  // other, so it stops the robot first — but say so rather than surprising
-  // anyone.
-  document.getElementById('rechooseBtn').textContent = scanRunning
-    ? 'Stop and re-choose sensors — resets the room'
-    : 'Re-choose sensors — resets the room';
+  // The driving pad is only meaningful when you are the one driving.
+  document.getElementById('manualCard').style.display =
+    currentMode === 'manual' ? '' : 'none';
+
+  if (!scanRunning && !document.getElementById('modeNote').textContent) {
+    document.getElementById('modeNote').textContent = 'idle';
+  }
 }
 
-showStage('sensors');
-loadSensors();
-refreshRunState();
+// A run already going when the page is opened means the setup has happened —
+// reloading a tab mid-scan should show the map, not ask the questions again.
+(async function begin() {
+  try {
+    const body = await (await fetch('/api/scan/status')).json();
+    if (body.running) {
+      showDialog(null);
+      refreshRunState();
+      return;
+    }
+  } catch { /* fall through to the setup */ }
+  loadSensors();
+  showDialog('sensors');
+})();
+
 setInterval(refreshRunState, 2000);
 
 resize();

@@ -263,3 +263,85 @@ def test_every_command_renews_the_deadline(client):
     client.post("/api/drive", json={"action": "forward"})
 
     assert app.state.manual_deadline > first
+
+
+# ── Switching who drives ─────────────────────────────────────────────────────
+
+
+def test_the_mode_can_be_switched(client):
+    for mode in ("automatic", "manual", "idle"):
+        reply = client.post("/api/mode", json={"mode": mode})
+        assert reply.status_code in (200, 409), mode
+
+
+def test_an_unknown_mode_is_refused(client):
+    reply = client.post("/api/mode", json={"mode": "telepathy"})
+    assert reply.status_code == 409
+    assert "telepathy" in reply.json()["detail"]
+
+
+def test_the_status_says_who_is_driving(client):
+    assert "mode" in client.get("/api/scan/status").json()
+
+
+def test_switching_keeps_the_map_by_default(client):
+    """Switching is handing the robot over, not starting again. Taking the
+    controls to finish a corner the autonomy gave up on is the main reason to
+    do it, and wiping the room would defeat that."""
+    from mapper.main import pipeline
+
+    client.post("/api/mode", json={"mode": "idle"})
+    before = pipeline.packets_processed
+    client.post("/api/mode", json={"mode": "idle"})
+
+    assert pipeline.packets_processed >= before
+
+
+def test_starting_a_run_can_clear_the_map(client):
+    """The deliberate Start at the beginning of a run does clear, and asks."""
+    from mapper.main import pipeline
+
+    client.post("/api/mode", json={"mode": "idle", "clear_map": True})
+    assert pipeline.packets_processed == 0
+
+
+# ── The setup flow ───────────────────────────────────────────────────────────
+
+
+def _page():
+    from pathlib import Path
+
+    return (
+        Path(__file__).resolve().parents[1]
+        / "services" / "mapper" / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+
+
+def test_the_page_asks_the_sensors_first():
+    """One question at a time, over a page that waits. Showing all of it at
+    once beside a map of a run that has not happened invited people to press
+    Start before they had chosen anything."""
+    page = _page()
+    assert 'id="dlgSensors"' in page
+    assert 'id="dlgStart"' in page
+    assert "showDialog('sensors')" in page
+
+
+def test_the_dialogs_cover_the_page():
+    """A half-configured run is not something to start, so the page waits
+    behind them rather than being usable through them."""
+    page = _page()
+    assert ".scrim" in page
+    assert "position: fixed; inset: 0" in page
+
+
+def test_reloading_mid_run_does_not_ask_again():
+    """A run already going means the setup has happened."""
+    page = _page()
+    assert "if (body.running)" in page
+
+
+def test_both_modes_are_offered():
+    page = _page()
+    assert 'data-mode="automatic"' in page
+    assert 'data-mode="manual"' in page
