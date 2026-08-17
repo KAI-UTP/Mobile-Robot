@@ -2,8 +2,9 @@
 
     Window > Script Editor, paste this whole file, Ctrl+Enter.
 
-Builds a realistic room rather than an empty box: walls with a doorway and a
-window, a table and chairs, a sofa, a cabinet, a rug — and the four Bluetooth
+Builds a realistic room rather than an empty box: four solid walls, a shut door
+and a window, a table and chairs, a sofa, a cabinet, a rug — and the four
+Bluetooth
 beacons in the corners, so the positioning setup is visible rather than
 implied.
 
@@ -220,12 +221,13 @@ def sphere(stage, path, centre, radius, rgb, opacity=None):
 
 
 def build_shell(stage):
-    """Floor, walls, a doorway and a window.
+    """Floor, four solid walls, a shut door and a window.
 
-    The doorway is built as two wall segments with a gap rather than a solid
-    wall, because an opening is what makes the room realistic for both the
-    range sensors and the radio model — and it is where a real robot would
-    drive out and get lost.
+    The south wall used to be split around an opening, on the grounds that a
+    doorway is realistic for the range sensors and the radio model. It was not
+    realistic, it was a disagreement: the world the robot drives in is
+    `VirtualWorld.rectangular_room`, which is four solid walls, so the robot
+    met an invisible wall exactly where the opening was drawn.
     """
     UsdGeom.Xform.Define(stage, Sdf.Path(f"{ROOT}/Room"))
 
@@ -235,21 +237,27 @@ def build_shell(stage):
     h = WALL_HEIGHT / 2
     t = WALL_THICK
 
-    # South wall, split around a 0.9 m doorway.
+    # South wall, solid, with the door shut in it.
+    #
+    # It used to be split around a 0.9 m opening with the door swung inwards.
+    # The robot's world has four solid walls — `VirtualWorld.rectangular_room`
+    # builds exactly four — so the robot met an invisible wall precisely where
+    # the doorway was drawn, and a viewer watching the 3D scene saw it refuse
+    # to drive through an obvious gap.
+    #
+    # A gap is also the wrong thing to measure. The flood fill that finds the
+    # room deliberately stops at walls, and `_is_enclosed` treats an open
+    # doorway as a room whose boundary was never found — so an opening here
+    # would leak the map into whatever is beyond it and grade every scan as
+    # unusable. A closed room is what the mapping assumes, and now what it is
+    # shown.
     door_x, door_w = 4.3, 0.9
-    left_w = door_x - door_w / 2
-    box(stage, f"{ROOT}/Room/WallS_left",
-        (left_w / 2, 0, h), (left_w, t, WALL_HEIGHT), COL_WALL)
-    right_start = door_x + door_w / 2
-    right_w = ROOM_W - right_start
-    box(stage, f"{ROOT}/Room/WallS_right",
-        (right_start + right_w / 2, 0, h), (right_w, t, WALL_HEIGHT), COL_WALL)
-    # Lintel above the opening.
-    box(stage, f"{ROOT}/Room/WallS_lintel",
-        (door_x, 0, 2.15), (door_w, t, 0.5), COL_WALL)
-    # The door itself, swung open into the room.
+    box(stage, f"{ROOT}/Room/WallS",
+        (ROOM_W / 2, 0, h), (ROOM_W, t, WALL_HEIGHT), COL_WALL)
+    # The door itself: shut, set into the face of the wall rather than cut
+    # through it, so the room still reads as a room you could walk out of.
     box(stage, f"{ROOT}/Room/Door",
-        (door_x + 0.42, 0.42, 1.0), (0.05, 0.85, 2.0), COL_DOOR)
+        (door_x, t / 2 + 0.02, 1.0), (door_w, 0.05, 2.0), COL_DOOR)
 
     box(stage, f"{ROOT}/Room/WallN",
         (ROOM_W / 2, ROOM_H, h), (ROOM_W, t, WALL_HEIGHT), COL_WALL)
@@ -270,7 +278,7 @@ def build_shell(stage):
     ):
         box(stage, f"{ROOT}/Room/Skirting{name}", centre, size, COL_SKIRTING)
 
-    print(f"[room] shell built: {ROOM_W} x {ROOM_H} x {WALL_HEIGHT} m, one doorway")
+    print(f"[room] shell built: {ROOM_W} x {ROOM_H} x {WALL_HEIGHT} m, closed room")
 
 
 def build_furniture(stage):

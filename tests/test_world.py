@@ -40,14 +40,23 @@ def test_the_room_has_four_walls():
     assert len(walls) >= 4
 
 
-def test_the_doorway_is_an_opening_not_a_solid_wall():
-    """An opening is what makes the room realistic for the range sensors, and
-    it is where a real robot drives out and gets lost."""
+def test_the_room_is_closed():
+    """This used to assert the opposite — that the south wall was split around
+    a doorway, "realistic for the range sensors". It was not realistic, it was
+    a mismatch: the world the robot actually drives in is
+    `VirtualWorld.rectangular_room`, which builds four solid walls. So the
+    robot met an invisible wall exactly where the opening was drawn.
+
+    A gap is also the wrong thing to measure. The flood fill that finds the
+    room stops at walls on purpose, and `_is_enclosed` treats an open doorway
+    as a boundary that was never found — an opening here would leak the map
+    into whatever is beyond it and grade every scan unusable.
+    """
     boxes = describe_world("rectangular").boxes
     names = {b.name for b in boxes}
-    assert "wall_s_left" in names and "wall_s_right" in names
-    assert "wall_s" not in names
-    assert any(b.kind == "door" for b in boxes)
+
+    assert "wall_s" in names, "the south wall is not solid"
+    assert "wall_s_left" not in names and "wall_s_right" not in names
 
 
 def test_furniture_is_inside_the_room():
@@ -153,3 +162,54 @@ def test_every_box_has_a_colour_and_a_label():
     for box in describe_world("furnished").boxes:
         assert box.colour.startswith("#")
         assert box.label
+
+
+# ── The description and the world the robot drives in ────────────────────────
+#
+# The doorway existed for a long time in both 3D descriptions and in neither of
+# the simulator's rooms. Nothing compared them, so nothing objected. This does.
+
+
+def test_the_described_walls_match_the_world_the_robot_drives_in():
+    """`/api/world` is what the 3D views draw. If it describes a gap the
+    simulator has no gap for, the robot refuses to drive through an opening
+    that is plainly there on screen — which reads as broken navigation."""
+    from simulator.virtual_robot import VirtualWorld
+
+    described = describe_world("rectangular")
+    simulated = VirtualWorld.rectangular_room(described.width_m, described.height_m)
+
+    shell = [w for w in simulated.walls if w.kind == "shell"]
+    walls = [b for b in described.boxes if b.kind == "wall"]
+
+    # Four sides, four sides. A split wall would make it five.
+    assert len(shell) == 4
+    assert len(walls) == 4, f"described {len(walls)} wall segments for 4 real ones"
+
+
+def test_a_ray_along_every_wall_is_blocked():
+    """The honest version of "is the room closed": fire a ray at each wall from
+    the middle and check something stops it. An opening anywhere lets the map
+    leak out through it."""
+    from simulator.virtual_robot import VirtualWorld
+
+    world = VirtualWorld.rectangular_room(6.0, 4.5)
+    middle_x, middle_y = 3.0, 2.25
+
+    for bearing, limit in ((0, 3.0), (90, 2.25), (180, 3.0), (270, 2.25)):
+        reach = world.raycast(middle_x, middle_y, bearing, 20.0)
+        assert reach < limit + 0.2, f"a ray at {bearing} deg escaped the room"
+
+
+def test_the_door_is_drawn_but_does_not_open_a_hole(kit):
+    """A shut door set into the wall face still reads as a room you could walk
+    out of, without being a gap the robot is expected to use."""
+    module, stage = kit
+    module.build_room()
+
+    door = [p for path, p in stage.prims.items() if path.endswith("/Room/Door")]
+    assert door, "the room has no door at all"
+
+    # The wall it sits in is one piece.
+    walls = [path for path in stage.prims if "/Room/WallS" in path]
+    assert walls == [f"{module.ROOT}/Room/WallS"], f"south wall is split: {walls}"

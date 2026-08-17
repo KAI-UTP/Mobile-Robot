@@ -799,20 +799,14 @@ async def post_rescan() -> JSONResponse:
     return JSONResponse(result, status_code=status)
 
 
-@app.post("/api/scan/start")
-async def post_scan_start() -> JSONResponse:
-    """Send the robot out, with whatever sensors and room are set up now.
-
-    Same machinery as a rescan — clear the map, build a world, drive — but it
-    is the deliberate beginning of a run rather than a repeat of one. Kept as
-    its own route because "Start" and "Scan again" mean different things to
-    whoever is pressing them, and because a run that has not begun yet has no
-    previous scan to repeat.
-    """
-    result = await asyncio.to_thread(rescan)
-    status = 409 if result["status"] in ("busy", "error") else 200
-    return JSONResponse(result, status_code=status)
-
+# /api/scan/start has been removed.
+#
+# It started an autonomous scan, and /api/mode does that and more: it stops
+# whatever was running first, which is the half that matters, and it can start
+# manual driving instead. Two routes doing overlapping things is how a page
+# ends up calling the one that does not stop the previous run.
+#
+#     POST /api/mode {"mode": "automatic", "clear_map": true}
 
 @app.post("/api/drive")
 async def post_drive(request: Request) -> JSONResponse:

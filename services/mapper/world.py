@@ -255,7 +255,7 @@ def describe_world(
             name="Furnished room",
             width_m=6.0,
             height_m=4.5,
-            boxes=_walls(6.0, 4.5, 2.4, door_x=4.3) + _furniture(6.0, 4.5),
+            boxes=_walls(6.0, 4.5, 2.4, door_x=None) + _furniture(6.0, 4.5),
             beacons=_beacons(6.0, 4.5),
         )
 
@@ -277,7 +277,7 @@ def describe_world(
             name="Empty rectangular room",
             width_m=6.0,
             height_m=4.5,
-            boxes=_walls(6.0, 4.5, 2.4, door_x=4.3),
+            boxes=_walls(6.0, 4.5, 2.4, door_x=None),
             beacons=_beacons(6.0, 4.5),
         )
 

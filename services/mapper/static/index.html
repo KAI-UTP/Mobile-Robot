@@ -226,7 +226,7 @@
             style="background:#8b2c2c;border-color:#8b2c2c;font-weight:600">
       Stop
     </button>
-    <button onclick="reopenSetup()">Set up a new run&hellip;</button>
+    <button onclick="reopenSetup()">Set up a new run &mdash; resets the room</button>
   </div>
 
   <div class="card" id="manualCard">
@@ -1052,12 +1052,25 @@ async function startRun() {
   refreshRunState();
 }
 
-function reopenSetup() {
-  // Deliberately does not stop the robot. Reopening the setup is usually
-  // someone checking what they chose, and halting a run to answer that would be
-  // a surprising price.
+async function reopenSetup() {
+  // Setting up a new run means starting over, and starting over means the room
+  // too — otherwise the next run happens in whatever arrangement the last one
+  // was left in, a difference nobody asked for and nobody would notice until
+  // the numbers disagreed. The robot is stopped first: it cannot be driving
+  // while its sensors are being chosen.
+  //
+  // This call went missing once. Rewriting the setup flow dropped it, and the
+  // room reset became unreachable from the page while still passing its own
+  // tests, because nothing checked that anything called it.
+  await fetch('/api/mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'idle' }),
+  });
+  await fetch('/api/scene/reset', { method: 'POST' });
   loadSensors();
   showDialog('sensors');
+  refreshRunState();
 }
 
 // ── Switching mode mid-run ──────────────────────────────────────────────────

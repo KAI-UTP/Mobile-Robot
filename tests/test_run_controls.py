@@ -345,3 +345,58 @@ def test_both_modes_are_offered():
     page = _page()
     assert 'data-mode="automatic"' in page
     assert 'data-mode="manual"' in page
+
+
+def test_setting_up_a_new_run_resets_the_room():
+    """This regressed once, silently. Rewriting the setup flow dropped the call
+    and the room reset became unreachable from the page — while still passing
+    its own tests, because nothing checked that anything called it.
+
+    An endpoint with no caller is not a feature.
+    """
+    page = _page()
+    assert "/api/scene/reset" in page, "nothing on the page resets the room"
+
+    # And it stops the robot first: it cannot be driving while its sensors are
+    # being chosen.
+    setup = page[page.index("async function reopenSetup"):]
+    setup = setup[:setup.index("\n}")]
+    assert "'idle'" in setup
+    assert "/api/scene/reset" in setup
+
+
+# ── The accuracy score ───────────────────────────────────────────────────────
+#
+# /api/compare survived the deletion of the page that drew it, on the grounds
+# that "the score is still worth having, and CI still checks it". CI did not.
+# Nothing referenced the endpoint at all, which is how it would have rotted
+# quietly until someone needed the number. Now it does.
+
+
+def test_the_comparison_endpoint_answers(client):
+    body = client.get("/api/compare").json()
+    assert "reference_name" in body
+    assert "measured_polygon" in body
+    assert "truth_polygon" in body
+
+
+def test_it_reports_a_truth_to_score_against(client):
+    """The reference room is what makes the score mean anything. Without one
+    the endpoint is just the measured room repeated back."""
+    body = client.get("/api/compare").json()
+    assert body["truth_polygon"], "no reference room to compare against"
+
+
+def test_it_does_not_invent_a_truth_when_there_is_none(client):
+    """With real hardware the true room is unknown, and presenting a reference
+    layout as if it were measured would make the comparison look authoritative
+    when it is an assumption."""
+    from mapper.main import app
+
+    previous = app.state.reference_room_name
+    app.state.reference_room_name = "no-such-room"
+    try:
+        body = client.get("/api/compare").json()
+        assert body["truth_polygon"] == []
+    finally:
+        app.state.reference_room_name = previous
