@@ -695,3 +695,32 @@ def test_nesting_does_not_hide_an_object(kit):
     module.make_solid(stage)
 
     assert "collision" in stage.prims[deep].schemas
+
+
+# ── What the scene tells you about itself ────────────────────────────────────
+
+
+def test_the_legend_explains_the_two_robots(kit, capsys):
+    """"Why are there two robots?" is the first thing anyone asks, and the gap
+    between them is the most useful thing the scene shows. Naming the colours
+    is not enough — the legend has to say what the distance means."""
+    module, _ = kit
+    module.build_room()
+    printed = capsys.readouterr().out.lower()
+
+    assert "blue" in printed and "green" in printed
+    assert "drift" in printed, "the legend names the markers but not the point"
+
+
+def test_the_legend_does_not_describe_markers_that_were_removed(kit, capsys):
+    """It advertised an orange RSSI marker for several commits after the marker
+    was deleted, and called this room LEFT of a measured room that no longer
+    stood beside it. A legend that describes the wrong scene is worse than
+    none: it is read as the truth about what is on screen."""
+    module, _ = kit
+    module.build_room()
+    printed = capsys.readouterr().out.lower()
+
+    assert "rssi" not in printed
+    assert "orange" not in printed
+    assert "left —" not in printed and "right —" not in printed

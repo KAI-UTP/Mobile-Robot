@@ -1158,12 +1158,24 @@ def build_room():
         make_solid(stage)
         make_robot_physical(stage)
 
+    # What the two robots mean.
+    #
+    # "Why are there two?" is the first thing anyone asks, and the legend used
+    # to answer a different question: it described an orange RSSI marker that
+    # has been deleted, and called this room LEFT of a measured room that no
+    # longer stands beside it. Naming the markers is not enough — the useful
+    # part is what the distance between them is.
     print()
-    print("  LEFT — the room that exists")
-    print("    blue     = where the robot is")
-    print("    green    = wheel odometry     (0.07 m mean error, measured)")
-    print("    orange   = Bluetooth RSSI     (2.71 m mean error, measured)")
-    print("    magenta  = BLE beacons")
+    print("  Two robots, and the distance between them is the point:")
+    print("    BLUE   where the robot actually is")
+    print("    GREEN  where its own dead reckoning thinks it is")
+    print()
+    print("  The gap between them IS the drift. It grows with distance driven,")
+    print("  and it is why the measured room comes back larger than the real")
+    print("  one — the 2D map is built from the green robot's idea of where it")
+    print("  went. http://localhost:8080 prints the same gap in metres.")
+    print()
+    print("    MAGENTA  the four BLE beacons, on the walls at 2.1 m")
     print()
     return stage
 
