@@ -412,3 +412,82 @@ def test_hardware_falls_back_to_the_estimate(kit):
 
     scene = _scene_with(module, stage, {"x_m": 2.0, "y_m": 1.5, "heading_deg": 0.0})
     assert scene.x > 0.0 and scene.y > 0.0
+
+
+# ── Following the robot, not a recording of one ──────────────────────────────
+#
+# The source used to be chosen once at startup, which was survivable while the
+# mapper drove off the moment it booted. It stopped being survivable when the
+# page gained a Start button: the robot is idle when Kit launches, so the scene
+# fell back to its canned demo lap permanently and never noticed Start being
+# pressed. The web app showed the real robot; Omniverse showed a scripted
+# rectangle. Not two views drifting apart — two different robots.
+
+
+class _Fixed:
+    def __init__(self, pose): self.pose = pose
+    def read(self): return self.pose
+
+
+def test_it_shows_the_demo_lap_while_the_robot_is_idle(kit):
+    module, _ = kit
+    demo = _Fixed({"x_m": 99.0, "y_m": 99.0, "heading_deg": 0.0})
+    source = module.LiveOrDemo([_Fixed(None)], demo)
+
+    assert source.read() is demo.pose
+    assert source.using_demo
+
+
+def test_it_switches_to_the_robot_when_it_starts_moving(kit):
+    """The whole point: pressing Start has to be noticed."""
+    module, _ = kit
+    live = _Fixed({"x_m": 1.0, "y_m": 1.0, "heading_deg": 0.0, "sequence": 1})
+    source = module.LiveOrDemo([live], _Fixed({"x_m": 99.0, "y_m": 99.0}))
+
+    source.read()                       # first look establishes the sequence
+    live.pose = dict(live.pose, sequence=2, x_m=1.2)
+    pose = source.read()
+
+    assert pose["x_m"] == 1.2, "did not follow the robot once it started"
+    assert not source.using_demo
+
+
+def test_a_frozen_pose_is_not_a_running_robot(kit):
+    """The mapper holds its last pose indefinitely, so "is there a pose?" is
+    answered yes for ever once anything has run. A sequence number that stops
+    advancing is what says the robot has stopped."""
+    import time as _time
+
+    module, _ = kit
+    live = _Fixed({"x_m": 1.0, "y_m": 1.0, "heading_deg": 0.0, "sequence": 7})
+    demo = _Fixed({"x_m": 99.0, "y_m": 99.0})
+    source = module.LiveOrDemo([live], demo)
+    source.STALE_AFTER_S = 0.05
+
+    source.read()
+    live.pose = dict(live.pose, sequence=8)
+    source.read()
+    assert not source.using_demo
+
+    _time.sleep(0.1)                    # nothing new arrives
+    assert source.read() is demo.pose
+    assert source.using_demo
+
+
+def test_the_http_source_forwards_the_whole_pose(kit, monkeypatch):
+    """It used to copy three fields, which silently dropped `sequence` — the
+    only way to tell a running robot from a stopped one — and `true_x_m`,
+    without which the scene draws the drifted estimate and the robot walks
+    through walls again."""
+    from test_kit_measured_room import _stub_fetch
+
+    module, _ = kit
+    payload = {"pose": {
+        "x_m": 1.0, "y_m": 2.0, "heading_deg": 0.0,
+        "sequence": 42, "true_x_m": 1.1, "true_y_m": 2.1,
+    }}
+    monkeypatch.setattr("urllib.request.urlopen", _stub_fetch(payload))
+
+    pose = module.HttpPose().read()
+    assert pose["sequence"] == 42
+    assert pose["true_x_m"] == 1.1

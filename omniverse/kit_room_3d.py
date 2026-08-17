@@ -710,13 +710,74 @@ class HttpPose:
         if not pose:
             return self.latest
 
-        self.latest = {
-            "x_m": pose["x_m"],
-            "y_m": pose["y_m"],
-            "heading_deg": pose["heading_deg"],
-            "timestamp": pose.get("timestamp"),
-        }
+        # Passed through whole rather than picked apart field by field.
+        #
+        # Copying three keys is how this quietly lost the rest: `sequence`,
+        # which is the only way to tell a robot that is running from one that
+        # stopped an hour ago, and `true_x_m`, without which the scene goes
+        # back to drawing the drifted estimate and the robot walks through
+        # walls again. Both were added to the mapper and neither reached the
+        # scene, because this function decided in advance what mattered.
+        self.latest = dict(pose)
         return self.latest
+
+
+class LiveOrDemo:
+    """Follow the real robot whenever there is one, and keep checking.
+
+    The source used to be chosen once, at startup: whatever was available in
+    that instant was what the scene followed for the rest of the session. That
+    was survivable while the mapper began driving the moment it booted.
+
+    It stopped being survivable when the page gained a Start button. The robot
+    is now deliberately idle until someone presses it, so at the moment Kit
+    launches there is never a live pose — and the scene fell back to its canned
+    demo lap permanently. Press Start, and the web app showed the real robot
+    while Omniverse carried on driving a scripted rectangle. Not two views
+    drifting apart: two different robots.
+
+    Live means the pose is MOVING. A sequence number that has not advanced for
+    a few seconds is a robot that is not publishing, which is a robot that is
+    not running — the mapper holds its last pose indefinitely, so "is there a
+    pose?" is answered yes forever once anything has ever run.
+    """
+
+    #: How long a frozen sequence number means the robot has stopped. Long
+    #: enough to ride out a dropped request, short enough that pressing Start
+    #: shows up almost at once.
+    STALE_AFTER_S = 4.0
+
+    def __init__(self, live, demo):
+        self.live = live
+        self.demo = demo
+        self.using_demo = True
+        self._sequence = None
+        self._changed_at = 0.0
+
+    def read(self):
+        pose = None
+        for source in self.live:
+            pose = source.read()
+            if pose:
+                break
+
+        now = time.monotonic()
+        if pose:
+            sequence = pose.get("sequence")
+            if sequence != self._sequence:
+                self._sequence = sequence
+                self._changed_at = now
+
+        moving = pose is not None and (now - self._changed_at) < self.STALE_AFTER_S
+
+        if moving and self.using_demo:
+            print("[room] the robot is running — following it")
+            self.using_demo = False
+        elif not moving and not self.using_demo:
+            print("[room] the robot has stopped — showing the demo lap")
+            self.using_demo = True
+
+        return pose if moving else self.demo.read()
 
 
 class DemoPose:
@@ -1372,17 +1433,12 @@ def run_room():
     # The file first — cheaper, and needs no web server — then the mapper over
     # HTTP, which is what actually works when this file is pasted into the
     # Script Editor with nothing set. Only then the canned lap.
-    source = FilePose()
-    if source.read() is not None:
-        print(f"[room] following the live robot from {POSE_FILE}")
-    else:
-        source = HttpPose()
-        if source.read() is not None:
-            print(f"[room] following the live robot from {MAPPER_URL}/api/state")
-        else:
-            print("[room] no live pose found — running the built-in demo lap")
-            print("       start services/mapper/main.py --source sim")
-            source = DemoPose()
+    # Both live sources, tried in order, with the demo lap only while neither
+    # has a moving robot to show. Checked every frame rather than once at
+    # startup — the robot is idle until somebody presses Start, and deciding at
+    # launch meant the scene never noticed them pressing it.
+    source = LiveOrDemo([FilePose(), HttpPose()], DemoPose())
+    print(f"[room] watching for the robot — {POSE_FILE}, then {MAPPER_URL}/api/state")
 
     # The scene is the physical world: move the furniture here and the robot
     # meets it where you put it. Pushed on a timer rather than on an edit
