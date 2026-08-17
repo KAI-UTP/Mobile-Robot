@@ -181,3 +181,85 @@ def test_manual_speed_is_below_the_autonomy(client):
     from mapper.main import MANUAL_SPEED_MPS
 
     assert 0.05 <= MANUAL_SPEED_MPS <= 0.25
+
+
+# ── The controller on its own ────────────────────────────────────────────────
+
+
+def test_the_controller_page_is_served(client):
+    reply = client.get("/drive")
+    assert reply.status_code == 200
+    assert "STOP" in reply.text
+
+
+def test_the_controller_locks_zoom():
+    """A pinch or a double-tap-to-zoom mid-drive moves the controls out from
+    under the thumb holding one down."""
+    from pathlib import Path
+
+    page = (
+        Path(__file__).resolve().parents[1]
+        / "services" / "mapper" / "static" / "drive.html"
+    ).read_text(encoding="utf-8")
+
+    assert "user-scalable=no" in page
+    assert "touch-action: none" in page
+
+
+def test_the_controller_renews_while_held():
+    """The server expires a command after a second, so a page that sent one
+    press and went quiet would stop the robot mid-drive."""
+    from pathlib import Path
+
+    page = (
+        Path(__file__).resolve().parents[1]
+        / "services" / "mapper" / "static" / "drive.html"
+    ).read_text(encoding="utf-8")
+
+    assert "setInterval" in page and "RENEW_MS" in page
+
+
+def test_the_controller_releases_when_hidden():
+    """A control held while the phone shows a notification would otherwise
+    never come back up."""
+    from pathlib import Path
+
+    page = (
+        Path(__file__).resolve().parents[1]
+        / "services" / "mapper" / "static" / "drive.html"
+    ).read_text(encoding="utf-8")
+
+    assert "visibilitychange" in page
+    assert "pointercancel" in page
+
+
+# ── The watchdog behind it ───────────────────────────────────────────────────
+
+
+def test_a_command_expires(client):
+    """The failure that matters on a phone over Wi-Fi: the connection drops
+    mid-press, the last thing the robot heard was 'forward'. Silence has to
+    mean stop, and the backstop has to live at the end that keeps moving."""
+    import time as _time
+
+    from mapper.main import MANUAL_WATCHDOG_S, app
+
+    client.post("/api/drive", json={"action": "forward"})
+    assert app.state.manual_deadline > _time.monotonic()
+
+    # Short enough that a held control renewing a few times a second never
+    # trips it, long enough to survive one dropped request.
+    assert 0.3 <= MANUAL_WATCHDOG_S <= 3.0
+
+
+def test_every_command_renews_the_deadline(client):
+    import time as _time
+
+    from mapper.main import app
+
+    client.post("/api/drive", json={"action": "forward"})
+    first = app.state.manual_deadline
+    _time.sleep(0.02)
+    client.post("/api/drive", json={"action": "forward"})
+
+    assert app.state.manual_deadline > first

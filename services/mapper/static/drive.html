@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Sized for a phone held in one hand, and locked there: a pinch-zoom or a
+     double-tap-to-zoom in the middle of driving would move the controls out
+     from under the thumb that is holding one down. -->
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<title>Drive — Room Mapper</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e;
+    --go: #238636; --stop: #b62324; --accent: #1f6feb;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    user-select: none; -webkit-user-select: none;
+    /* Nothing here scrolls. A drag that started on a button must drive the
+       robot, not pull the page around. */
+    overflow: hidden; touch-action: none;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  h1 { font-size: 14px; margin: 0; letter-spacing: .3px; font-weight: 600; }
+  a { color: var(--accent); text-decoration: none; font-size: 12px; }
+  .state {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .7px;
+    padding: 3px 8px; border-radius: 999px; font-weight: 600;
+    background: rgba(139,148,158,.15); color: var(--muted);
+  }
+  .state.live { background: rgba(63,185,80,.15); color: #3fb950; }
+
+  main {
+    height: calc(100% - 52px);
+    display: grid; grid-template-rows: auto 1fr auto; gap: 10px; padding: 12px;
+  }
+  .readout {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px;
+  }
+  .readout div { text-align: center; }
+  .readout b { display: block; font-size: 17px; font-variant-numeric: tabular-nums; }
+  .readout span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+
+  /* Three columns, three rows: rotate on the outside, translate in the middle.
+     Laid out the way the robot moves rather than the way a keyboard does. */
+  .pad {
+    display: grid; gap: 10px;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: 1fr 1fr 1fr;
+    min-height: 0;
+  }
+  .pad button {
+    border: 1px solid var(--border); background: #21262d; color: var(--text);
+    border-radius: 14px; font-size: 26px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center;
+    touch-action: none; cursor: pointer; min-height: 0;
+  }
+  .pad button:active, .pad button.held {
+    background: var(--go); border-color: var(--go);
+  }
+  .pad .spacer { visibility: hidden; }
+
+  #estop {
+    border: none; border-radius: 14px; padding: 18px; width: 100%;
+    background: var(--stop); color: #fff; font-size: 17px; font-weight: 700;
+    letter-spacing: .5px; touch-action: none; cursor: pointer;
+  }
+  #estop:active { filter: brightness(1.2); }
+  #note {
+    text-align: center; font-size: 12px; color: var(--muted);
+    padding-top: 6px; min-height: 18px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Drive the robot</h1>
+  <span class="state" id="link">connecting</span>
+  <a href="/">map &rsaquo;</a>
+</header>
+
+<main>
+  <div class="readout">
+    <div><b id="rx">—</b><span>x metres</span></div>
+    <div><b id="ry">—</b><span>y metres</span></div>
+    <div><b id="rc">—</b><span>bumps</span></div>
+    <div><b id="ra">—</b><span>m² mapped</span></div>
+  </div>
+
+  <div class="pad">
+    <button data-drive="turn_left" aria-label="spin left">&#8634;</button>
+    <button data-drive="forward"   aria-label="forward">&#9650;</button>
+    <button data-drive="turn_right" aria-label="spin right">&#8635;</button>
+
+    <button data-drive="left"  aria-label="slide left">&#9668;</button>
+    <div class="spacer"></div>
+    <button data-drive="right" aria-label="slide right">&#9658;</button>
+
+    <div class="spacer"></div>
+    <button data-drive="back" aria-label="back">&#9660;</button>
+    <div class="spacer"></div>
+  </div>
+
+  <div>
+    <button id="estop">STOP</button>
+    <div id="note">Hold a control. Letting go stops the robot.</div>
+  </div>
+</main>
+
+<script>
+// Hold to move, release to stop.
+//
+// A driving command says what the robot should be doing NOW, so releasing has
+// to stop it rather than queue anything. While a control is held the command
+// is renewed a few times a second: the server expires it after a second, so a
+// dropped connection stops the robot instead of leaving it committed to
+// whatever it was last told. That matters most on the device this page is
+// designed for — a phone, on Wi-Fi, held in one hand.
+
+const RENEW_MS = 250;
+let held = null;          // the action currently being held
+let renewTimer = null;
+
+async function send(action) {
+  try {
+    const reply = await fetch('/api/drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    setLink(reply.ok);
+    return reply.ok;
+  } catch {
+    setLink(false);
+    return false;
+  }
+}
+
+function setLink(ok) {
+  const pill = document.getElementById('link');
+  pill.textContent = ok ? 'connected' : 'no link';
+  pill.className = 'state' + (ok ? ' live' : '');
+}
+
+function startHold(action, button) {
+  if (held === action) return;
+  stopHold({ silent: true });
+
+  held = action;
+  button?.classList.add('held');
+  document.getElementById('note').textContent =
+    'driving: ' + action.replace('_', ' ');
+  send(action);
+  // Renewing is what makes the server's watchdog safe rather than annoying.
+  renewTimer = setInterval(() => send(action), RENEW_MS);
+}
+
+function stopHold({ silent = false } = {}) {
+  clearInterval(renewTimer);
+  renewTimer = null;
+  for (const b of document.querySelectorAll('.pad button')) b.classList.remove('held');
+  if (held && !silent) {
+    document.getElementById('note').textContent = 'stopped';
+  }
+  const wasHeld = held;
+  held = null;
+  if (wasHeld && !silent) send('stop');
+}
+
+for (const button of document.querySelectorAll('.pad button')) {
+  const action = button.dataset.drive;
+  // Pointer events cover mouse, touch and pen with one path, and capture keeps
+  // the press attached to this button even if the thumb slides off it — on a
+  // phone that happens constantly, and losing the press mid-drive would be
+  // read as the robot stalling.
+  button.addEventListener('pointerdown', event => {
+    event.preventDefault();
+    button.setPointerCapture(event.pointerId);
+    startHold(action, button);
+  });
+  button.addEventListener('pointerup', () => stopHold());
+  button.addEventListener('pointercancel', () => stopHold());
+  button.addEventListener('contextmenu', e => e.preventDefault());
+}
+
+document.getElementById('estop').addEventListener('pointerdown', event => {
+  event.preventDefault();
+  stopHold({ silent: true });
+  send('stop');
+  document.getElementById('note').textContent = 'stopped';
+});
+
+// Keys too, for whoever has this open on a laptop.
+const KEYS = {
+  w: 'forward', s: 'back', a: 'left', d: 'right',
+  q: 'turn_left', e: 'turn_right',
+  arrowup: 'forward', arrowdown: 'back', arrowleft: 'left', arrowright: 'right',
+};
+addEventListener('keydown', event => {
+  if (event.repeat) return;
+  const action = KEYS[event.key.toLowerCase()];
+  if (action) {
+    event.preventDefault();
+    startHold(action, document.querySelector(`[data-drive="${action}"]`));
+  }
+});
+addEventListener('keyup', event => {
+  if (KEYS[event.key.toLowerCase()]) stopHold();
+});
+
+// A control held while the page is hidden or backgrounded would otherwise
+// never be released — on a phone that is one notification away.
+addEventListener('blur', () => stopHold());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopHold();
+});
+
+async function refresh() {
+  try {
+    const [state, status] = await Promise.all([
+      fetch('/api/state').then(r => r.json()),
+      fetch('/api/scan/status').then(r => r.json()),
+    ]);
+    setLink(true);
+    const pose = state.pose;
+    document.getElementById('rx').textContent = pose ? pose.x_m.toFixed(2) : '—';
+    document.getElementById('ry').textContent = pose ? pose.y_m.toFixed(2) : '—';
+    document.getElementById('rc').textContent = status.contacts ?? '—';
+    const room = state.room;
+    document.getElementById('ra').textContent =
+      room && room.area_m2 ? room.area_m2.toFixed(1) : '—';
+  } catch {
+    setLink(false);
+  }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

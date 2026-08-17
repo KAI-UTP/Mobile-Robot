@@ -144,6 +144,21 @@ app.state.manual_twist = (0.0, 0.0, 0.0)
 MANUAL_SPEED_MPS = 0.18
 MANUAL_TURN_DPS = 60.0
 
+# A held command expires unless it is renewed.
+#
+# The controller page is meant to be held in one hand, very possibly on a phone
+# over Wi-Fi, and the failure that matters is the one where the connection
+# drops mid-press: the last thing the robot heard was "forward", and without
+# this it would keep going until it hit something. The page renews while a
+# control is held, so a lost connection stops the robot rather than committing
+# it to whatever it was doing.
+#
+# Same reasoning as the servo driver's own watchdog in services/pilot — the
+# backstop has to live at the end that keeps moving, not at the end that
+# vanished.
+MANUAL_WATCHDOG_S = 1.0
+app.state.manual_deadline = 0.0
+
 # What sensors this robot has, which decides how it maps a room rather than
 # merely describing it. `simulated` is the demo default because the simulator
 # genuinely does produce range readings; `actual` is the robot that exists and
@@ -173,6 +188,18 @@ _clients_lock = threading.Lock()
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/drive")
+async def drive_page() -> FileResponse:
+    """The controller on its own — nothing but the robot and your thumbs.
+
+    Meant to be opened on a phone and held in one hand while the map is watched
+    on something bigger. The controls on the map page are the same commands,
+    but they share the screen with a floor plan and a sidebar, which is exactly
+    what you do not want when steering something around furniture.
+    """
+    return FileResponse(STATIC_DIR / "drive.html")
 
 
 @app.get("/health")
@@ -787,6 +814,9 @@ async def post_drive(request: Request) -> JSONResponse:
         )
 
     app.state.manual_twist = moves[action]
+    # Renewed on every command, including the repeats the page sends while a
+    # control is held. Silence means stop.
+    app.state.manual_deadline = time.monotonic() + MANUAL_WATCHDOG_S
 
     started = False
     if action != "stop" and (_scan_thread is None or not _scan_thread.is_alive()):
@@ -1322,6 +1352,15 @@ def start_sim_source(
             publish_raw_packet(packet)
 
             vx, vy, omega = app.state.manual_twist
+            if time.monotonic() > app.state.manual_deadline:
+                # Nobody has said anything for a while. The controller page may
+                # have been closed, backgrounded, or lost its connection — none
+                # of which are reasons to keep driving.
+                if (vx, vy, omega) != (0.0, 0.0, 0.0):
+                    logger.info("Manual command expired — stopping the robot")
+                app.state.manual_twist = (0.0, 0.0, 0.0)
+                vx = vy = omega = 0.0
+
             robot.drive_holonomic(vx, vy, omega, dt_s)
             check_contact(BodyTwist(vx_mps=vx, vy_mps=vy, omega_dps=omega))
             time.sleep(dt_s / max(speed, 0.01))
