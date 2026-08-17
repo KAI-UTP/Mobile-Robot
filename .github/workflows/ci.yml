@@ -165,7 +165,11 @@ jobs:
           done
 
           echo "--- every page must render ---"
-          for path in / /twin /compare /scans; do
+          # Kept in step with the routes that exist. /twin and /compare were
+          # here long after both were deleted, so this job had been red on
+          # every commit for a whole session while the failure it reported was
+          # itself the stale thing.
+          for path in / /drive /scans; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080$path")
             echo "  $path -> $code"
             [ "$code" = "200" ] || { docker stop mapper-smoke || true; exit 1; }
