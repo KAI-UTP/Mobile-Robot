@@ -181,6 +181,28 @@
     <div class="note" id="runNote">Press Start when the room is how you want it.</div>
   </div>
 
+  <div class="card" id="manualCard">
+    <h2>Drive it yourself</h2>
+    <div class="note" style="margin-top:0">
+      Hold a key or a button. Letting go stops the robot. It maps while you
+      drive, so this is how you reach a corner the autonomy gave up on.
+    </div>
+    <div id="dpad" style="display:grid;grid-template-columns:repeat(3,1fr);
+                          gap:4px;margin-top:8px">
+      <button data-drive="turn_left"  title="Q">&#8634;</button>
+      <button data-drive="forward"    title="W">&#9650;</button>
+      <button data-drive="turn_right" title="E">&#8635;</button>
+      <button data-drive="left"       title="A">&#9668;</button>
+      <button data-drive="back"       title="S">&#9660;</button>
+      <button data-drive="right"      title="D">&#9658;</button>
+    </div>
+    <div class="note" style="margin-top:6px">
+      Keys: <b>W A S D</b> to move — it strafes sideways rather than turning,
+      because it is a kiwi drive — and <b>Q E</b> to spin.
+    </div>
+    <div class="note" id="driveNote">idle</div>
+  </div>
+
   <div class="card">
     <h2>Floor area</h2>
     <div class="big"><span id="area">—</span> <span>m²</span></div>
@@ -804,6 +826,58 @@ function drawPlan() {
     + `${(room.obstacles || []).length} obstacle(s), ${blocked.toFixed(2)} m² blocked · `
     + (room.is_closed ? 'boundary closed' : 'boundary still open');
 }
+
+// ── Driving it by hand ──────────────────────────────────────────────────────
+//
+// Hold to move, release to stop. A driving command says what the robot should
+// be doing NOW, so letting go has to stop it rather than queue something —
+// which is what anyone holding a control expects, and the only safe way to
+// steer something you are watching on a screen.
+
+const KEYS = {
+  w: 'forward', s: 'back', a: 'left', d: 'right',
+  q: 'turn_left', e: 'turn_right',
+  arrowup: 'forward', arrowdown: 'back',
+  arrowleft: 'left', arrowright: 'right',
+};
+let driving = null;
+
+async function drive(action) {
+  if (action === driving) return;      // holding a key repeats; say it once
+  driving = action;
+  try {
+    const body = await (await fetch('/api/drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })).json();
+    document.getElementById('driveNote').textContent =
+      action === 'stop' ? 'idle' : `driving: ${action.replace('_', ' ')}`;
+    if (body.started) refreshRunState();
+  } catch (e) {
+    document.getElementById('driveNote').textContent = 'could not drive: ' + e;
+  }
+}
+
+for (const button of document.querySelectorAll('#dpad button')) {
+  const action = button.dataset.drive;
+  // Pointer events rather than click, so the robot moves while held.
+  button.addEventListener('pointerdown', e => { e.preventDefault(); drive(action); });
+  button.addEventListener('pointerup', () => drive('stop'));
+  button.addEventListener('pointerleave', () => { if (driving === action) drive('stop'); });
+}
+
+addEventListener('keydown', e => {
+  if (e.repeat || e.target.tagName === 'INPUT') return;
+  const action = KEYS[e.key.toLowerCase()];
+  if (action) { e.preventDefault(); drive(action); }
+});
+addEventListener('keyup', e => {
+  if (KEYS[e.key.toLowerCase()]) drive('stop');
+});
+// A key held while the tab loses focus would otherwise never come back up,
+// and the robot would drive off on its own.
+addEventListener('blur', () => { if (driving && driving !== 'stop') drive('stop'); });
 
 // ── Setting up a run ────────────────────────────────────────────────────────
 //

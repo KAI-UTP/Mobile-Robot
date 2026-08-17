@@ -121,3 +121,63 @@ def test_the_room_can_be_emptied_and_refilled(client):
     })
     pieces = client.get("/api/world/geometry").json()["pieces"]
     assert len(pieces) in (0, 1)   # 0 when no simulator is running in this process
+
+
+# ── Driving it by hand ───────────────────────────────────────────────────────
+#
+# The same pipeline, the same collision inference, the same map — only the
+# thing choosing the velocities is different. It is the only way to reach a
+# corner the autonomy has given up on.
+
+
+def test_every_direction_is_accepted(client):
+    for action in ("forward", "back", "left", "right",
+                   "turn_left", "turn_right", "stop"):
+        reply = client.post("/api/drive", json={"action": action})
+        assert reply.status_code == 200, action
+
+
+def test_an_unknown_direction_says_what_it_knows(client):
+    """Driving is the one place a typo must not be guessed at."""
+    reply = client.post("/api/drive", json={"action": "wiggle"})
+    assert reply.status_code == 400
+    assert "forward" in reply.json()["known"]
+
+
+def test_left_strafes_rather_than_turning(client):
+    """A kiwi drive goes sideways without rotating, and a manual control that
+    turned instead would waste the one thing this base does that others cannot."""
+    vx, vy, omega = client.post("/api/drive", json={"action": "left"}).json()["twist"]
+    assert vy > 0
+    assert omega == 0
+    assert vx == 0
+
+
+def test_turning_does_not_translate(client):
+    vx, vy, omega = client.post(
+        "/api/drive", json={"action": "turn_left"}
+    ).json()["twist"]
+    assert omega > 0
+    assert vx == 0 and vy == 0
+
+
+def test_stop_means_stop(client):
+    """Releasing a key has to halt the robot, not queue something. A driving
+    command is a statement about now."""
+    client.post("/api/drive", json={"action": "forward"})
+    twist = client.post("/api/drive", json={"action": "stop"}).json()["twist"]
+    assert twist == [0.0, 0.0, 0.0]
+
+
+def test_forward_and_back_are_opposites(client):
+    forward = client.post("/api/drive", json={"action": "forward"}).json()["twist"]
+    back = client.post("/api/drive", json={"action": "back"}).json()["twist"]
+    assert forward[0] == -back[0]
+
+
+def test_manual_speed_is_below_the_autonomy(client):
+    """Someone steering by eye through a browser has a far longer reaction time
+    than a control loop, and the robot is mapping while they do it."""
+    from mapper.main import MANUAL_SPEED_MPS
+
+    assert 0.05 <= MANUAL_SPEED_MPS <= 0.25

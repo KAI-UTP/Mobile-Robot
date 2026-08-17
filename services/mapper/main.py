@@ -132,6 +132,18 @@ app.state.lap_distance_m = None
 # been restarted. See /api/scene/reset.
 app.state.scene_reset_token = 0
 
+# What the manual controls are asking for, as (vx, vy, omega) in the body
+# frame. Held rather than queued: a driving command is a statement about what
+# the robot should be doing NOW, and a stale one that arrived late is worse
+# than none — releasing a key has to stop the robot, not join a queue.
+app.state.manual_twist = (0.0, 0.0, 0.0)
+
+# How fast the manual controls drive. Deliberately below the autonomy's own
+# limits: someone steering by eye through a browser has a much longer reaction
+# time than a control loop, and the robot is mapping while they do it.
+MANUAL_SPEED_MPS = 0.18
+MANUAL_TURN_DPS = 60.0
+
 # What sensors this robot has, which decides how it maps a room rather than
 # merely describing it. `simulated` is the demo default because the simulator
 # genuinely does produce range readings; `actual` is the robot that exists and
@@ -743,6 +755,50 @@ async def post_scan_start() -> JSONResponse:
     return JSONResponse(result, status_code=status)
 
 
+@app.post("/api/drive")
+async def post_drive(request: Request) -> JSONResponse:
+    """Steer the robot by hand.
+
+    Takes a direction rather than a distance: `forward`, `back`, `left`,
+    `right`, `turn_left`, `turn_right`, or `stop`. The browser sends one on key
+    down and `stop` on key up, so letting go stops the robot — which is what
+    anyone holding a control expects, and the only safe way to drive something
+    you are watching through a video feed.
+
+    Starts manual mode if the robot is idle, so the first press just works.
+    """
+    payload = await request.json()
+    action = str(payload.get("action", "stop")).lower()
+
+    moves = {
+        "forward":    (MANUAL_SPEED_MPS, 0.0, 0.0),
+        "back":       (-MANUAL_SPEED_MPS, 0.0, 0.0),
+        # Strafing, not turning — this is a kiwi drive and it can go sideways.
+        "left":       (0.0, MANUAL_SPEED_MPS, 0.0),
+        "right":      (0.0, -MANUAL_SPEED_MPS, 0.0),
+        "turn_left":  (0.0, 0.0, MANUAL_TURN_DPS),
+        "turn_right": (0.0, 0.0, -MANUAL_TURN_DPS),
+        "stop":       (0.0, 0.0, 0.0),
+    }
+    if action not in moves:
+        return JSONResponse(
+            {"error": f"unknown action {action!r}", "known": sorted(moves)},
+            status_code=400,
+        )
+
+    app.state.manual_twist = moves[action]
+
+    started = False
+    if action != "stop" and (_scan_thread is None or not _scan_thread.is_alive()):
+        result = await asyncio.to_thread(start_manual)
+        started = result.get("status") == "driving"
+
+    return JSONResponse({
+        "status": "ok", "action": action,
+        "twist": app.state.manual_twist, "started": started,
+    })
+
+
 @app.post("/api/scan/stop")
 async def post_scan_stop() -> JSONResponse:
     """Stop the robot where it is, and keep what it has measured.
@@ -1023,6 +1079,7 @@ def start_sim_source(
     speed: float,
     sweep: bool = True,
     stop: threading.Event | None = None,
+    manual: bool = False,
 ) -> None:
     """Drive the virtual robot on a background thread.
 
@@ -1239,8 +1296,42 @@ def start_sim_source(
         report("Final")
         save("contact-only mapping")
 
+    def manual_loop() -> None:
+        """Drive the robot by hand, mapping as it goes.
+
+        The same pipeline, the same collision inference, the same map — only
+        the thing choosing the velocities is different. Driving a room yourself
+        and watching the floor plan fill in is the quickest way to see what the
+        robot can and cannot work out, and it is the only way to reach a corner
+        the autonomy has given up on.
+
+        Never finishes on its own. Someone is holding the controls, so Stop is
+        what ends it.
+        """
+        import time
+
+        pipeline.use_contact_extractor(strategy is Strategy.CONTACT_ONLY)
+        logger.info("Manual driving — use the controls on the map page")
+
+        while True:
+            if stop is not None and stop.is_set():
+                logger.info("Manual driving ended")
+                return
+            packet = robot.build_packet(dt_ms=int(dt_s * 1000))
+            pipeline.process(packet)
+            publish_raw_packet(packet)
+
+            vx, vy, omega = app.state.manual_twist
+            robot.drive_holonomic(vx, vy, omega, dt_s)
+            check_contact(BodyTwist(vx_mps=vx, vy_mps=vy, omega_dps=omega))
+            time.sleep(dt_s / max(speed, 0.01))
+
     def loop() -> None:
         import time
+
+        if manual:
+            manual_loop()
+            return
 
         if strategy is Strategy.CONTACT_ONLY:
             contact_only_loop()
@@ -1440,6 +1531,43 @@ def rescan() -> dict:
             "room": settings["room"],
             "strategy": app.state.hardware.strategy().value,
         }
+    finally:
+        _scan_lock.release()
+
+
+def start_manual() -> dict:
+    """Hand the robot over to whoever is pressing the buttons.
+
+    Shares the lock and the thread with the autonomous scan, because there is
+    one robot: driving it by hand while an autonomous sweep is also steering it
+    would produce a map drawn by two pilots disagreeing, which would look like
+    a mapping fault rather than like what it is.
+
+    The map is NOT cleared. Taking the controls to reach a corner the autonomy
+    gave up on is the main reason to do this, and wiping the room it had
+    already measured would defeat the point.
+    """
+    global _scan_thread
+
+    if not _scan_lock.acquire(blocking=False):
+        return {"status": "busy", "detail": "a restart is already in progress"}
+
+    try:
+        if _scan_thread is not None and _scan_thread.is_alive():
+            return {"status": "busy", "detail": "the robot is already running"}
+
+        settings = getattr(app.state, "sim_settings", None)
+        if settings is None:
+            return {
+                "status": "unavailable",
+                "detail": "no simulator to drive — this is hardware mode",
+            }
+
+        _scan_stop.clear()
+        _scan_thread = start_sim_source(
+            stop=_scan_stop, manual=True, **settings
+        )
+        return {"status": "driving"}
     finally:
         _scan_lock.release()
 
