@@ -935,3 +935,75 @@ def test_http_is_tried_before_the_demo_lap(kit, monkeypatch):
     file_source = module.FilePose(path="/definitely/not/a/path.json")
     assert file_source.read() is None
     assert module.HttpPose().read() is not None
+
+
+# ── Everything in the room is solid ──────────────────────────────────────────
+
+
+def test_the_beacons_are_solid(kit):
+    """They were not. `make_solid` walked the direct children of two groups and
+    the beacons are in a third, so thirteen prims mounted on the walls let
+    everything pass straight through them."""
+    module, stage = kit
+    module.build_room()
+
+    beacons = [
+        p for path, p in stage.prims.items()
+        if "/Beacons/" in path and p.GetChildren() == []
+    ]
+    assert beacons, "no beacons were drawn"
+    assert all("collision" in p.schemas for p in beacons)
+
+
+def test_every_piece_of_geometry_in_the_room_is_solid(kit):
+    """Walls, furniture, beacons — anything that is an object rather than a
+    drawing. Checked over the whole tree, so nesting something one level deeper
+    cannot silently opt it out."""
+    module, stage = kit
+    module.build_room()
+
+    soft = []
+    for path, prim in stage.prims.items():
+        if not path.startswith(module.ROOT + "/"):
+            continue
+        group = path[len(module.ROOT) + 1:].split("/")[0]
+        if group in module.NOT_PHYSICAL:
+            continue
+        if prim.GetChildren():          # a grouping Xform has no geometry
+            continue
+        if "collision" not in prim.schemas:
+            soft.append(path)
+
+    assert not soft, f"objects with no collider: {soft[:6]}"
+
+
+def test_the_drawings_are_not_solid(kit):
+    """Each of these would be a bug as a collider. The trail is a breadcrumb
+    every 0.15 m — hundreds of them lying on the floor for a dynamic prop to
+    catch on — and the ghost is where the filter *thinks* the robot is, which
+    is by definition not where anything is."""
+    module, stage = kit
+    module.build_room()
+
+    for group in ("Trail", "RobotOdometry", "Lighting", "Camera"):
+        for path, prim in stage.prims.items():
+            if f"/{group}" in path:
+                assert "collision" not in prim.schemas, f"{path} should not be solid"
+
+
+def test_nesting_does_not_hide_an_object(kit):
+    """The old walk took direct children only, so a prim one level deeper was
+    skipped without anything saying so."""
+    module, stage = kit
+    module.build_room()
+
+    # The intermediate group has to exist, as it would in USD — defining
+    # /Furniture/Shelf/Plank there creates /Furniture/Shelf on the way. The
+    # stub only records what it is handed, so the test creates it explicitly
+    # rather than pretending the walk can find a prim with no parent.
+    module.UsdGeom.Xform.Define(stage, f"{module.ROOT}/Furniture/Shelf")
+    deep = f"{module.ROOT}/Furniture/Shelf/Plank"
+    module.box(stage, deep, (1.0, 1.0, 0.5), (0.4, 0.2, 0.02), (0.5, 0.5, 0.5))
+    module.make_solid(stage)
+
+    assert "collision" in stage.prims[deep].schemas

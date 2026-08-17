@@ -875,31 +875,63 @@ def add_collider(stage, path, approximation="convexHull"):
         return False
 
 
+#: Groups that are drawings rather than objects, and must NOT become solid.
+#:
+#: Every one of these would be a bug as a collider. The trail is a breadcrumb
+#: per 0.15 m driven — nine hundred of them, lying on the floor, each one
+#: something for a dynamic prop to catch on. The odometry ghost is where the
+#: filter *thinks* the robot is, which is by definition not where anything is.
+#: Lights and the camera are not in the room at all.
+NOT_PHYSICAL = ("Trail", "RobotOdometry", "RobotRssi", "Lighting", "Camera",
+                "Measured")
+
+
 def make_solid(stage):
-    """Give every wall and every piece of furniture a collider.
+    """Give everything in the room a collider — walls, furniture, beacons.
+
+    Walks the whole tree rather than the direct children of two groups. The
+    old version did the latter and missed the beacons entirely: thirteen prims
+    mounted on the walls, physically present, that anything dynamic passed
+    straight through. It would also have silently skipped any furniture that
+    was ever nested one level deeper, which is the kind of gap that appears
+    later and looks like a physics bug.
 
     What this buys and what it does not
     -----------------------------------
     It makes the room *physically real* to PhysX: anything dynamic dropped into
-    the scene will rest on the floor and stop at the sofa, and Isaac Sim can
-    drive the robot against it for real.
+    the scene rests on the floor and stops at the sofa, and Isaac Sim can drive
+    the robot against it for real.
 
     It does NOT by itself stop the blue robot marker, because that marker is
     not simulated — it is placed each frame at the pose the mapper reports.
     Collision for it is decided in the mapper's own simulator, and the marker
-    only ever mirrors the result. Making it a dynamic body instead would mean
-    the twin no longer shows where the robot actually is, which is the one job
-    it has.
+    only mirrors the result. Making it dynamic instead would mean the twin no
+    longer shows where the robot actually is, which is the one job it has.
     """
-    solid = 0
-    for parent in (f"{ROOT}/Room", f"{ROOT}/Furniture"):
-        root = stage.GetPrimAtPath(Sdf.Path(parent))
-        if not root:
-            continue
-        for prim in root.GetChildren():
-            if add_collider(stage, prim.GetPath().pathString):
+    root = stage.GetPrimAtPath(Sdf.Path(ROOT))
+    if not root:
+        return 0
+
+    solid = skipped = 0
+
+    def walk(prim):
+        nonlocal solid, skipped
+        for child in prim.GetChildren():
+            path = child.GetPath().pathString
+            name = path[len(ROOT) + 1:].split("/")[0]
+            if name in NOT_PHYSICAL:
+                skipped += 1
+                continue
+            # A grouping Xform has no geometry to collide with; its children do.
+            if child.GetChildren():
+                walk(child)
+                continue
+            if add_collider(stage, path):
                 solid += 1
-    print(f"[room] {solid} colliders — walls and furniture are solid to physics")
+
+    walk(root)
+    print(f"[room] {solid} colliders — the room is solid to physics "
+          f"({skipped} drawing(s) left alone)")
     return solid
 
 
