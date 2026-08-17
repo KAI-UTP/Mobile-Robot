@@ -177,6 +177,10 @@ class ContactCoverage:
 
         self._backoff_remaining_m = 0.0
         self._retry_from_other_end = False
+        # Whether this row has already had its one retry. Without it, a row
+        # blocked at BOTH ends grants itself a fresh retry on every contact and
+        # ping-pongs between the two obstacles for ever.
+        self._retried_this_row = False
         self._last_x: float | None = None
         self._last_y: float | None = None
 
@@ -312,6 +316,7 @@ class ContactCoverage:
         self._direction *= -1.0
         self._row_target = None
         self._retry_from_other_end = False
+        self._retried_this_row = False
 
         if self._row_index >= len(self._rows):
             return self._next_pass()
@@ -357,7 +362,12 @@ class ContactCoverage:
         self.stats.contact_points.append((x_m, y_m))
 
         self._row_target = None
-        self._retry_from_other_end = True
+        # One retry per row, not one per contact. A row blocked at both ends
+        # would otherwise grant itself another every time it touched either of
+        # them, and ping-pong between the two for ever — measured on the live
+        # stack, the robot spent 451 m bouncing between (3.82, 3.67) and
+        # (4.70, 3.67) and never reached another row.
+        self._retry_from_other_end = not self._retried_this_row
         self._backoff_remaining_m = self.config.backoff_m
         self.state = CoverState.BACKING
         return self._reverse(heading_deg)
@@ -379,6 +389,7 @@ class ContactCoverage:
         # a robot wedged against something cannot sit here trading directions.
         if self._retry_from_other_end:
             self._retry_from_other_end = False
+            self._retried_this_row = True
             self._direction *= -1.0
             self._row_target = None
             return CoverCommand(0.0, 0.0, 0.0, self.state, "same row, other way")

@@ -197,3 +197,63 @@ def test_it_needs_no_range_readings():
     parameters = set(inspect.signature(ContactCoverage.step).parameters)
     assert "ranges" not in parameters
     assert {"x_m", "y_m", "heading_deg", "blocked"} <= parameters
+
+
+# ── Not getting stuck ────────────────────────────────────────────────────────
+
+
+def test_a_row_blocked_at_both_ends_moves_on():
+    """The failure seen on the live stack: the robot ping-ponged between
+    (3.82, 3.67) and (4.70, 3.67) for 451 m and never reached another row.
+
+    A row that runs into something gets ONE retry from the other end, because
+    it has only covered the side it approached from. Granting a fresh retry on
+    every contact — which is what "set the flag in _on_contact" quietly did —
+    means a row blocked at both ends trades directions for ever.
+    """
+    explorer = ContactCoverage(CoverConfig(find_distance_m=1.0))
+    explorer.state = CoverState.SWEEPING
+    explorer.start_x, explorer.start_y = 1.0, 1.0
+    explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
+    explorer._plan_rows()
+
+    # A corridor blocked at both ends, so every row is a trap.
+    blocked = lambda x, y: not (2.5 < x < 3.5)      # noqa: E731
+
+    rows_at_start = explorer._row_index
+    _drive(explorer, 30000, blocked_at=blocked, start=(3.0, 1.0))
+
+    assert explorer.is_finished or explorer._row_index > rows_at_start, (
+        "never left the first row"
+    )
+
+
+def test_the_retry_is_granted_once_per_row():
+    explorer = ContactCoverage(CoverConfig(find_distance_m=1.0))
+    explorer.state = CoverState.SWEEPING
+    explorer.start_x, explorer.start_y = 1.0, 1.0
+    explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
+    explorer._plan_rows()
+
+    explorer._on_contact(3.0, 1.0, 0.0)
+    assert explorer._retry_from_other_end, "first contact should earn a retry"
+
+    explorer._back_off(0.0, 10.0)                   # consumes it
+    explorer._on_contact(3.0, 1.0, 0.0)
+    assert not explorer._retry_from_other_end, "a second retry on the same row"
+
+
+def test_a_fresh_row_gets_its_own_retry():
+    """Once per row, not once per run — the next row has its own obstacles."""
+    explorer = ContactCoverage(CoverConfig(find_distance_m=1.0))
+    explorer.state = CoverState.SWEEPING
+    explorer.start_x, explorer.start_y = 1.0, 1.0
+    explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
+    explorer._plan_rows()
+
+    explorer._on_contact(3.0, 1.0, 0.0)
+    explorer._back_off(0.0, 10.0)
+    explorer._end_of_row()
+
+    explorer._on_contact(3.0, 1.2, 0.0)
+    assert explorer._retry_from_other_end
