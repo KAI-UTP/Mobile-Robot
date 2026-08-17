@@ -1225,6 +1225,10 @@ def start_sim_source(
             time.sleep(dt_s / max(speed, 0.01))
 
         summary = explorer.summary()
+        # Covering every planned row is what bounds the room for a robot that
+        # cannot see one; the grid has no way to tell. See
+        # MappingPipeline.mark_coverage_complete.
+        pipeline.mark_coverage_complete(bool(summary["completed"]))
         logger.info(
             "Contact mapping complete: %d contact(s), %.1f m driven, "
             "%d rows over %d pass(es) — %s",

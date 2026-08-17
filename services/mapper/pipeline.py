@@ -49,6 +49,9 @@ class MappingPipeline:
         # Whether this map is being built by touch rather than by ranging.
         # See `use_contact_extractor`.
         self.contact_only = False
+        # Set when the contact sweep has covered every row it planned. See
+        # `mark_coverage_complete` for why the grid cannot answer this.
+        self._coverage_complete = False
 
         # Obstacles grown by the robot's own size. Kept apart from the grid
         # because the two answer different questions: the grid says what is
@@ -186,6 +189,32 @@ class MappingPipeline:
                 else RoomExtractor()
             )
 
+    def mark_coverage_complete(self, complete: bool = True) -> None:
+        """The contact sweep covered every row it planned, so the outline is a
+        measurement rather than a lower bound.
+
+        `is_closed` normally comes from the grid: the free region must not run
+        off the edge of what has been mapped, and the ring around it must be
+        mostly known rather than unexplored. The second half of that is a test
+        a robot without range sensors cannot pass, and cannot fail informatively
+        either. It never *sees* a wall — it feels a few hundred points on one —
+        so its boundary is a dotted line by construction. Measured on the
+        furnished room, the fraction of that ring left unknown:
+
+            full sweep, all rows covered   35.8 %
+            cut off half way               39.8 %
+            cut off almost immediately     36.3 %
+
+        Always about a third, whatever happened. Relaxing the threshold to let
+        the good run through would have let the other two through as well, and
+        `is_closed` would have stopped meaning anything.
+
+        What does separate them is whether the sweep covered its rows, and only
+        the explorer knows that — so it says so here.
+        """
+        with self._lock:
+            self._coverage_complete = complete
+
     def explored_cells(self) -> int:
         """How many grid cells the robot has learned anything about.
 
@@ -313,6 +342,11 @@ class MappingPipeline:
             room.bounding_height_m = frozen.bounding_height_m
             room.is_closed = frozen.is_closed
 
+        # A contact sweep that covered its rows has bounded the room, and the
+        # grid cannot tell — see `mark_coverage_complete`.
+        if self.contact_only and self._coverage_complete:
+            room.is_closed = True
+
         self.room = room
 
     def refresh_room(self) -> RoomOutline | None:
@@ -333,6 +367,7 @@ class MappingPipeline:
             self.contacts = 0
             self._bumper_was_active = False
             self._frozen_outline = None
+            self._coverage_complete = False
             logger.info("Pipeline reset (clear_map=%s)", clear_map)
 
     # ── Output ────────────────────────────────────────────────────────────

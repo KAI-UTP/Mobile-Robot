@@ -68,6 +68,7 @@ class CoverState(str, Enum):
     FINDING = "FINDING"      # bouncing around to find where the walls are
     SWEEPING = "SWEEPING"    # driving a row
     SHIFTING = "SHIFTING"    # sliding sideways to the next row
+    DETOUR = "DETOUR"        # stepping around something small, mid-row
     BACKING = "BACKING"      # easing off something just touched
     FINISHED = "FINISHED"
 
@@ -112,6 +113,21 @@ class CoverConfig:
     # Easing off after a contact. Enough to unstick the wheels and no more —
     # every centimetre back is floor being re-covered.
     backoff_m: float = 0.10
+
+    # Stepping around something small instead of abandoning the row.
+    #
+    # Most of what stands in a real room is thin: of the 35 pieces the demo
+    # scene pushes, 20 are table and chair legs under 0.15 m across. Ending a
+    # 5 m row because it met a 0.07 m leg is how a systematic sweep degrades
+    # into the bouncing it replaced — the row is abandoned, the next one starts
+    # elsewhere, and the floor past the leg goes unvisited.
+    #
+    # So the robot slides across by a row, drives past, and slides back. The
+    # clearance is what it takes to get beyond a chair rather than a leg;
+    # anything bigger exhausts the detours and the row ends as before, which is
+    # the right answer for a sofa.
+    detour_clear_m: float = 0.45
+    max_detours_per_row: int = 4
 
     # Sweep along one axis, then the other. The second pass reaches floor the
     # first could not: a row that runs into a table stops there, and what is
@@ -176,6 +192,14 @@ class ContactCoverage:
         self._shift_target: float | None = None
 
         self._backoff_remaining_m = 0.0
+        # What to do once the robot has eased off whatever it touched.
+        self._after_backoff = CoverState.SWEEPING
+        # Where the sweep goes after a sideways slide, and how a detour tracks
+        # its way back onto the row.
+        self._after_shift = CoverState.SWEEPING
+        self._detour_offset = 0.0
+        self._detour_resume_at: float | None = None
+        self._detours_left = 0
         self._retry_from_other_end = False
         # Whether this row has already had its one retry. Without it, a row
         # blocked at BOTH ends grants itself a fresh retry on every contact and
@@ -206,12 +230,14 @@ class ContactCoverage:
         if self.state == CoverState.FINDING:
             return self._find(x_m, y_m, heading_deg, blocked, dt_s)
 
-        if blocked and self.state in (CoverState.SWEEPING, CoverState.SHIFTING):
+        if blocked and self.state in (
+            CoverState.SWEEPING, CoverState.SHIFTING, CoverState.DETOUR
+        ):
             return self._on_contact(x_m, y_m, heading_deg)
 
         if self.state == CoverState.BACKING:
-            return self._back_off(heading_deg, dt_s)
-        if self.state == CoverState.SHIFTING:
+            return self._back_off(x_m, y_m, heading_deg, dt_s)
+        if self.state in (CoverState.SHIFTING, CoverState.DETOUR):
             return self._shift(x_m, y_m, heading_deg)
         return self._sweep(x_m, y_m, heading_deg)
 
@@ -281,6 +307,17 @@ class ContactCoverage:
         self._row_index = 0
         self._direction = 1.0
         self._row_target = None
+        self._detours_left = self.config.max_detours_per_row
+        self._detour_offset = 0.0
+        self._detour_resume_at = None
+        self._retried_this_row = False
+
+    def _row_line(self) -> float:
+        """The across-coordinate the robot should be holding right now."""
+        if not self._rows:
+            return 0.0
+        index = min(self._row_index, len(self._rows) - 1)
+        return self._rows[index] + self._detour_offset
 
     def _sweep(self, x_m: float, y_m: float, heading_deg: float) -> CoverCommand:
         cfg = self.config
@@ -297,6 +334,21 @@ class ContactCoverage:
 
         if self._row_target is None:
             self._row_target = along_high if self._direction > 0 else along_low
+
+        if self._detour_resume_at is not None:
+            past = (
+                here >= self._detour_resume_at if self._direction > 0
+                else here <= self._detour_resume_at
+            )
+            if past:
+                # Clear of it. Slide back onto the row and carry on, so the
+                # detour costs a step sideways rather than the rest of the row.
+                self._detour_resume_at = None
+                self._detour_offset = 0.0
+                self._shift_target = self._row_line()
+                self._after_shift = CoverState.SWEEPING
+                self.state = CoverState.DETOUR
+                return CoverCommand(0.0, 0.0, 0.0, self.state, "back onto the row")
 
         reached = (
             here >= self._row_target - 0.06 if self._direction > 0
@@ -317,11 +369,15 @@ class ContactCoverage:
         self._row_target = None
         self._retry_from_other_end = False
         self._retried_this_row = False
+        self._detours_left = self.config.max_detours_per_row
+        self._detour_offset = 0.0
+        self._detour_resume_at = None
 
         if self._row_index >= len(self._rows):
             return self._next_pass()
 
         self._shift_target = self._rows[self._row_index]
+        self._after_shift = CoverState.SWEEPING
         self.state = CoverState.SHIFTING
         return CoverCommand(0.0, 0.0, 0.0, self.state, "next row")
 
@@ -331,8 +387,8 @@ class ContactCoverage:
         gap = self._shift_target - across
 
         if abs(gap) < 0.05:
-            self.state = CoverState.SWEEPING
-            return CoverCommand(0.0, 0.0, 0.0, self.state, "on the next row")
+            self.state = self._after_shift
+            return CoverCommand(0.0, 0.0, 0.0, self.state, "on the row")
 
         speed = math.copysign(self.config.cruise_speed_mps, gap)
         world = (0.0, speed) if self._axis == 0 else (speed, 0.0)
@@ -357,36 +413,52 @@ class ContactCoverage:
     # ── Contact during the sweep ──────────────────────────────────────────
 
     def _on_contact(self, x_m: float, y_m: float, heading_deg: float) -> CoverCommand:
-        """Something solid in the row. Note it, ease off, take the next row."""
+        """Something solid in the row. Step around it if it is small enough."""
         self.stats.contacts += 1
         self.stats.contact_points.append((x_m, y_m))
-
-        self._row_target = None
-        # One retry per row, not one per contact. A row blocked at both ends
-        # would otherwise grant itself another every time it touched either of
-        # them, and ping-pong between the two for ever — measured on the live
-        # stack, the robot spent 451 m bouncing between (3.82, 3.67) and
-        # (4.70, 3.67) and never reached another row.
-        self._retry_from_other_end = not self._retried_this_row
         self._backoff_remaining_m = self.config.backoff_m
+        self._row_target = None
+
+        if self._detours_left > 0:
+            # Most of what is in a room is thin — 20 of the 35 pieces in the
+            # demo scene are legs under 0.15 m across — and abandoning a 5 m row
+            # because it met one is how a systematic sweep decays into the
+            # bouncing it replaced.
+            self._detours_left -= 1
+            along = x_m if self._axis == 0 else y_m
+            self._detour_resume_at = along + self._direction * self.config.detour_clear_m
+            self._detour_offset = self.config.row_spacing_m
+            self._after_backoff = CoverState.DETOUR
+        else:
+            # Out of detours: this is something big, and a row that has run into
+            # it has only covered the side it approached from. One retry from
+            # the other end, per row — granting one per contact ping-pongs a row
+            # blocked at both ends for ever.
+            self._detour_resume_at = None
+            self._detour_offset = 0.0
+            self._retry_from_other_end = not self._retried_this_row
+            self._after_backoff = CoverState.SWEEPING
+
         self.state = CoverState.BACKING
         return self._reverse(heading_deg)
 
-    def _back_off(self, heading_deg: float, dt_s: float) -> CoverCommand:
+    def _back_off(
+        self, x_m: float, y_m: float, heading_deg: float, dt_s: float
+    ) -> CoverCommand:
         self._backoff_remaining_m -= self.config.reverse_speed_mps * dt_s
         if self._backoff_remaining_m > 0.0:
             return self._reverse(heading_deg)
 
+        if self._after_backoff == CoverState.DETOUR:
+            self._shift_target = self._row_line()
+            self._after_shift = CoverState.SWEEPING
+            self.state = CoverState.DETOUR
+            return CoverCommand(0.0, 0.0, 0.0, self.state, "stepping around it")
+
         self.state = CoverState.SWEEPING
 
-        # A row that ran into something has only covered the side of it the
-        # robot approached from. Run the same row back the other way before
-        # moving on, and the far side gets covered too.
-        #
-        # Without this each row covered one side of the table and the next row
-        # covered the other, so half of every obstructed band was missed —
-        # 57.6 % of a furnished room, no better than bouncing. Once per row, so
-        # a robot wedged against something cannot sit here trading directions.
+        # A row that ran into something big has only covered the side the robot
+        # approached from. Run it back the other way before moving on.
         if self._retry_from_other_end:
             self._retry_from_other_end = False
             self._retried_this_row = True

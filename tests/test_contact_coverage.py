@@ -235,10 +235,15 @@ def test_the_retry_is_granted_once_per_row():
     explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
     explorer._plan_rows()
 
+    # Detours are tried first and are for small things; the retry is what a row
+    # falls back on once it is clear the obstacle is not small.
+    explorer._detours_left = 0
+
     explorer._on_contact(3.0, 1.0, 0.0)
     assert explorer._retry_from_other_end, "first contact should earn a retry"
 
-    explorer._back_off(0.0, 10.0)                   # consumes it
+    explorer._back_off(3.0, 1.0, 0.0, 10.0)         # consumes it
+    explorer._detours_left = 0
     explorer._on_contact(3.0, 1.0, 0.0)
     assert not explorer._retry_from_other_end, "a second retry on the same row"
 
@@ -251,9 +256,69 @@ def test_a_fresh_row_gets_its_own_retry():
     explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
     explorer._plan_rows()
 
+    explorer._detours_left = 0
     explorer._on_contact(3.0, 1.0, 0.0)
-    explorer._back_off(0.0, 10.0)
+    explorer._back_off(3.0, 1.0, 0.0, 10.0)
     explorer._end_of_row()
 
+    explorer._detours_left = 0
     explorer._on_contact(3.0, 1.2, 0.0)
     assert explorer._retry_from_other_end
+
+
+def test_a_thin_obstacle_is_stepped_around_not_abandoned():
+    """Twenty of the 35 pieces in the demo scene are legs under 0.15 m across.
+    Ending a 5 m row because it met a 0.07 m leg is how a systematic sweep
+    decays into the bouncing it replaced."""
+    explorer = ContactCoverage(CoverConfig(find_distance_m=1.0))
+    explorer.state = CoverState.SWEEPING
+    explorer.start_x, explorer.start_y = 1.0, 1.0
+    explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
+    explorer._plan_rows()
+    row_before = explorer._row_index
+
+    explorer._on_contact(3.0, 1.0, 0.0)
+    explorer._back_off(3.0, 1.0, 0.0, 10.0)
+
+    assert explorer.state == CoverState.DETOUR
+    assert explorer._row_index == row_before, "the row was abandoned"
+    assert explorer._detour_offset > 0, "did not step aside"
+
+
+def test_the_detour_rejoins_the_row_once_past():
+    """A step aside that never comes back is not a detour, it is a new row."""
+    explorer = ContactCoverage(CoverConfig(find_distance_m=1.0))
+    explorer.state = CoverState.SWEEPING
+    explorer.start_x, explorer.start_y = 1.0, 1.0
+    explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
+    explorer._plan_rows()
+
+    explorer._on_contact(3.0, 1.0, 0.0)
+    explorer._back_off(3.0, 1.0, 0.0, 10.0)
+    resume_at = explorer._detour_resume_at
+    assert resume_at is not None
+
+    # Driven past the obstacle: it should now be heading back to the row.
+    explorer.state = CoverState.SWEEPING
+    explorer._sweep(resume_at + 0.1, 1.0, 0.0)
+
+    assert explorer._detour_offset == 0.0
+    assert explorer._detour_resume_at is None
+
+
+def test_detours_run_out_so_a_sofa_still_ends_the_row():
+    """Stepping aside four times across a two-metre sofa would be twenty
+    metres of scraping along it. Something that big ends the row."""
+    explorer = ContactCoverage(CoverConfig(find_distance_m=1.0))
+    explorer.state = CoverState.SWEEPING
+    explorer.start_x, explorer.start_y = 1.0, 1.0
+    explorer.stats.contact_points = [(0.1, 0.1), (5.9, 4.4), (0.1, 4.4)]
+    explorer._plan_rows()
+
+    for _ in range(explorer.config.max_detours_per_row):
+        explorer._on_contact(3.0, 1.0, 0.0)
+        explorer._back_off(3.0, 1.0, 0.0, 10.0)
+
+    assert explorer._detours_left == 0
+    explorer._on_contact(3.0, 1.0, 0.0)
+    assert explorer._after_backoff == CoverState.SWEEPING, "still detouring"
