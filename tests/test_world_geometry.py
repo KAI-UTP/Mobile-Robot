@@ -294,3 +294,65 @@ def test_a_failed_push_is_retried(kit, monkeypatch):
     publisher.poll(1.0)
 
     assert len(attempts) == 2, "gave up after one failure"
+
+
+# ── The trail belongs to one run ─────────────────────────────────────────────
+
+
+def test_the_trail_is_wiped_for_a_new_run(kit):
+    """A trail from the previous run lying over a new one is the same lie as
+    furniture that is not there: it shows the robot having been somewhere it
+    has not been this time. The mapper clears its map on every fresh start;
+    this is the 3D half of that."""
+    module, stage = kit
+    module.build_room()
+    scene = module.RoomScene(stage, source=None)
+
+    for i in range(12):
+        scene.x, scene.y = i * 0.3, 1.0
+        scene._drop_trail()
+    assert [p for p in stage.prims if "/Trail/" in p], "no trail was drawn"
+
+    scene.clear_trail()
+    assert not [p for p in stage.prims if "/Trail/" in p], "the trail survived"
+    assert scene.trail_index == 0
+
+
+def test_the_trail_stops_growing(kit):
+    """One dot every 0.15 m and a contact run drives 300 m, so an uncapped
+    trail is thousands of prims burying the room it is drawn on."""
+    module, stage = kit
+    module.build_room()
+    scene = module.RoomScene(stage, source=None)
+
+    cap = module.MAX_TRAIL_DOTS
+    for i in range(cap + 200):
+        scene.x, scene.y = (i % 30) * 0.2, (i // 30) * 0.2
+        scene._drop_trail()
+
+    dots = [p for p in stage.prims if "/Trail/Dot_" in p]
+    assert len(dots) <= cap, f"{len(dots)} dots for a cap of {cap}"
+
+
+def test_a_recycled_dot_moves_to_where_the_robot_now_is(kit):
+    """Recycling must reposition the prim, not leave it where it was — a stale
+    dot is a breadcrumb for a place the robot is not."""
+    module, stage = kit
+    module.build_room()
+    scene = module.RoomScene(stage, source=None)
+
+    cap = module.MAX_TRAIL_DOTS
+    # The first drop has to be a real move: a dot is only left once the robot
+    # has travelled the spacing, so dropping one where it already is does
+    # nothing.
+    scene.x, scene.y = 0.2, 0.0
+    scene._drop_trail()
+    first = stage.prims[f"{module.ROOT}/Trail/Dot_0"]
+    assert first.translate[0] == pytest.approx(0.2)
+
+    # Drive far enough to come all the way round to Dot_0 again.
+    for i in range(1, cap + 1):
+        scene.x, scene.y = (i + 1) * 0.2, 0.0
+        scene._drop_trail()
+
+    assert first.translate[0] == pytest.approx((cap + 1) * 0.2)

@@ -132,6 +132,13 @@ app.state.lap_distance_m = None
 # been restarted. See /api/scene/reset.
 app.state.scene_reset_token = 0
 
+# Bumped whenever the robot sets off on a fresh run. The Omniverse scene wipes
+# the breadcrumb trail when it changes, because the map has been cleared and a
+# trail from the previous run left lying over the new one is the same lie as
+# furniture that is not there — it shows the robot having been somewhere it has
+# not been this time.
+app.state.run_id = 0
+
 # What the manual controls are asking for, as (vx, vy, omega) in the body
 # frame. Held rather than queued: a driving command is a statement about what
 # the robot should be doing NOW, and a stale one that arrived late is worse
@@ -365,6 +372,7 @@ async def post_scene_reset() -> JSONResponse:
     been restarted.
     """
     app.state.scene_reset_token += 1
+    app.state.run_id += 1
     app.state.scene_geometry = []
 
     world = getattr(app.state, "sim_world", None)
@@ -854,6 +862,9 @@ async def get_scan_status() -> JSONResponse:
         # The Omniverse scene watches this and rebuilds its room when it
         # changes. Served here so the scene needs only one endpoint to poll.
         "scene_reset_token": app.state.scene_reset_token,
+        # Changes when a fresh run starts, so the 3D scene knows to wipe the
+        # trail it drew for the last one.
+        "run_id": app.state.run_id,
     })
 
 
@@ -1560,6 +1571,7 @@ def rescan() -> dict:
                 "detail": "map cleared — drive the robot again to build a new one",
             }
 
+        app.state.run_id += 1
         _scan_thread = start_sim_source(stop=_scan_stop, **settings)
         logger.info(
             "Scan started (room=%s, strategy=%s)",
@@ -1603,6 +1615,7 @@ def start_manual() -> dict:
             }
 
         _scan_stop.clear()
+        app.state.run_id += 1
         _scan_thread = start_sim_source(
             stop=_scan_stop, manual=True, **settings
         )

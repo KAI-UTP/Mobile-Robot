@@ -137,6 +137,16 @@ RSSI_TYPICAL_ERROR_M = 2.71
 UPDATE_HZ = 60.0
 SMOOTHING = 0.25
 
+# How many breadcrumbs the trail keeps.
+#
+# One dot every 0.15 m, and a contact-only run drives 300 m or more, so an
+# uncapped trail is two thousand prims and climbing — it buries the room it is
+# drawn on and costs frame time for the privilege. Past this the oldest dot is
+# moved to the newest position rather than a new prim being made, so the count
+# is fixed and the trail becomes a rolling window of where the robot has just
+# been. The full path is on the 2D map, which is a better place to read it.
+MAX_TRAIL_DOTS = 900
+
 # ── Palette ─────────────────────────────────────────────────────────────────
 
 COL_FLOOR      = (0.74, 0.68, 0.58)
@@ -538,7 +548,8 @@ class GeometryPublisher:
     #: is on screen — the exact failure this whole mechanism exists to prevent.
     HEARTBEAT_S = 20.0
 
-    def __init__(self, stage, url=None, interval_s=0.5, rebuild=None):
+    def __init__(self, stage, url=None, interval_s=0.5, rebuild=None,
+                 clear_trail=None):
         self.stage = stage
         self.url = url or MAPPER_URL
         self.interval_s = interval_s
@@ -546,7 +557,12 @@ class GeometryPublisher:
         # for a reset. Pull rather than push: the mapper cannot call into Kit,
         # and a scene that asks recovers on its own after either end restarts.
         self.rebuild = rebuild
+        # Called when a fresh run starts, to wipe the breadcrumbs left by the
+        # last one. A trail from a previous run lying over a new one shows the
+        # robot having been somewhere it has not been this time.
+        self.clear_trail = clear_trail
         self._reset_token = None
+        self._run_id = None
         self._signature = None
         self._next_check = 0.0
         self._next_heartbeat = 0.0
@@ -581,30 +597,42 @@ class GeometryPublisher:
         return sent
 
     def _check_for_reset(self):
-        """Has the page asked for the room to go back to how it started?"""
+        """Has the page asked for anything to be put back?
+
+        One request answers both questions — the room going back to how it
+        started, and a fresh run needing a clean trail — because the scene
+        polls this on a timer and two endpoints would be two round trips for
+        one answer.
+        """
         import urllib.request
 
         try:
             with urllib.request.urlopen(
                 f"{self.url}/api/scan/status", timeout=1.5
             ) as reply:
-                token = json.loads(reply.read().decode("utf-8")).get(
-                    "scene_reset_token"
-                )
+                status = json.loads(reply.read().decode("utf-8"))
         except Exception:
             return False
 
-        if token is None:
-            return False
+        token = status.get("scene_reset_token")
+        run_id = status.get("run_id")
 
-        first_look = self._reset_token is None
-        changed = token != self._reset_token
-        self._reset_token = token
+        first_look = self._reset_token is None and self._run_id is None
+        reset_changed = token is not None and token != self._reset_token
+        run_changed = run_id is not None and run_id != self._run_id
+        self._reset_token, self._run_id = token, run_id
 
         # Not on the first look: the scene has only just built the room, and
-        # tearing it down and building it again would be a visible flicker for
+        # tearing it down to build it again would be a visible flicker for
         # nothing.
-        if changed and not first_look and self.rebuild is not None:
+        if first_look:
+            return False
+
+        if run_changed and self.clear_trail is not None:
+            print("[room] new run — clearing the trail")
+            self.clear_trail()
+
+        if reset_changed and self.rebuild is not None:
             print("[room] resetting the furniture to where it started")
             self.rebuild()
             return True
@@ -1169,9 +1197,33 @@ class RoomScene:
     def _drop_trail(self, spacing=0.15):
         if math.hypot(self.x - self._last_trail[0], self.y - self._last_trail[1]) < spacing:
             return
-        box(self.stage, f"{ROOT}/Trail/Dot_{self.trail_index}",
-            (self.x, self.y, 0.008), (0.035, 0.035, 0.008), COL_TRAIL)
+
+        # Recycled by index, so the trail is a fixed number of prims that roll
+        # rather than a list that grows for ever. See MAX_TRAIL_DOTS.
+        path = f"{ROOT}/Trail/Dot_{self.trail_index % MAX_TRAIL_DOTS}"
+        existing = self.stage.GetPrimAtPath(Sdf.Path(path))
+        if existing:
+            UsdGeom.XformCommonAPI(existing).SetTranslate(
+                Gf.Vec3d(self.x, self.y, 0.008)
+            )
+        else:
+            box(self.stage, path, (self.x, self.y, 0.008),
+                (0.035, 0.035, 0.008), COL_TRAIL)
+
         self.trail_index += 1
+        self._last_trail = (self.x, self.y)
+
+    def clear_trail(self):
+        """Wipe the breadcrumbs, for a run that has not happened yet.
+
+        A trail from the previous run lying over a new one is the same kind of
+        lie as furniture that is not there: it shows the robot having been
+        somewhere it has not been this time. The mapper clears its own map on
+        every fresh start, and this is the 3D half of that.
+        """
+        self.stage.RemovePrim(Sdf.Path(f"{ROOT}/Trail"))
+        UsdGeom.Xform.Define(self.stage, Sdf.Path(f"{ROOT}/Trail"))
+        self.trail_index = 0
         self._last_trail = (self.x, self.y)
 
     def stop(self):
@@ -1284,7 +1336,16 @@ def run_room():
         if ENABLE_PHYSICS:
             make_solid(stage)
 
-    publisher = GeometryPublisher(stage, rebuild=rebuild_furniture)
+    scene_holder = {}
+
+    def clear_trail():
+        scene = scene_holder.get("scene")
+        if scene is not None:
+            scene.clear_trail()
+
+    publisher = GeometryPublisher(
+        stage, rebuild=rebuild_furniture, clear_trail=clear_trail
+    )
     pieces = furniture_footprints(stage)
     print(
         f"[room] {len(pieces)} solid piece(s) of furniture — drag them in the "
@@ -1292,6 +1353,7 @@ def run_room():
     )
 
     _scene = RoomScene(stage, source, measured, geometry=publisher)
+    scene_holder["scene"] = _scene
     _scene.start()
 
 
