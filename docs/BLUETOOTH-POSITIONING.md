@@ -133,7 +133,7 @@ UWB would be the upgrade if radio positioning genuinely had to carry the map.
 | `simulator/virtual_robot.py` | beacon simulation with shadowing, TxPower spread, body blocking |
 | `tests/test_rssi.py` | 32 tests — maths, geometry, divergence |
 | `tests/test_rssi_accuracy.py` | 14 tests — the measurements in this document |
-| `omniverse/kit_room_3d.py` | 3D room showing the RSSI marker wandering |
+| `omniverse/kit_room_3d.py` | the 3D room. The RSSI marker was removed with the fusion |
 
 ### One bug worth recording
 

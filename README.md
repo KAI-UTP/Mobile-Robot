@@ -68,7 +68,6 @@ the furniture to, and the contact count moves in Grafana.
 | also | |
 |---|---|
 | <http://localhost:8080/scans> | saved scans — the product loop |
-| <http://localhost:8080/compare> | the real room beside the room the robot drew |
 | <http://localhost:8080/api/hardware> | what sensors are fitted, and what that lets the robot do |
 | <http://localhost:8086> | InfluxDB (admin / roommapper123) |
 
@@ -188,48 +187,37 @@ simulation has to be reimplemented for hardware.
 
 | You have | Run | Physics? |
 |---|---|---|
-| **Any Kit app** | paste [`omniverse/kit_room_3d.py`](omniverse/kit_room_3d.py) — **furnished room + the robot's own map, side by side** | no |
+| **Any Kit app** | paste [`omniverse/kit_room_3d.py`](omniverse/kit_room_3d.py) — **the room, and the robot driving in it** | no |
 | Omniverse Kit / Code / USD Composer | [`omniverse/kit_holonomic.py`](omniverse/kit_holonomic.py) — movement only | no |
 | Isaac Sim | `isaac-sim/python.bat omniverse/run_isaac.py --mode teleop` | yes |
 
-`kit_room_3d.py` builds the digital twin scene: walls with a doorway and
+`kit_room_3d.py` builds the digital twin scene: four solid walls, a shut door and
 window, table, chairs, sofa, cabinet, and the four BLE beacons in the corners.
 
-It draws **three** robots, and the gap between them is the point:
+It draws **two** robots, and the gap between them is the point:
 
 | | |
 |---|---|
 | 🔵 solid blue | where the robot actually is |
-| 🟢 green ghost | wheel odometry — **0.07 m** mean error |
-| 🟠 orange sphere | Bluetooth RSSI — **2.71 m** mean error |
+| 🟢 green ghost | where its own dead reckoning thinks it is |
 
-Watching the orange marker drift across the sofa while the green one stays on
-the robot explains the architecture in one glance.
+That gap **is** the drift, and watching it open up over a run is the most
+useful thing the scene shows: it is why the map comes back larger than the
+room, and why a long contact-only scan grades poorly. The 2D map prints the
+same figure in metres, so the two views explain each other rather than merely
+disagreeing.
 
-**Both screens, in Omniverse.** With `SHOW_MEASURED = True` (the default) the
-scene also builds the room the *robot drew*, standing on its own pad beside the
-real one, read live from the mapper over plain HTTP:
+A third marker used to show where Bluetooth thought the robot was. It went with
+the fusion that fed it — BLE measured *worse* than dead reckoning, 0.51 m of
+error becoming 1.42 m, so nothing uses it and drawing it implied otherwise.
 
-| Left — the room that exists | Right — the room the robot drew |
-|---|---|
-| walls, doorway, furniture, beacons | its measured outline, extruded |
-| the robot and its two error markers | 🟩 green closed / 🟧 amber still open |
-| ground truth | 🟥 red slabs — blocked floor it cannot drive over |
+The scene also used to build the room the robot drew, on a pad beside the real
+one. That is gone too: a flat floor plan reads better in a browser than an
+extruded outline seen in perspective, and the 2D map now shows it beside the
+live grid. Omniverse draws the physical room; the browser draws the
+measurement; each does what it is best at.
 
-So the comparison is a thing you can orbit around rather than two flat canvases
-side by side. The obstacles are drawn as low translucent slabs, not as
-furniture: the robot measured a footprint on the floor, not a table, and
-drawing a table would claim knowledge it does not have — the point is to
-compare those slabs against the real furniture opposite.
-
-The measured outline is placed by its own bounding box, not by its
-coordinates. It lives in the pose estimate's frame, whose origin is wherever
-the robot started and whose axes are however it was facing, so those numbers
-would fling the model across the stage as a scan progresses. What is
-meaningful is the shape. `/compare` scores that properly with rotation and IoU;
-this is the version you can walk around.
-
-Needs the mapper running for the right-hand room:
+Needs the mapper running, so there is a robot to follow:
 
 ```bash
 python services/mapper/main.py --source sim --room furnished
@@ -428,7 +416,7 @@ than a measurement.
 
 ## The two screens
 
-`/compare` puts them side by side:
+`/api/compare` scores one against the other:
 
 | Screen 1 | Screen 2 |
 |---|---|

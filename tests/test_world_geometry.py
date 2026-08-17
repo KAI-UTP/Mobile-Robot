@@ -479,7 +479,7 @@ def test_the_http_source_forwards_the_whole_pose(kit, monkeypatch):
     only way to tell a running robot from a stopped one — and `true_x_m`,
     without which the scene draws the drifted estimate and the robot walks
     through walls again."""
-    from test_kit_measured_room import _stub_fetch
+    from test_kit_scene import _stub_fetch
 
     module, _ = kit
     payload = {"pose": {
