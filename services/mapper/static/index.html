@@ -868,11 +868,26 @@ function drawPlan() {
   planCtx.fillText(`${room.area_m2.toFixed(2)} m²`,
                    (px(minX) + px(maxX)) / 2, (py(minY) + py(maxY)) / 2);
 
+  // Say how far the robot's own position estimate has drifted, when that is
+  // knowable. The 3D scene draws the robot where it ACTUALLY is; this map is
+  // drawn from the estimate, and built by it. So the two views disagree by
+  // exactly this much — which looks like a bug until it is named. It is the
+  // reason this outline comes back larger than the room.
+  const pose = state && state.pose;
+  let drift = '';
+  if (pose && pose.true_x_m !== undefined) {
+    const dx = pose.x_m + 1.0 - pose.true_x_m;
+    const dy = pose.y_m + 1.0 - pose.true_y_m;
+    const off = Math.hypot(dx, dy);
+    drift = ' · dead reckoning is ' + off.toFixed(2)
+          + ' m out, which is why this differs from the 3D view';
+  }
+
   const blocked = room.blocked_area_m2 || 0;
   note.textContent =
     `${room.bounding_width_m.toFixed(2)} × ${room.bounding_height_m.toFixed(2)} m · `
     + `${(room.obstacles || []).length} obstacle(s), ${blocked.toFixed(2)} m² blocked · `
-    + (room.is_closed ? 'boundary closed' : 'boundary still open');
+    + (room.is_closed ? 'boundary closed' : 'boundary still open') + drift;
 }
 
 // ── Driving it by hand ──────────────────────────────────────────────────────
